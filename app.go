@@ -65,6 +65,7 @@ type settings struct {
 	ownTracer       bool
 	ownMeter        bool
 	roles           []Role
+	replacements    []replacement
 }
 
 // Option configures an App.
@@ -252,6 +253,7 @@ func New(opts ...Option) (*App, error) {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("config section %q is not used by any module (typo?)", section))
 		}
 	}
+	a.applyReplacements()
 	a.checkCoordination()
 	a.checkRoles()
 

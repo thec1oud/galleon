@@ -1,5 +1,8 @@
 go 1.26.0
 
-// Every module in this repository is listed here. Add new modules
-// (pg, jobs, web, adapters/...) with `go work use ./<dir>`.
-use .
+use (
+	// Every module in this repository is listed here. Add new modules
+	// (pg, jobs, web, adapters/...) with `go work use ./<dir>`.
+	.
+	./testkit
+)

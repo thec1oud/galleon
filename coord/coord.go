@@ -113,6 +113,10 @@ type Election interface {
 	Campaign(ctx context.Context) (Lease, error)
 	// Leader reports the current leader, if any.
 	Leader(ctx context.Context) (NodeID, bool, error)
+	// Observe sends the current leader, then every change of leader; "" means
+	// there is none. The channel closes when ctx ends. Intermediate changes may
+	// be skipped by a slow reader, but the latest leader is always delivered.
+	Observe(ctx context.Context) <-chan NodeID
 }
 
 type Message struct {

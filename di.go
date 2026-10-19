@@ -163,3 +163,31 @@ type Stopper interface {
 }
 
 type reflectType = reflect.Type
+
+type replacement struct {
+	typ   reflect.Type
+	value reflect.Value
+	site  string
+}
+
+// Replace swaps whatever provides T for value, which is used as is: it is not
+// started or stopped. It exists for tests, where testkit uses it to put fakes
+// in place of real seams. Boot fails if nothing provides T, so a replacement
+// that has gone stale can't silently do nothing.
+func Replace[T any](value T) Option {
+	r := replacement{typ: reflect.TypeFor[T](), value: reflect.ValueOf(&value).Elem(), site: callerSite(2)}
+	return func(s *settings) { s.replacements = append(s.replacements, r) }
+}
+
+func (a *App) applyReplacements() {
+	for _, r := range a.settings.replacements {
+		p, ok := a.providers[r.typ]
+		if !ok {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): nothing provides %s", r.typ, r.site, r.typ))
+			continue
+		}
+		p.ctor, p.params = reflect.Value{}, nil
+		p.value, p.built = r.value, true
+		p.module, p.site = "replaced", r.site
+	}
+}
