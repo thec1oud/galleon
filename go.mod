@@ -6,6 +6,7 @@ require (
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
+	golang.org/x/sys v0.49.0
 )
 
 require (

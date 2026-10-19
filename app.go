@@ -23,6 +23,7 @@ import (
 
 	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/coord"
+	"github.com/thec1oud/galleon/process"
 )
 
 // Deployment declares how many instances of the app will run. It lets boot
@@ -155,6 +156,7 @@ type App struct {
 	requires   []require
 	gates      []gate
 	startHooks []hook
+	readyHooks []hook
 	stopHooks  []hook
 	drainHooks []hook
 
@@ -317,10 +319,16 @@ func (a *App) checkCoordination() {
 	if caps.Scope == coord.ScopeCluster || len(a.needs) == 0 {
 		return
 	}
-	switch a.settings.deployment {
+	deployment := a.settings.deployment
+	if process.Supervised() {
+		// Workers of one supervisor are separate processes: a process-scoped
+		// backend gives each its own locks and leaders.
+		deployment = MultiNode
+	}
+	switch deployment {
 	case MultiNode:
 		if !a.settings.allowPerProcess {
-			a.bootErrs = append(a.bootErrs, fmt.Errorf("deployment is multi-node but coordination backend %q only guarantees within one process; "+
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("the app runs as several processes (multi-node, or under a supervisor) but coordination backend %q only guarantees within one process; "+
 				"use a cluster backend, or set galleon.AllowPerProcessGuarantees() to accept per-process guarantees", caps.Name))
 			return
 		}
@@ -385,7 +393,7 @@ func (a *App) Start(ctx context.Context) error {
 	a.state = stateStarted
 	a.fullyStarted = true
 	a.mu.Unlock()
-	a.notifySupervisorWhenReady()
+	a.watchReadiness()
 	a.log.Info("started", "roles", a.settings.roles, "providers", len(a.started), "deployment", a.settings.deployment.String(), "coordination", a.backend.Capabilities().Name)
 	return nil
 }

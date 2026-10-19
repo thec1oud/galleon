@@ -1,3 +1,5 @@
 package process
 
-const soReusePort = 0xf // SO_REUSEPORT
+import "golang.org/x/sys/unix"
+
+const soReusePort = unix.SO_REUSEPORT
