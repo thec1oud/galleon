@@ -167,6 +167,11 @@ type App struct {
 	state        state
 	started      []*provider // providers whose Start succeeded, in order
 	fullyStarted bool        // every provider and start hook succeeded
+	sealed       bool        // New has returned; registrations are closed
+	readyCancel  context.CancelFunc
+	readyDone    chan struct{}
+	fatal        chan struct{} // closed by die
+	fatalErr     error
 }
 
 // New configures, registers and validates the whole app. Every wiring, config
@@ -213,13 +218,14 @@ func New(opts ...Option) (*App, error) {
 		configRaw:    map[string]json.RawMessage{},
 		configOwners: map[string]string{},
 		knownRoles:   map[Role]bool{},
+		fatal:        make(chan struct{}),
 	}
 
 	if nodeErr != nil {
 		a.bootErrs = append(a.bootErrs, nodeErr)
 	}
 	if err := a.loadConfig(); err != nil {
-		return nil, a.failBoot(err)
+		return nil, a.failBoot(&BootError{Errs: append(a.bootErrs, err)})
 	}
 
 	kernel := &Registry{app: a, module: "galleon"}
@@ -267,6 +273,7 @@ func New(opts ...Option) (*App, error) {
 	if len(a.bootErrs) > 0 {
 		return nil, a.failBoot(&BootError{Errs: a.bootErrs})
 	}
+	a.sealed = true
 	return a, nil
 }
 
@@ -356,7 +363,11 @@ func (a *App) checkCoordination() {
 func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	if a.state != stateBuilt {
+		st := a.state
 		a.mu.Unlock()
+		if st == stateStopped {
+			return errors.New("galleon: Start called after Shutdown; an app runs once")
+		}
 		return errors.New("galleon: Start called twice")
 	}
 	a.state = stateStarting
@@ -417,6 +428,12 @@ func (a *App) Ready(ctx context.Context) error {
 	a.mu.Unlock()
 	switch st {
 	case stateStarted:
+		a.mu.Lock()
+		fatal := a.fatalErr
+		a.mu.Unlock()
+		if fatal != nil {
+			return fatal
+		}
 	case stateDraining:
 		return errors.New("draining")
 	default:
@@ -442,7 +459,8 @@ func (a *App) Shutdown(ctx context.Context) error {
 	case stateStarted:
 	case stateBuilt:
 		// Never started: nothing to drain or stop, but the telemetry
-		// providers the app was handed still need flushing.
+		// providers the app was handed still need flushing. Shutdown is
+		// final, so the app can't be started afterwards.
 		a.state = stateStopped
 		a.mu.Unlock()
 		return shutdownTelemetry(ctx, &a.settings)
@@ -452,6 +470,7 @@ func (a *App) Shutdown(ctx context.Context) error {
 	}
 	a.state = stateDraining
 	a.mu.Unlock()
+	a.stopWatchingReadiness()
 	a.log.Info("draining", "grace", a.settings.drainGrace)
 
 	if a.settings.drainGrace > 0 {
@@ -518,17 +537,26 @@ func (a *App) runHook(ctx context.Context, h hook, kind string) error {
 	return nil
 }
 
-// Run starts the app, waits for ctx to end or for SIGINT/SIGTERM, then shuts down.
+// Run starts the app, waits for ctx to end, for SIGINT/SIGTERM, or for a fatal
+// error such as a failed OnReady hook, then shuts down. It returns the fatal
+// error, if any, so the process can exit non-zero.
 func (a *App) Run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := a.Start(ctx); err != nil {
 		return err
 	}
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-a.fatal:
+	}
 	sctx, cancel := context.WithTimeout(context.Background(), a.settings.drainGrace+a.settings.stopTimeout)
 	defer cancel()
-	return a.Shutdown(sctx)
+	err := a.Shutdown(sctx)
+	a.mu.Lock()
+	fatal := a.fatalErr
+	a.mu.Unlock()
+	return errors.Join(fatal, err)
 }
 
 // Name returns the app's name.

@@ -12,8 +12,10 @@ import (
 //
 // Unlike time.AfterFunc, callbacks that fall due during Advance run
 // synchronously in the goroutine calling Advance, so their order is
-// deterministic. They may use the clock, including scheduling more callbacks,
-// but must not block on something only the Advance caller can provide.
+// deterministic. They may use the clock, including scheduling more callbacks
+// and calling Advance, but must not block on something only the Advance
+// caller can provide. Drive time from one goroutine: two goroutines calling
+// Advance at once can interleave their callbacks out of order.
 type Fake struct {
 	mu      sync.Mutex
 	now     time.Time
@@ -71,7 +73,19 @@ func (f *Fake) NewTicker(d time.Duration) Ticker {
 // within the window.
 func (f *Fake) Advance(d time.Duration) {
 	f.mu.Lock()
-	target := f.now.Add(d)
+	f.advanceToLocked(f.now.Add(d))
+	f.mu.Unlock()
+}
+
+// Set moves the clock to t, firing what falls due on the way. A t before Now
+// does nothing.
+func (f *Fake) Set(t time.Time) {
+	f.mu.Lock()
+	f.advanceToLocked(t)
+	f.mu.Unlock()
+}
+
+func (f *Fake) advanceToLocked(target time.Time) {
 	for len(f.waiters) > 0 && !f.waiters[0].at.After(target) {
 		w := f.waiters[0]
 		if w.at.After(f.now) { // never move backwards if a callback advanced further
@@ -86,12 +100,6 @@ func (f *Fake) Advance(d time.Duration) {
 	if target.After(f.now) {
 		f.now = target
 	}
-	f.mu.Unlock()
-}
-
-// Set moves the clock to t, which must not be before Now.
-func (f *Fake) Set(t time.Time) {
-	f.Advance(t.Sub(f.Now()))
 }
 
 // Waiters reports how many timers, tickers and callbacks are pending.
@@ -190,14 +198,17 @@ func (f *Fake) notifyLocked() {
 }
 
 // drain discards an undelivered value, as Stop and Reset do on time.Timer and
-// time.Ticker since Go 1.23.
-func drain(ch chan time.Time) {
+// time.Ticker since Go 1.23, and reports whether there was one: such a timer
+// counts as not yet fired, so Stop and Reset report it as active.
+func drain(ch chan time.Time) bool {
 	if ch == nil {
-		return
+		return false
 	}
 	select {
 	case <-ch:
+		return true
 	default:
+		return false
 	}
 }
 
@@ -211,14 +222,14 @@ func (t *fakeTimer) C() <-chan time.Time { return t.w.ch }
 func (t *fakeTimer) Stop() bool {
 	t.f.mu.Lock()
 	defer t.f.mu.Unlock()
-	drain(t.w.ch)
-	return t.f.removeLocked(t.w)
+	drained := drain(t.w.ch)
+	return t.f.removeLocked(t.w) || drained
 }
 
 func (t *fakeTimer) Reset(d time.Duration) bool {
 	t.f.mu.Lock()
-	drain(t.w.ch)
-	wasActive := t.f.removeLocked(t.w)
+	drained := drain(t.w.ch)
+	wasActive := t.f.removeLocked(t.w) || drained
 	fn := t.f.armLocked(t.w, d)
 	t.f.mu.Unlock()
 	if fn != nil {

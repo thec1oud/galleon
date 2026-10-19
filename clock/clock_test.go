@@ -152,6 +152,37 @@ func TestFakeStopAndResetDropStaleValues(t *testing.T) {
 	}
 }
 
+func TestFakeStopAndResetReportAnUnreceivedFireAsActive(t *testing.T) {
+	// Matches time.Timer since Go 1.23: a fired value nobody received is
+	// discarded and the timer counts as stopped before firing, so the idiom
+	// "if !t.Stop() { <-t.C() }" never blocks.
+	c := clock.NewFake(epoch)
+	tm := c.NewTimer(time.Second)
+	c.Advance(time.Second)
+	if !tm.Stop() {
+		t.Fatal("Stop after an unreceived fire should report true")
+	}
+	tm.Reset(time.Second)
+	c.Advance(time.Second)
+	if !tm.Reset(time.Second) {
+		t.Fatal("Reset after an unreceived fire should report true")
+	}
+	c.Advance(time.Second)
+	<-tm.C()
+	if tm.Stop() {
+		t.Fatal("Stop after the value was received should report false")
+	}
+}
+
+func TestFakeSetNeverOvershoots(t *testing.T) {
+	c := clock.NewFake(epoch)
+	c.Set(epoch.Add(time.Hour))
+	c.Set(epoch) // going back does nothing
+	if !c.Now().Equal(epoch.Add(time.Hour)) {
+		t.Fatalf("now = %v", c.Now())
+	}
+}
+
 func TestFakeConcurrentResetKeepsOneEntry(t *testing.T) {
 	c := clock.NewFake(epoch)
 	tm := c.NewTimer(time.Hour)

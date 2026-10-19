@@ -29,7 +29,9 @@ func Roles(roles ...Role) Option {
 func (r *Registry) Active(roles ...Role) bool {
 	active := false
 	for _, role := range roles {
-		r.app.knownRoles[role] = true
+		if !r.app.sealed { // after New, roles can no longer be checked
+			r.app.knownRoles[role] = true
+		}
 		active = active || r.app.runs(role)
 	}
 	return active
@@ -52,33 +54,43 @@ func (a *App) checkRoles() {
 
 // watchReadiness waits, after Start, until every readiness gate first passes,
 // then runs the OnReady hooks and reports readiness to a supervisor, so an
-// upgrade only retires the old generation once this one serves.
+// upgrade only retires the old generation once this one serves. Shutdown
+// cancels it and waits for it, so no hook runs, or is still running, once
+// draining has begun. A failing hook is fatal: the app stops reporting ready
+// and Run returns the error, so a supervisor restarts the worker instead of
+// leaving it running with nothing listening.
 func (a *App) watchReadiness() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	a.mu.Lock()
+	a.readyCancel, a.readyDone = cancel, done
+	a.mu.Unlock()
 	if len(a.readyHooks) == 0 && !process.Supervised() {
+		cancel()
+		close(done)
 		return
 	}
 	go func() {
+		defer close(done)
+		defer cancel()
 		t := time.NewTicker(50 * time.Millisecond)
 		defer t.Stop()
-		for {
-			a.mu.Lock()
-			st := a.state
-			a.mu.Unlock()
-			if st != stateStarted {
+		for a.Ready(ctx) != nil {
+			select {
+			case <-t.C:
+			case <-ctx.Done():
 				return
 			}
-			if a.Ready(context.Background()) == nil {
-				break
-			}
-			<-t.C
 		}
 		for _, h := range a.readyHooks {
-			hctx, cancel := context.WithTimeout(context.Background(), a.settings.startTimeout)
+			if ctx.Err() != nil {
+				return
+			}
+			hctx, hcancel := context.WithTimeout(ctx, a.settings.startTimeout)
 			err := h.fn(hctx)
-			cancel()
+			hcancel()
 			if err != nil {
-				// Not reporting ready lets a supervisor roll the upgrade back.
-				a.log.Error("ready hook failed; not reporting ready", "module", h.module, "site", h.site, "error", err)
+				a.die(fmt.Errorf("ready hook of module %q (%s): %w", h.module, h.site, err))
 				return
 			}
 		}
@@ -86,4 +98,27 @@ func (a *App) watchReadiness() {
 			a.log.Error("reporting readiness to the supervisor failed", "error", err)
 		}
 	}()
+}
+
+// stopWatchingReadiness cancels watchReadiness and waits until it has returned.
+func (a *App) stopWatchingReadiness() {
+	a.mu.Lock()
+	cancel, done := a.readyCancel, a.readyDone
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+}
+
+// die records a fatal error: readiness fails from now on, and Run shuts the
+// app down and returns err.
+func (a *App) die(err error) {
+	a.log.Error("fatal", "error", err)
+	a.mu.Lock()
+	if a.fatalErr == nil {
+		a.fatalErr = err
+		close(a.fatal)
+	}
+	a.mu.Unlock()
 }

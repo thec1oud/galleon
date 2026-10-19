@@ -91,3 +91,41 @@ func TestOnReadyRunsOnceAfterGatesPass(t *testing.T) {
 		t.Fatalf("OnReady ran %d times, want 1", n)
 	}
 }
+
+func TestFailingReadyHookIsFatal(t *testing.T) {
+	mod := galleon.ModuleFunc("web", func(r *galleon.Registry) error {
+		r.OnReady(func(context.Context) error { return errors.New("address already in use") })
+		return nil
+	})
+	app, err := galleon.New(base(mod)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = app.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "address already in use") || ctx.Err() != nil {
+		t.Fatalf("Run should stop on its own and return the hook's error, got %v (ctx err %v)", err, ctx.Err())
+	}
+}
+
+func TestReadyHookNeverRunsOnceShutdownBegins(t *testing.T) {
+	var ran atomic.Bool
+	mod := galleon.ModuleFunc("web", func(r *galleon.Registry) error {
+		r.Gate("never", func(context.Context) error { return errors.New("not yet") })
+		r.OnReady(func(context.Context) error { ran.Store(true); return nil })
+		return nil
+	})
+	app, err := galleon.New(base(mod)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = app.Start(context.Background())
+	if err := app.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if ran.Load() {
+		t.Fatal("OnReady ran after shutdown")
+	}
+}

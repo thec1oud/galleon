@@ -23,8 +23,9 @@ const (
 // environment, and the readiness pipe is closed on exec, so processes this
 // worker starts don't believe they are supervised.
 var (
-	slot    = -1
-	readyFD = -1
+	slot       = -1
+	readyFD    = -1
+	generation string
 )
 
 func init() {
@@ -33,6 +34,10 @@ func init() {
 			slot = n
 		}
 		os.Unsetenv(EnvWorker)
+	}
+	if s, ok := os.LookupEnv(EnvGeneration); ok && slot >= 0 {
+		generation = s
+		os.Unsetenv(EnvGeneration)
 	}
 	if s, ok := os.LookupEnv(EnvReadyFD); ok {
 		if n, err := strconv.Atoi(s); err == nil {
@@ -48,6 +53,10 @@ func Supervised() bool { return slot >= 0 }
 
 // Slot returns this worker's slot, or -1 when not supervised.
 func Slot() int { return slot }
+
+// Generation returns the generation the supervisor gave this worker, as set in
+// EnvGeneration, or "" when not supervised.
+func Generation() string { return generation }
 
 var readyOnce sync.Once
 

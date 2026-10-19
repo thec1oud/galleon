@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/coord"
 	"github.com/thec1oud/galleon/coord/local"
 	"github.com/thec1oud/galleon/process"
 )
@@ -31,9 +34,16 @@ func TestHelperWorker(t *testing.T) {
 	if os.Getenv("GALLEON_TEST_HELPER") != "1" {
 		t.Skip("only runs as a supervised worker")
 	}
-	if os.Getenv(process.EnvWorker) != "" || os.Getenv(process.EnvReadyFD) != "" || !process.Supervised() {
+	if os.Getenv(process.EnvWorker) != "" || os.Getenv(process.EnvReadyFD) != "" || os.Getenv(process.EnvGeneration) != "" || !process.Supervised() {
 		fmt.Fprintln(os.Stderr, "supervisor variables leaked into the environment, or were not read")
 		os.Exit(4)
+	}
+	if runtime.GOOS == "linux" {
+		// The readiness pipe must not leak into the worker's own children.
+		if err := exec.Command("sh", "-c", "test ! -e /proc/self/fd/3").Run(); err != nil {
+			fmt.Fprintln(os.Stderr, "fd 3 leaked into a child process")
+			os.Exit(4)
+		}
 	}
 	node := mustNode()
 	dir := os.Getenv("HELPER_DIR")
@@ -63,6 +73,9 @@ func TestHelperWorker(t *testing.T) {
 
 	var srv atomic.Pointer[http.Server]
 	mod := galleon.ModuleFunc("web", func(r *galleon.Registry) error {
+		if mode == "needs-leader" {
+			r.Needs(coord.LeaderElection)
+		}
 		if !r.Active("web") {
 			return nil
 		}
@@ -119,7 +132,7 @@ func TestHelperWorker(t *testing.T) {
 
 func mustNode() uint64 {
 	var gen uint64
-	fmt.Sscan(os.Getenv(process.EnvGeneration), &gen)
+	fmt.Sscan(process.Generation(), &gen)
 	return gen
 }
 
@@ -210,9 +223,17 @@ func TestWorkersShareOnePort(t *testing.T) {
 func TestCrashedWorkerIsRestarted(t *testing.T) {
 	h := newHarness(t, 1, "crash-once")
 	h.waitWorkers("1", 1)
-	if !strings.Contains(h.logs.String(), "worker exited; restarting") {
-		t.Fatalf("restart not logged:\n%s", h.logs)
+	if !strings.Contains(h.logs.String(), "worker exited; restarting") || !strings.Contains(h.logs.String(), "after=10ms") {
+		t.Fatalf("restart not logged, or not after MinBackoff (10ms):\n%s", h.logs)
 	}
+}
+
+func TestSupervisedWorkersRefuseAProcessScopedBackend(t *testing.T) {
+	out := &syncBuf{}
+	newHarness(t, 1, "needs-leader", func(s *process.Supervisor) { s.Stderr = out })
+	eventually(t, "the worker refuses to boot", func() bool {
+		return strings.Contains(out.String(), "only guarantees within one process")
+	})
 }
 
 func TestUpgradeReplacesTheGeneration(t *testing.T) {

@@ -41,7 +41,11 @@ func currentNode() (Node, error) {
 		host = "unknown"
 	}
 	var gen uint64
-	if s := os.Getenv(GenerationEnv); s != "" {
+	s := process.Generation()
+	if v, ok := os.LookupEnv(GenerationEnv); ok {
+		s = v // set directly, without a supervisor
+	}
+	if s != "" {
 		if gen, err = strconv.ParseUint(s, 10, 64); err != nil {
 			return Node{Host: host, PID: os.Getpid()}, fmt.Errorf("%s=%q is not a generation number", GenerationEnv, s)
 		}
