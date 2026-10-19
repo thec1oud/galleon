@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
@@ -33,17 +34,28 @@ func MeterProvider(mp metric.MeterProvider) Option {
 	}
 }
 
+// spentFlushBudget is how long a flush may take when the shutdown deadline is
+// already spent.
+const spentFlushBudget = 2 * time.Second
+
 type shutdowner interface {
 	Shutdown(ctx context.Context) error
 }
 
 // shutdownTelemetry flushes the providers s owns, once. It is the last step of
-// shutdown so everything before it is exported. It gets its own deadline: the
-// caller's context may already be spent by drain and stop, and a flush with a
-// done context drops every buffered span.
+// shutdown so everything before it is exported. It uses what is left of the
+// caller's deadline; only if drain and stop have already spent it does it get
+// a short budget of its own, since a flush with a done context drops every
+// buffered span.
 func shutdownTelemetry(ctx context.Context, s *settings) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.stopTimeout)
-	defer cancel()
+	if !s.ownTracer && !s.ownMeter {
+		return nil
+	}
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), spentFlushBudget)
+		defer cancel()
+	}
 	var errs []error
 	if p, ok := s.tracerProvider.(shutdowner); ok && s.ownTracer {
 		s.ownTracer = false
@@ -80,7 +92,9 @@ func WithLogAttrs(ctx context.Context, attrs ...slog.Attr) context.Context {
 }
 
 // ContextHandler adds the trace and span IDs of the active span, and any attrs
-// from WithLogAttrs, to each record, at the top level even inside groups. The
+// from WithLogAttrs, to each record. They stay top-level keys even inside
+// groups opened through the wrapped handler (a group already inside h when it
+// is wrapped can't be undone). The
 // kernel wraps the app's logger with it, so a log line written with a
 // request's context can be found from its trace.
 func ContextHandler(h slog.Handler) slog.Handler {
