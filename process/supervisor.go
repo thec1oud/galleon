@@ -141,6 +141,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if s.Processes < 1 {
 		return errors.New("process: Supervisor.Processes must be at least 1")
 	}
+	if Supervised() {
+		return errors.New("process: Run called inside a supervised worker; run the app instead of another supervisor")
+	}
 	if !supervisorSupported {
 		return errors.New("process: the supervisor needs a unix system (inherited pipes and SIGTERM)")
 	}
@@ -375,6 +378,9 @@ func (s *Supervisor) start(slot int, gen uint64, path string, exits chan<- *work
 	// Own process group: a terminal hangup or Ctrl-C reaches the supervisor
 	// only, which then stops or upgrades the workers in order.
 	cmd.SysProcAttr = newProcessGroup()
+	// If the worker leaves children holding its output pipes, don't let them
+	// keep Wait (and so stopAll) from returning.
+	cmd.WaitDelay = s.StopTimeout
 	cmd.ExtraFiles = []*os.File{wr} // fd 3 in the worker
 	cmd.Env = append(append(os.Environ(), s.Env...),
 		EnvWorker+"="+strconv.Itoa(slot),

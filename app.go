@@ -417,8 +417,12 @@ func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	a.state = stateStarted
 	a.fullyStarted = true
+	// Set up under the same lock as stateStarted, so a concurrent Shutdown
+	// always finds the watcher to cancel.
+	readyCtx, readyCancel := context.WithCancel(context.Background())
+	a.readyCancel, a.readyDone = readyCancel, make(chan struct{})
 	a.mu.Unlock()
-	a.watchReadiness()
+	a.watchReadiness(readyCtx)
 	a.log.Info("started", "roles", a.settings.roles, "providers", len(a.started), "deployment", a.settings.deployment.String(), "coordination", a.backend.Capabilities().Name)
 	return nil
 }
@@ -473,7 +477,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	}
 	a.state = stateDraining
 	a.mu.Unlock()
-	a.stopWatchingReadiness()
+	if err := a.stopWatchingReadiness(ctx); err != nil {
+		a.log.Warn("ready hook still running at shutdown; draining anyway", "error", err)
+	}
 	a.log.Info("draining", "grace", a.settings.drainGrace)
 
 	if a.settings.drainGrace > 0 {
