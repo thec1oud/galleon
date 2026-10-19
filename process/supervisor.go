@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -33,8 +34,10 @@ type Supervisor struct {
 	// Args are the worker's arguments. Nil means this process's arguments.
 	Args []string
 	// Env is added to this process's environment for every worker.
-	Env    []string
-	Logger *slog.Logger
+	Env []string
+	// Stdout and Stderr receive the workers' output. Nil means this process's.
+	Stdout, Stderr io.Writer
+	Logger         *slog.Logger
 
 	ReadyTimeout time.Duration // how long a new generation has to become ready; default 60s
 	StopTimeout  time.Duration // how long a worker has to exit after SIGTERM; default 30s
@@ -81,6 +84,12 @@ func (s *Supervisor) defaults() {
 	}
 	if s.Args == nil {
 		s.Args = os.Args[1:]
+	}
+	if s.Stdout == nil {
+		s.Stdout = os.Stdout
+	}
+	if s.Stderr == nil {
+		s.Stderr = os.Stderr
 	}
 }
 
@@ -132,6 +141,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if s.Processes < 1 {
 		return errors.New("process: Supervisor.Processes must be at least 1")
 	}
+	if !supervisorSupported {
+		return errors.New("process: the supervisor needs a unix system (inherited pipes and SIGTERM)")
+	}
 	if !reusePortSupported && s.Processes > 1 {
 		return errors.New("process: several workers need SO_REUSEPORT, which this platform does not support")
 	}
@@ -174,7 +186,17 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		return w, nil
 	}
 	upgrade := func(reply chan error) {
+		if !reusePortSupported {
+			// The new generation could not bind the ports the old one holds.
+			err := errors.New("process: upgrades need SO_REUSEPORT, which this platform does not support")
+			s.Logger.Error("upgrade refused", "error", err)
+			if reply != nil {
+				reply <- err
+			}
+			return
+		}
 		if upgrading {
+			s.Logger.Warn("upgrade already in progress; ignoring this request")
 			if reply != nil {
 				reply <- errors.New("process: an upgrade is already in progress")
 			}
@@ -349,7 +371,10 @@ func (s *Supervisor) start(slot int, gen uint64, path string, exits chan<- *work
 		return nil, err
 	}
 	cmd := exec.Command(path, s.Args...)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	cmd.Stdout, cmd.Stderr = s.Stdout, s.Stderr
+	// Own process group: a terminal hangup or Ctrl-C reaches the supervisor
+	// only, which then stops or upgrades the workers in order.
+	cmd.SysProcAttr = newProcessGroup()
 	cmd.ExtraFiles = []*os.File{wr} // fd 3 in the worker
 	cmd.Env = append(append(os.Environ(), s.Env...),
 		EnvWorker+"="+strconv.Itoa(slot),
@@ -363,7 +388,9 @@ func (s *Supervisor) start(slot int, gen uint64, path string, exits chan<- *work
 	}
 	wr.Close()
 	w := &worker{slot: slot, gen: gen, path: path, cmd: cmd, started: time.Now(), ready: make(chan struct{}), exited: make(chan struct{})}
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		defer r.Close()
 		line, _ := bufio.NewReader(r).ReadString('\n')
 		if line == "ready\n" {
@@ -372,6 +399,9 @@ func (s *Supervisor) start(slot int, gen uint64, path string, exits chan<- *work
 	}()
 	go func() {
 		w.err = cmd.Wait()
+		// The pipe reaches EOF once the worker is gone, so this ordering means
+		// a worker that reported ready and then exited is always seen as ready.
+		<-readerDone
 		close(w.exited)
 		exits <- w
 	}()
