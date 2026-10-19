@@ -8,12 +8,13 @@ import (
 	"strconv"
 
 	"github.com/thec1oud/galleon/coord"
+	"github.com/thec1oud/galleon/process"
 )
 
 // GenerationEnv names the environment variable a supervisor sets on the
 // processes it starts, so each generation of workers is distinguishable during
 // a zero-downtime upgrade.
-const GenerationEnv = "GALLEON_GENERATION"
+const GenerationEnv = process.EnvGeneration
 
 // Node identifies this process in coordination, telemetry and leases. It is
 // provided to dependency injection as Node.

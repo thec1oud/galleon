@@ -64,6 +64,7 @@ type settings struct {
 	meterProvider   metric.MeterProvider
 	ownTracer       bool
 	ownMeter        bool
+	roles           []Role
 }
 
 // Option configures an App.
@@ -149,6 +150,7 @@ type App struct {
 	configOwners map[string]string
 	configReport []ConfigValue
 
+	knownRoles map[Role]bool
 	needs      []need
 	requires   []require
 	gates      []gate
@@ -179,6 +181,9 @@ func New(opts ...Option) (*App, error) {
 	if s.name == "" {
 		s.name = "app"
 	}
+	if len(s.roles) == 0 {
+		s.roles = []Role{RoleAll}
+	}
 	if s.clock == nil {
 		s.clock = clock.System()
 	}
@@ -207,6 +212,7 @@ func New(opts ...Option) (*App, error) {
 		providers:    map[reflectType]*provider{},
 		configRaw:    map[string]json.RawMessage{},
 		configOwners: map[string]string{},
+		knownRoles:   map[Role]bool{},
 	}
 
 	if err := a.loadConfig(); err != nil {
@@ -247,6 +253,7 @@ func New(opts ...Option) (*App, error) {
 		}
 	}
 	a.checkCoordination()
+	a.checkRoles()
 
 	if order, err := a.resolveGraph(); err != nil {
 		a.bootErrs = append(a.bootErrs, err)
@@ -378,7 +385,8 @@ func (a *App) Start(ctx context.Context) error {
 	a.state = stateStarted
 	a.fullyStarted = true
 	a.mu.Unlock()
-	a.log.Info("started", "providers", len(a.started), "deployment", a.settings.deployment.String(), "coordination", a.backend.Capabilities().Name)
+	a.notifySupervisorWhenReady()
+	a.log.Info("started", "roles", a.settings.roles, "providers", len(a.started), "deployment", a.settings.deployment.String(), "coordination", a.backend.Capabilities().Name)
 	return nil
 }
 
