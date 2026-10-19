@@ -176,3 +176,29 @@ func TestShutdownIsNotHeldByABlockedReadyHook(t *testing.T) {
 		t.Fatalf("Shutdown took %v; it must not wait past its deadline for a hook", d)
 	}
 }
+
+func TestReadyHookContextLastsUntilShutdown(t *testing.T) {
+	got := make(chan context.Context, 1)
+	mod := galleon.ModuleFunc("web", func(r *galleon.Registry) error {
+		r.OnReady(func(ctx context.Context) error { got <- ctx; return nil })
+		return nil
+	})
+	app, err := galleon.New(base(mod)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx := <-got
+	time.Sleep(100 * time.Millisecond)
+	if ctx.Err() != nil {
+		t.Fatal("the ready hook's context ended before Shutdown; servers using it as their base context would stop")
+	}
+	if err := app.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("Shutdown must cancel the ready hook's context")
+	}
+}

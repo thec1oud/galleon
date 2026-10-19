@@ -40,7 +40,7 @@ func init() {
 		os.Unsetenv(EnvGeneration)
 	}
 	if s, ok := os.LookupEnv(EnvReadyFD); ok {
-		if n, err := strconv.Atoi(s); err == nil {
+		if n, err := strconv.Atoi(s); err == nil && slot >= 0 {
 			readyFD = n
 			closeOnExec(n)
 		}
