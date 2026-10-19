@@ -1,6 +1,7 @@
 package clock_test
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,5 +101,75 @@ func TestSystemClockIsReal(t *testing.T) {
 	case <-tm.C():
 	case <-time.After(time.Second):
 		t.Fatal("system timer did not fire")
+	}
+}
+
+func TestFakeAfterFuncRunsInOrderAtEachDeadline(t *testing.T) {
+	c := clock.NewFake(epoch)
+	var got []time.Duration
+	record := func() { got = append(got, c.Since(epoch)) }
+	c.AfterFunc(2*time.Second, record)
+	c.AfterFunc(time.Second, func() {
+		record()
+		c.AfterFunc(time.Second, record) // due at +2s, after the one registered first
+	})
+	c.AfterFunc(5*time.Second, record)
+	c.Advance(3 * time.Second)
+	want := []time.Duration{time.Second, 2 * time.Second, 2 * time.Second}
+	if len(got) != len(want) {
+		t.Fatalf("ran at %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ran at %v, want %v", got, want)
+		}
+	}
+	if c.Waiters() != 1 {
+		t.Fatalf("only the +5s callback should be pending, got %d", c.Waiters())
+	}
+}
+
+func TestFakeStopAndResetDropStaleValues(t *testing.T) {
+	c := clock.NewFake(epoch)
+	tm := c.NewTimer(time.Second)
+	c.Advance(time.Second) // fires; the value sits in the channel
+	tm.Stop()
+	if _, ok := recv(t, tm.C()); ok {
+		t.Fatal("Stop must discard an undelivered value")
+	}
+	c.Advance(time.Second)
+	tm.Reset(10 * time.Second)
+	c.Advance(time.Second)
+	if _, ok := recv(t, tm.C()); ok {
+		t.Fatal("Reset must discard an undelivered value, so a new timeout does not fire early")
+	}
+
+	tk := c.NewTicker(time.Second)
+	c.Advance(time.Second)
+	tk.Reset(time.Minute)
+	if _, ok := recv(t, tk.C()); ok {
+		t.Fatal("Ticker.Reset must discard an undelivered tick")
+	}
+}
+
+func TestFakeConcurrentResetKeepsOneEntry(t *testing.T) {
+	c := clock.NewFake(epoch)
+	tm := c.NewTimer(time.Hour)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				tm.Reset(time.Hour)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := c.Waiters(); n != 1 {
+		t.Fatalf("one timer has %d pending entries", n)
+	}
+	if !tm.Stop() || c.Waiters() != 0 {
+		t.Fatal("Stop should remove the timer's only entry")
 	}
 }

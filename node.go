@@ -42,10 +42,10 @@ func currentNode() (Node, error) {
 	var gen uint64
 	if s := os.Getenv(GenerationEnv); s != "" {
 		if gen, err = strconv.ParseUint(s, 10, 64); err != nil {
-			return Node{}, fmt.Errorf("%s=%q is not a generation number", GenerationEnv, s)
+			return Node{Host: host, PID: os.Getpid()}, fmt.Errorf("%s=%q is not a generation number", GenerationEnv, s)
 		}
 	}
-	var b [4]byte
+	var b [8]byte
 	_, _ = rand.Read(b[:])
 	return Node{Host: host, PID: os.Getpid(), Generation: gen, Instance: hex.EncodeToString(b[:])}, nil
 }
