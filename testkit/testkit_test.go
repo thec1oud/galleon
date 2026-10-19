@@ -61,3 +61,24 @@ func TestHarnessRunsTheAppOnFakes(t *testing.T) {
 		t.Fatalf("harness app should be ready: %v", err)
 	}
 }
+
+type resource struct{ stopped *bool }
+
+func (r resource) Stop(context.Context) error { *r.stopped = true; return nil }
+
+func TestHarnessShutsDownWhenTheTestEnds(t *testing.T) {
+	stopped := false
+	t.Run("inner", func(t *testing.T) {
+		mod := galleon.ModuleFunc("res", func(r *galleon.Registry) error {
+			galleon.Provide[resource](r, func() resource { return resource{&stopped} })
+			return nil
+		})
+		testkit.New(t, galleon.Modules(mod))
+		if stopped {
+			t.Fatal("stopped before the test ended")
+		}
+	})
+	if !stopped {
+		t.Fatal("the app was not shut down when its test ended")
+	}
+}

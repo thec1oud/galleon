@@ -32,6 +32,9 @@ type Harness struct {
 // as a single node, no drain grace, and a logger that records into Logs and
 // prints them only if the test fails. opts are applied after those defaults,
 // so any of them can be overridden; use galleon.Replace to swap in fakes.
+//
+// The in-process coordination backend keeps real time: advancing Clock does
+// not expire its leases, TTLs or counter windows.
 func New(t testing.TB, opts ...galleon.Option) *Harness {
 	t.Helper()
 	h := &Harness{Clock: clock.NewFake(Epoch), Logs: &Logs{}}

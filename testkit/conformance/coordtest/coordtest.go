@@ -12,6 +12,7 @@ package coordtest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,7 +32,15 @@ type Factory struct {
 
 // Run runs every conformance test that applies to the backend.
 func Run(t *testing.T, f Factory) {
-	t.Run("Capabilities", func(t *testing.T) { capabilities(t, f) })
+	t.Run("Capabilities", func(t *testing.T) {
+		if err := checkCapabilities(f.New(t).Capabilities(), f.Peer != nil); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Run("Membership", func(t *testing.T) {
+		need(t, f, coord.MembershipCap)
+		membership(t, f)
+	})
 	t.Run("Locks", func(t *testing.T) {
 		need(t, f, coord.Locks)
 		t.Run("MutualExclusion", func(t *testing.T) { mutualExclusion(t, f) })
@@ -67,6 +76,16 @@ func need(t *testing.T, f Factory, c coord.Capability) {
 	}
 }
 
+// selfID is the node ID a leader campaigning from b should be reported as.
+// Without membership the suite can't know it, so it returns "" and callers
+// only check that some leader is reported.
+func selfID(b coord.Backend) coord.NodeID {
+	if !b.Capabilities().Has(coord.MembershipCap) {
+		return ""
+	}
+	return b.Membership().Self()
+}
+
 func ctx(t *testing.T) context.Context {
 	c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
@@ -82,25 +101,67 @@ func nodes(t *testing.T, f Factory) []coord.Backend {
 	return []coord.Backend{b, f.Peer(t, b)}
 }
 
-func capabilities(t *testing.T, f Factory) {
-	caps := f.New(t).Capabilities()
+// checkCapabilities enforces rule 6 (honest scope) and rule 7 (a reported
+// failure-detection bound) of the coordination specification.
+func checkCapabilities(caps coord.Capabilities, hasPeer bool) error {
+	var errs []error
 	if caps.Name == "" {
-		t.Error("Capabilities().Name is empty")
+		errs = append(errs, errors.New("Capabilities().Name is empty"))
 	}
 	switch caps.Scope {
 	case coord.ScopeProcess:
-		if f.Peer != nil {
-			t.Error("a process-scoped backend cannot have peers on the same store")
+		if hasPeer {
+			errs = append(errs, errors.New("a process-scoped backend cannot have peers on the same store"))
 		}
 	case coord.ScopeCluster:
-		if f.Peer == nil {
-			t.Error("a cluster-scoped backend must give the suite a Peer factory, so cross-node guarantees are tested")
+		if !hasPeer {
+			errs = append(errs, errors.New("a cluster-scoped backend must give the suite a Peer factory, so cross-node guarantees are tested"))
 		}
 		if caps.Has(coord.MembershipCap) && caps.FailureDetection <= 0 {
-			t.Error("a cluster backend with membership must report its failure detection bound")
+			errs = append(errs, errors.New("a cluster backend with membership must report its failure detection bound"))
 		}
 	default:
-		t.Errorf("unknown scope %v", caps.Scope)
+		errs = append(errs, fmt.Errorf("unknown scope %v", caps.Scope))
+	}
+	return errors.Join(errs...)
+}
+
+func membership(t *testing.T, f Factory) {
+	ns := nodes(t, f)
+	want := map[coord.NodeID]bool{}
+	for _, n := range ns {
+		self := n.Membership().Self()
+		if self == "" {
+			t.Fatal("Self() is empty")
+		}
+		want[self] = true
+	}
+	if len(want) != len(ns) {
+		t.Fatalf("nodes share a node ID: %v", want)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		members, err := ns[0].Membership().Members(ctx(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := map[coord.NodeID]bool{}
+		for _, m := range members {
+			seen[m.ID] = true
+		}
+		missing := 0
+		for id := range want {
+			if !seen[id] {
+				missing++
+			}
+		}
+		if missing == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Members() = %v, want it to include %v", members, want)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -183,7 +244,8 @@ func expiry(t *testing.T, f Factory) {
 
 func renew(t *testing.T, f Factory) {
 	ns := nodes(t, f)
-	l, ok, err := ns[0].Locks().TryAcquire(ctx(t), "conformance/renew", 300*time.Millisecond)
+	// A 1s TTL renewed every 100ms leaves 900ms of slack for a slow runner.
+	l, ok, err := ns[0].Locks().TryAcquire(ctx(t), "conformance/renew", time.Second)
 	if err != nil || !ok {
 		t.Fatalf("acquire: ok=%v err=%v", ok, err)
 	}
@@ -201,9 +263,9 @@ func renew(t *testing.T, f Factory) {
 
 func acquireWaits(t *testing.T, f Factory) {
 	ns := nodes(t, f)
-	l, _, err := ns[0].Locks().TryAcquire(ctx(t), "conformance/wait", time.Minute)
-	if err != nil {
-		t.Fatal(err)
+	l, ok, err := ns[0].Locks().TryAcquire(ctx(t), "conformance/wait", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
 	}
 	waiter := ns[len(ns)-1]
 	short, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -211,21 +273,24 @@ func acquireWaits(t *testing.T, f Factory) {
 	if _, err := waiter.Locks().Acquire(short, "conformance/wait", time.Second); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Acquire on a held key with a short deadline = %v, want DeadlineExceeded", err)
 	}
-	got := make(chan coord.Lease, 1)
+	type result struct {
+		l   coord.Lease
+		err error
+	}
+	got := make(chan result, 1) // buffered: the goroutine never blocks or touches t
+	waitCtx := ctx(t)
 	go func() {
-		l2, err := waiter.Locks().Acquire(ctx(t), "conformance/wait", time.Second)
-		if err != nil {
-			t.Error(err)
-		}
-		got <- l2
+		l2, err := waiter.Locks().Acquire(waitCtx, "conformance/wait", time.Second)
+		got <- result{l2, err}
 	}()
 	time.Sleep(50 * time.Millisecond)
 	_ = l.Release(context.Background())
 	select {
-	case l2 := <-got:
-		if l2 != nil {
-			_ = l2.Release(context.Background())
+	case r := <-got:
+		if r.err != nil {
+			t.Fatalf("waiting Acquire: %v", r.err)
 		}
+		_ = r.l.Release(context.Background())
 	case <-time.After(5 * time.Second):
 		t.Fatal("waiter was not woken by Release")
 	}
@@ -263,11 +328,23 @@ func election(t *testing.T, f Factory) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	self := ns[0].Membership().Self()
-	if id, ok, _ := ns[len(ns)-1].Leader("conformance").Leader(ctx(t)); !ok || id != self {
+	self := selfID(ns[0])
+	id, ok, _ := ns[len(ns)-1].Leader("conformance").Leader(ctx(t))
+	if !ok || (self != "" && id != self) {
 		t.Fatalf("leader = %q (ok=%v), want %q", id, ok, self)
 	}
-	expect(self)
+	expect(id)
+
+	// A new observer gets the current leader first.
+	late := ns[len(ns)-1].Leader("conformance").Observe(obsCtx)
+	select {
+	case first := <-late:
+		if first != id {
+			t.Fatalf("a new observer's first value = %q, want the current leader %q", first, id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a new observer got no first value")
+	}
 
 	_ = l.Release(context.Background())
 	if _, ok, _ := e.Leader(ctx(t)); ok {
@@ -276,13 +353,19 @@ func election(t *testing.T, f Factory) {
 	expect("")
 
 	stop()
-	select {
-	case _, ok := <-observed:
-		for ok {
-			_, ok = <-observed
+	closed := time.After(5 * time.Second)
+	for _, ch := range []<-chan coord.NodeID{observed, late} {
+	drain:
+		for {
+			select {
+			case _, ok := <-ch:
+				if !ok {
+					break drain
+				}
+			case <-closed:
+				t.Fatal("Observe did not close when its context ended")
+			}
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Observe did not close when its context ended")
 	}
 }
 
@@ -418,16 +501,29 @@ func kvTTLWatch(t *testing.T, f Factory) {
 func counters(t *testing.T, f Factory) {
 	ns := nodes(t, f)
 	c := ctx(t)
+	// A window boundary can fall inside a run; it can't fall inside two runs
+	// in a row, so one retry with fresh keys tells a boundary from a bug.
+	var err error
+	for attempt := range 2 {
+		if err = countersOnce(c, ns, fmt.Sprintf("conformance/ip/%d", attempt)); err == nil {
+			return
+		}
+	}
+	t.Fatal(err)
+}
+
+func countersOnce(c context.Context, ns []coord.Backend, key string) error {
 	for i := 1; i <= 4; i++ {
-		n, err := ns[i%len(ns)].Counters().Add(c, "conformance/ip", 1, time.Hour)
+		n, err := ns[i%len(ns)].Counters().Add(c, key, 1, time.Hour)
 		if err != nil {
-			t.Fatal(err)
+			return err
 		}
 		if n != int64(i) {
-			t.Fatalf("count = %d, want %d", n, i)
+			return fmt.Errorf("count = %d, want %d", n, i)
 		}
 	}
-	if n, _ := ns[0].Counters().Add(c, "conformance/ip", 1, time.Minute); n != 1 {
-		t.Fatalf("a different window is a different counter: got %d, want 1", n)
+	if n, err := ns[0].Counters().Add(c, key, 1, time.Minute); err != nil || n != 1 {
+		return fmt.Errorf("a different window is a different counter: got %d (err %v), want 1", n, err)
 	}
+	return nil
 }

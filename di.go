@@ -4,8 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
+
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/thec1oud/galleon/clock"
+	"github.com/thec1oud/galleon/coord"
 )
 
 type provider struct {
@@ -179,11 +186,31 @@ func Replace[T any](value T) Option {
 	return func(s *settings) { s.replacements = append(s.replacements, r) }
 }
 
+// kernelOptions names the option to use instead of Replace for the values the
+// kernel itself provides, since the kernel also uses them directly.
+var kernelOptions = map[reflect.Type]string{
+	reflect.TypeFor[*slog.Logger]():         "galleon.Logger",
+	reflect.TypeFor[clock.Clock]():          "galleon.Clock",
+	reflect.TypeFor[coord.Backend]():        "galleon.Coordination",
+	reflect.TypeFor[trace.TracerProvider](): "galleon.TracerProvider",
+	reflect.TypeFor[metric.MeterProvider](): "galleon.MeterProvider",
+}
+
 func (a *App) applyReplacements() {
+	replaced := map[reflect.Type]string{}
 	for _, r := range a.settings.replacements {
+		if opt, ok := kernelOptions[r.typ]; ok {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): the kernel provides %s and uses it itself; set it with %s instead", r.typ, r.site, r.typ, opt))
+			continue
+		}
+		if prev, ok := replaced[r.typ]; ok {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): %s is already replaced at %s", r.typ, r.site, r.typ, prev))
+			continue
+		}
+		replaced[r.typ] = r.site
 		p, ok := a.providers[r.typ]
 		if !ok {
-			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): nothing provides %s", r.typ, r.site, r.typ))
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): nothing provides %s%s", r.typ, r.site, r.typ, suggest(r.typ, a.providers)))
 			continue
 		}
 		p.ctor, p.params = reflect.Value{}, nil
