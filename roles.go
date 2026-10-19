@@ -70,7 +70,6 @@ func (a *App) watchReadiness(ctx context.Context) {
 	}
 	go func() {
 		defer close(done)
-		defer cancel()
 		t := time.NewTicker(50 * time.Millisecond)
 		defer t.Stop()
 		for a.Ready(ctx) != nil {
@@ -84,10 +83,7 @@ func (a *App) watchReadiness(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			hctx, hcancel := context.WithTimeout(ctx, a.settings.startTimeout)
-			err := h.fn(hctx)
-			hcancel()
-			if err != nil {
+			if err := h.fn(ctx); err != nil {
 				if ctx.Err() != nil {
 					return // cancelled by Shutdown: not a failure
 				}
@@ -95,7 +91,16 @@ func (a *App) watchReadiness(ctx context.Context) {
 				return
 			}
 		}
-		if err := process.NotifyReady(); err != nil {
+		// Shutdown moves the state on under a.mu before cancelling, so
+		// checking it under the same lock means a draining worker never
+		// tells the supervisor it is ready.
+		a.mu.Lock()
+		var err error
+		if a.state == stateStarted && ctx.Err() == nil {
+			err = process.NotifyReady()
+		}
+		a.mu.Unlock()
+		if err != nil {
 			a.log.Error("reporting readiness to the supervisor failed", "error", err)
 		}
 	}()

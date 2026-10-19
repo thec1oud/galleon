@@ -74,7 +74,9 @@ func (r *Registry) OnStart(fn func(ctx context.Context) error) {
 // OnStart: with shared ports, a socket gets connections as soon as it listens,
 // so a worker of a new generation would otherwise take traffic before it is
 // ready. A hook must return promptly: start serving in a goroutine (for
-// example go srv.Serve(ln)) and honour ctx, which Shutdown cancels.
+// example go srv.Serve(ln)). ctx stays live after the hook returns and is
+// cancelled when Shutdown begins, so it can be used as the server's base
+// context; a hook still running when Shutdown begins should return.
 func (r *Registry) OnReady(fn func(ctx context.Context) error) {
 	r.app.readyHooks = append(r.app.readyHooks, hook{module: r.module, site: callerSite(2), fn: fn})
 }
