@@ -284,3 +284,75 @@ func TestResolveBeforeStartFails(t *testing.T) {
 		t.Fatal("Resolve before Start should fail")
 	}
 }
+
+type Mailer interface{ Send(to string) error }
+type smtpMailer struct{}
+
+func (smtpMailer) Send(string) error { return errors.New("would send real mail") }
+
+type fakeMailer struct {
+	sent      []string
+	lifecycle []string
+}
+
+func (f *fakeMailer) Send(to string) error { f.sent = append(f.sent, to); return nil }
+func (f *fakeMailer) Start(context.Context) error {
+	f.lifecycle = append(f.lifecycle, "start")
+	return nil
+}
+func (f *fakeMailer) Stop(context.Context) error {
+	f.lifecycle = append(f.lifecycle, "stop")
+	return nil
+}
+
+func TestReplaceSwapsAProvider(t *testing.T) {
+	mod := galleon.ModuleFunc("mail", func(r *galleon.Registry) error {
+		galleon.Provide[Mailer](r, func(*Repo) Mailer { return smtpMailer{} })
+		return nil
+	})
+	fake := &fakeMailer{}
+	// *Repo is not provided: replacing Mailer also drops its constructor's needs.
+	app, err := galleon.New(append(base(mod), galleon.Replace[Mailer](fake))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer app.Shutdown(context.Background())
+	if err := galleon.MustResolve[Mailer](app).Send("a@b"); err != nil || len(fake.sent) != 1 {
+		t.Fatalf("fake not used: err=%v sent=%v", err, fake.sent)
+	}
+	_ = app.Shutdown(context.Background())
+	if len(fake.lifecycle) != 0 {
+		t.Fatalf("a replaced value belongs to the test and must not be started or stopped: %v", fake.lifecycle)
+	}
+
+	_, err = galleon.New(append(base(), galleon.Replace[Mailer](fake))...)
+	if err == nil || !strings.Contains(err.Error(), "nothing provides galleon_test.Mailer") || !strings.Contains(err.Error(), "app_test.go") {
+		t.Fatalf("stale replacement should fail boot naming the call site, got %v", err)
+	}
+}
+
+func TestReplaceRefusesKernelValuesAndDuplicates(t *testing.T) {
+	_, err := galleon.New(append(base(), galleon.Replace[coord.Backend](local.New()))...)
+	if err == nil || !strings.Contains(err.Error(), "set it with galleon.Coordination instead") {
+		t.Fatalf("replacing a kernel value should point at its option, got %v", err)
+	}
+	mod := galleon.ModuleFunc("mail", func(r *galleon.Registry) error {
+		galleon.Provide[Mailer](r, func() Mailer { return smtpMailer{} })
+		return nil
+	})
+	_, err = galleon.New(append(base(mod), galleon.Replace[Mailer](&fakeMailer{}), galleon.Replace[Mailer](&fakeMailer{}))...)
+	if err == nil || !strings.Contains(err.Error(), "is already replaced at") {
+		t.Fatalf("a second Replace of the same type should fail, got %v", err)
+	}
+	_, err = galleon.New(append(base(), galleon.Replace[galleon.Node](galleon.Node{Host: "fake"}))...)
+	if err == nil || !strings.Contains(err.Error(), "the kernel provides galleon.Node") {
+		t.Fatalf("every kernel value should be refused, got %v", err)
+	}
+	_, err = galleon.New(append(base(mod), galleon.Replace[Mailer](nil))...)
+	if err == nil || !strings.Contains(err.Error(), "the replacement is nil") {
+		t.Fatalf("a nil replacement should fail boot, got %v", err)
+	}
+}

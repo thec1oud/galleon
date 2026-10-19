@@ -11,8 +11,9 @@ This repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each mod
 | Module | Path | Contents |
 |---|---|---|
 | `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness, node identity, OpenTelemetry and slog), the clock seam, roles and the process supervisor, the error model, coordination interfaces and the in-process `local` backend |
+| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites, starting with `conformance/coordtest` |
 
-Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `testkit`, `pg`, `coord-pg`, `jobs`, `web`, `realtime`, `http3`, `adapters/*`, `cmd/galleon`.
+Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `pg`, `coord-pg`, `jobs`, `web`, `realtime`, `http3`, `adapters/*`, `cmd/galleon`.
 
 Dependency rules: the core imports no battery and no adapter; a battery imports only the core's public API; an adapter imports the core plus its one tool.
 
