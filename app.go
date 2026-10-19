@@ -218,7 +218,7 @@ func New(opts ...Option) (*App, error) {
 		a.bootErrs = append(a.bootErrs, nodeErr)
 	}
 	if err := a.loadConfig(); err != nil {
-		return nil, a.failBoot(err)
+		return nil, a.failBoot(&BootError{Errs: append(a.bootErrs, err)})
 	}
 
 	kernel := &Registry{app: a, module: "galleon"}
@@ -354,7 +354,11 @@ func (a *App) checkCoordination() {
 func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	if a.state != stateBuilt {
+		st := a.state
 		a.mu.Unlock()
+		if st == stateStopped {
+			return errors.New("galleon: Start called after Shutdown; an app runs once")
+		}
 		return errors.New("galleon: Start called twice")
 	}
 	a.state = stateStarting
@@ -440,7 +444,8 @@ func (a *App) Shutdown(ctx context.Context) error {
 	case stateStarted:
 	case stateBuilt:
 		// Never started: nothing to drain or stop, but the telemetry
-		// providers the app was handed still need flushing.
+		// providers the app was handed still need flushing. Shutdown is
+		// final, so the app can't be started afterwards.
 		a.state = stateStopped
 		a.mu.Unlock()
 		return shutdownTelemetry(ctx, &a.settings)

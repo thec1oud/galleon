@@ -11,6 +11,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
@@ -159,12 +160,31 @@ func TestOwnedProviderIsShutDownExactlyOnce(t *testing.T) {
 	}
 	for name, run := range cases {
 		t.Run(name, func(t *testing.T) {
-			tp, calls, _ := newFlushing()
-			run(t, append(base(), galleon.TracerProvider(tp)))
-			if *calls != 1 {
-				t.Fatalf("Shutdown called %d times, want 1", *calls)
+			tp, tcalls, _ := newFlushing()
+			mp := &flushingMP{}
+			run(t, append(base(), galleon.TracerProvider(tp), galleon.MeterProvider(mp)))
+			if *tcalls != 1 || mp.calls != 1 {
+				t.Fatalf("Shutdown called %d times on the tracer and %d on the meter provider, want 1 each", *tcalls, mp.calls)
 			}
 		})
+	}
+}
+
+type flushingMP struct {
+	metricnoop.MeterProvider
+	calls int
+}
+
+func (p *flushingMP) Shutdown(context.Context) error { p.calls++; return nil }
+
+func TestStartAfterShutdownIsRefusedClearly(t *testing.T) {
+	app, err := galleon.New(base()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = app.Shutdown(context.Background())
+	if err := app.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "after Shutdown") {
+		t.Fatalf("Start after Shutdown = %v", err)
 	}
 }
 
