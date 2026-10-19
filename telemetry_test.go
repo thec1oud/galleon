@@ -3,11 +3,13 @@ package galleon_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -49,6 +51,29 @@ func TestLogsCarryNodeTraceAndContextAttrs(t *testing.T) {
 			t.Errorf("log line missing %q:\n%s", want, line)
 		}
 	}
+
+	// Inside a group, the context attrs stay top-level keys.
+	buf.Reset()
+	got.WithGroup("http").With("status", 200).InfoContext(ctx, "grouped", "path", "/x")
+	line = buf.String()
+	for _, want := range []string{" trace_id=", " request_id=r-1", "http.status=200", "http.path=/x"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("grouped log line missing %q:\n%s", want, line)
+		}
+	}
+	if strings.Contains(line, "http.trace_id") {
+		t.Errorf("trace_id was put inside the group:\n%s", line)
+	}
+
+	// No valid span: no trace IDs. A child's attrs don't leak into its parent.
+	buf.Reset()
+	parent := galleon.WithLogAttrs(context.Background(), slog.String("a", "1"))
+	_ = galleon.WithLogAttrs(parent, slog.String("b", "2"))
+	got.InfoContext(parent, "plain")
+	line = buf.String()
+	if strings.Contains(line, "trace_id") || strings.Contains(line, "b=2") || !strings.Contains(line, "a=1") {
+		t.Errorf("unexpected attrs on a record without a span:\n%s", line)
+	}
 }
 
 func TestDefaultLoggerLevelIsAdjustable(t *testing.T) {
@@ -73,9 +98,107 @@ func TestDefaultLoggerLevelIsAdjustable(t *testing.T) {
 type flushingTP struct {
 	noop.TracerProvider
 	flushed *bool
+	calls   *int
+	ctxErr  *error
 }
 
-func (p flushingTP) Shutdown(context.Context) error { *p.flushed = true; return nil }
+func (p flushingTP) Shutdown(ctx context.Context) error {
+	*p.flushed = true
+	if p.calls != nil {
+		*p.calls++
+	}
+	if p.ctxErr != nil {
+		*p.ctxErr = ctx.Err()
+	}
+	return nil
+}
+
+func newFlushing() (flushingTP, *int, *error) {
+	calls, ctxErr := new(int), new(error)
+	return flushingTP{flushed: new(bool), calls: calls, ctxErr: ctxErr}, calls, ctxErr
+}
+
+func TestOwnedProviderIsShutDownExactlyOnce(t *testing.T) {
+	cases := map[string]func(t *testing.T, opts []galleon.Option){
+		"after shutdown": func(t *testing.T, opts []galleon.Option) {
+			app, err := galleon.New(opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = app.Start(context.Background())
+			_ = app.Shutdown(context.Background())
+			_ = app.Shutdown(context.Background())
+		},
+		"after a failed start": func(t *testing.T, opts []galleon.Option) {
+			mod := galleon.ModuleFunc("m", func(r *galleon.Registry) error {
+				galleon.Provide[failing](r, func() failing { return failing{} })
+				return nil
+			})
+			app, err := galleon.New(append(opts, galleon.Modules(mod))...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if app.Start(context.Background()) == nil {
+				t.Fatal("start should fail")
+			}
+			_ = app.Shutdown(context.Background())
+		},
+		"when New fails": func(t *testing.T, opts []galleon.Option) {
+			if _, err := galleon.New(append(opts, galleon.ConfigJSON([]byte(`{"typo":{}}`)))...); err == nil {
+				t.Fatal("New should fail")
+			}
+		},
+		"when never started": func(t *testing.T, opts []galleon.Option) {
+			app, err := galleon.New(opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = app.Shutdown(context.Background())
+			_ = app.Shutdown(context.Background())
+		},
+	}
+	for name, run := range cases {
+		t.Run(name, func(t *testing.T) {
+			tp, calls, _ := newFlushing()
+			run(t, append(base(), galleon.TracerProvider(tp)))
+			if *calls != 1 {
+				t.Fatalf("Shutdown called %d times, want 1", *calls)
+			}
+		})
+	}
+}
+
+func TestFlushGetsItsOwnDeadline(t *testing.T) {
+	tp, calls, ctxErr := newFlushing()
+	app, err := galleon.New(append(base(), galleon.TracerProvider(tp))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = app.Start(context.Background())
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = app.Shutdown(spent)
+	if *calls != 1 || *ctxErr != nil {
+		t.Fatalf("flush calls=%d ctx err=%v: the flush must not inherit a spent context", *calls, *ctxErr)
+	}
+}
+
+func TestGlobalAndNilProvidersAreNeverShutDown(t *testing.T) {
+	global, calls, _ := newFlushing()
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(global)
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	app, err := galleon.New(append(base(), galleon.TracerProvider(nil), galleon.MeterProvider(nil))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = app.Start(context.Background())
+	_ = app.Shutdown(context.Background())
+	if *calls != 0 {
+		t.Fatal("the global provider was shut down")
+	}
+}
 
 func TestOwnedTracerProviderIsFlushedLast(t *testing.T) {
 	var flushed bool
@@ -133,7 +256,9 @@ func TestGenerationFromEnvironment(t *testing.T) {
 		t.Fatalf("generation = %d", app.Node().Generation)
 	}
 	t.Setenv(galleon.GenerationEnv, "x")
-	if _, err := galleon.New(base()...); err == nil {
-		t.Fatal("invalid generation should fail boot")
+	_, err = galleon.New(base()...)
+	var be *galleon.BootError
+	if !errors.As(err, &be) || !strings.Contains(err.Error(), `GALLEON_GENERATION="x" is not a generation number`) {
+		t.Fatalf("invalid generation should be a boot error naming the variable, got %v", err)
 	}
 }

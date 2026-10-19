@@ -200,10 +200,7 @@ func New(opts ...Option) (*App, error) {
 		level = new(slog.LevelVar)
 		s.logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	}
-	node, err := currentNode()
-	if err != nil {
-		return nil, fmt.Errorf("galleon: %w", err)
-	}
+	node, nodeErr := currentNode()
 	a := &App{
 		name:         s.name,
 		log:          slog.New(ContextHandler(s.logger.Handler())).With("app", s.name, "node", node.String()),
@@ -217,8 +214,11 @@ func New(opts ...Option) (*App, error) {
 		knownRoles:   map[Role]bool{},
 	}
 
+	if nodeErr != nil {
+		a.bootErrs = append(a.bootErrs, nodeErr)
+	}
 	if err := a.loadConfig(); err != nil {
-		return nil, err
+		return nil, a.failBoot(err)
 	}
 
 	kernel := &Registry{app: a, module: "galleon"}
@@ -263,9 +263,18 @@ func New(opts ...Option) (*App, error) {
 		a.buildOrder = order
 	}
 	if len(a.bootErrs) > 0 {
-		return nil, &BootError{Errs: a.bootErrs}
+		return nil, a.failBoot(&BootError{Errs: a.bootErrs})
 	}
 	return a, nil
+}
+
+// failBoot releases the telemetry providers the app was handed, since no App
+// is returned to shut them down later.
+func (a *App) failBoot(err error) error {
+	if terr := shutdownTelemetry(context.Background(), &a.settings); terr != nil {
+		return errors.Join(err, terr)
+	}
+	return err
 }
 
 // BootError collects every problem found while building the app.
@@ -357,8 +366,8 @@ func (a *App) Start(ctx context.Context) error {
 		if serr := a.stopAll(stopCtx); serr != nil {
 			err = errors.Join(err, serr)
 		}
-		if terr := a.shutdownTelemetry(stopCtx); terr != nil {
-			err = errors.Join(err, fmt.Errorf("flushing telemetry: %w", terr))
+		if terr := shutdownTelemetry(stopCtx, &a.settings); terr != nil {
+			err = errors.Join(err, terr)
 		}
 		a.mu.Lock()
 		a.state = stateStopped
@@ -427,7 +436,15 @@ func (a *App) Ready(ctx context.Context) error {
 // stop hooks, then providers in reverse dependency order.
 func (a *App) Shutdown(ctx context.Context) error {
 	a.mu.Lock()
-	if a.state != stateStarted {
+	switch a.state {
+	case stateStarted:
+	case stateBuilt:
+		// Never started: nothing to drain or stop, but the telemetry
+		// providers the app was handed still need flushing.
+		a.state = stateStopped
+		a.mu.Unlock()
+		return shutdownTelemetry(ctx, &a.settings)
+	default:
 		a.mu.Unlock()
 		return nil
 	}
@@ -456,8 +473,8 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.state = stateStopped
 	a.mu.Unlock()
 	a.log.Info("stopped")
-	if err := a.shutdownTelemetry(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("flushing telemetry: %w", err))
+	if err := shutdownTelemetry(ctx, &a.settings); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

@@ -6,8 +6,14 @@ import (
 	"time"
 )
 
-// Fake is a Clock that only moves when told to. Timers, tickers and AfterFunc
-// callbacks fire in deadline order as Advance passes them.
+// Fake is a Clock that only moves when told to. Advance fires timers, tickers
+// and AfterFunc callbacks in deadline order, with the clock set to each one's
+// deadline as it fires.
+//
+// Unlike time.AfterFunc, callbacks that fall due during Advance run
+// synchronously in the goroutine calling Advance, so their order is
+// deterministic. They may use the clock, including scheduling more callbacks,
+// but must not block on something only the Advance caller can provide.
 type Fake struct {
 	mu      sync.Mutex
 	now     time.Time
@@ -61,19 +67,25 @@ func (f *Fake) NewTicker(d time.Duration) Ticker {
 }
 
 // Advance moves the clock forward by d, firing everything that falls due on the
-// way, each at its own deadline.
+// way, each at its own deadline, including anything a callback schedules
+// within the window.
 func (f *Fake) Advance(d time.Duration) {
 	f.mu.Lock()
 	target := f.now.Add(d)
-	for {
-		w := f.next(target)
-		if w == nil {
-			break
+	for len(f.waiters) > 0 && !f.waiters[0].at.After(target) {
+		w := f.waiters[0]
+		if w.at.After(f.now) { // never move backwards if a callback advanced further
+			f.now = w.at
 		}
-		f.now = w.at
-		f.fire(w)
+		if fn := f.fireLocked(w); fn != nil {
+			f.mu.Unlock()
+			fn()
+			f.mu.Lock()
+		}
 	}
-	f.now = target
+	if target.After(f.now) {
+		f.now = target
+	}
 	f.mu.Unlock()
 }
 
@@ -104,42 +116,45 @@ func (f *Fake) BlockUntil(n int) {
 	}
 }
 
-// next returns the earliest waiter due at or before target. Callers hold mu.
-func (f *Fake) next(target time.Time) *waiter {
-	if len(f.waiters) == 0 || f.waiters[0].at.After(target) {
-		return nil
-	}
-	return f.waiters[0]
-}
-
-// fire delivers a due waiter and re-arms tickers. Callers hold mu.
-func (f *Fake) fire(w *waiter) {
-	f.remove(w)
-	if w.fn != nil {
-		go w.fn()
-	} else {
-		select {
-		case w.ch <- f.now:
-		default: // like time.Ticker, drop ticks the reader hasn't taken
-		}
-	}
+// fireLocked delivers a due waiter and re-arms tickers on their schedule. It
+// returns the callback to run, which the caller runs without holding mu.
+func (f *Fake) fireLocked(w *waiter) func() {
+	f.removeLocked(w)
 	if w.period > 0 {
-		w.at = f.now.Add(w.period)
-		f.insert(w)
+		w.at = w.at.Add(w.period)
+		f.insertLocked(w)
 	}
+	if w.fn != nil {
+		return w.fn
+	}
+	select {
+	case w.ch <- f.now:
+	default: // like time.Ticker, drop ticks the reader hasn't taken
+	}
+	return nil
 }
 
 func (f *Fake) arm(w *waiter, d time.Duration) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	w.at = f.now.Add(d)
-	f.insert(w)
-	if d <= 0 {
-		f.fire(w)
+	fn := f.armLocked(w, d)
+	f.mu.Unlock()
+	if fn != nil {
+		go fn() // like time.AfterFunc(0, fn): not on the caller's stack
 	}
 }
 
-func (f *Fake) insert(w *waiter) {
+// armLocked schedules w after d. A non-positive d fires at once; the returned
+// callback, if any, must be run by the caller after releasing mu.
+func (f *Fake) armLocked(w *waiter, d time.Duration) func() {
+	w.at = f.now.Add(d)
+	f.insertLocked(w)
+	if d <= 0 {
+		return f.fireLocked(w)
+	}
+	return nil
+}
+
+func (f *Fake) insertLocked(w *waiter) {
 	f.seq++
 	w.seq = f.seq
 	w.active = true
@@ -150,11 +165,11 @@ func (f *Fake) insert(w *waiter) {
 	f.waiters = append(f.waiters, nil)
 	copy(f.waiters[i+1:], f.waiters[i:])
 	f.waiters[i] = w
-	f.notify()
+	f.notifyLocked()
 }
 
-// remove reports whether w was pending.
-func (f *Fake) remove(w *waiter) bool {
+// removeLocked reports whether w was pending.
+func (f *Fake) removeLocked(w *waiter) bool {
 	if !w.active {
 		return false
 	}
@@ -165,13 +180,25 @@ func (f *Fake) remove(w *waiter) bool {
 		}
 	}
 	w.active = false
-	f.notify()
+	f.notifyLocked()
 	return true
 }
 
-func (f *Fake) notify() {
+func (f *Fake) notifyLocked() {
 	close(f.changed)
 	f.changed = make(chan struct{})
+}
+
+// drain discards an undelivered value, as Stop and Reset do on time.Timer and
+// time.Ticker since Go 1.23.
+func drain(ch chan time.Time) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+	}
 }
 
 type fakeTimer struct {
@@ -184,14 +211,19 @@ func (t *fakeTimer) C() <-chan time.Time { return t.w.ch }
 func (t *fakeTimer) Stop() bool {
 	t.f.mu.Lock()
 	defer t.f.mu.Unlock()
-	return t.f.remove(t.w)
+	drain(t.w.ch)
+	return t.f.removeLocked(t.w)
 }
 
 func (t *fakeTimer) Reset(d time.Duration) bool {
 	t.f.mu.Lock()
-	wasActive := t.f.remove(t.w)
+	drain(t.w.ch)
+	wasActive := t.f.removeLocked(t.w)
+	fn := t.f.armLocked(t.w, d)
 	t.f.mu.Unlock()
-	t.f.arm(t.w, d)
+	if fn != nil {
+		go fn()
+	}
 	return wasActive
 }
 
@@ -205,7 +237,8 @@ func (t *fakeTicker) C() <-chan time.Time { return t.w.ch }
 func (t *fakeTicker) Stop() {
 	t.f.mu.Lock()
 	defer t.f.mu.Unlock()
-	t.f.remove(t.w)
+	drain(t.w.ch)
+	t.f.removeLocked(t.w)
 }
 
 func (t *fakeTicker) Reset(d time.Duration) {
@@ -213,8 +246,9 @@ func (t *fakeTicker) Reset(d time.Duration) {
 		panic("clock: non-positive interval for Ticker.Reset")
 	}
 	t.f.mu.Lock()
-	t.f.remove(t.w)
+	defer t.f.mu.Unlock()
+	drain(t.w.ch)
+	t.f.removeLocked(t.w)
 	t.w.period = d
-	t.f.mu.Unlock()
-	t.f.arm(t.w, d)
+	t.f.armLocked(t.w, d) // d > 0, so nothing fires here
 }
