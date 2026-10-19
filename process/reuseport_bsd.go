@@ -1,5 +1,7 @@
-//go:build darwin || freebsd || netbsd || openbsd || dragonfly
+//go:build darwin || netbsd || openbsd || dragonfly
 
 package process
 
-const soReusePort = 0x200 // SO_REUSEPORT
+import "golang.org/x/sys/unix"
+
+const soReusePort = unix.SO_REUSEPORT

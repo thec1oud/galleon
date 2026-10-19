@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -30,8 +31,14 @@ func TestHelperWorker(t *testing.T) {
 	if os.Getenv("GALLEON_TEST_HELPER") != "1" {
 		t.Skip("only runs as a supervised worker")
 	}
+	if os.Getenv(process.EnvWorker) != "" || os.Getenv(process.EnvReadyFD) != "" || !process.Supervised() {
+		fmt.Fprintln(os.Stderr, "supervisor variables leaked into the environment, or were not read")
+		os.Exit(4)
+	}
 	node := mustNode()
-	switch os.Getenv("HELPER_MODE") {
+	dir := os.Getenv("HELPER_DIR")
+	mode := os.Getenv("HELPER_MODE")
+	switch mode {
 	case "crash-once":
 		marker := filepath.Join(os.Getenv("HELPER_DIR"), "crashed")
 		if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
@@ -42,25 +49,53 @@ func TestHelperWorker(t *testing.T) {
 		if node > 1 {
 			<-make(chan struct{}) // never becomes ready; the supervisor stops it
 		}
+	case "crash-after-upgrade":
+		// Each generation-2 slot crashes once, shortly after reporting ready.
+		marker := filepath.Join(dir, fmt.Sprintf("crashed-%d", process.Slot()))
+		if _, err := os.Stat(marker); node > 1 && errors.Is(err, os.ErrNotExist) {
+			_ = os.WriteFile(marker, nil, 0o600)
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				os.Exit(5)
+			}()
+		}
 	}
 
-	var srv *http.Server
+	var srv atomic.Pointer[http.Server]
 	mod := galleon.ModuleFunc("web", func(r *galleon.Registry) error {
 		if !r.Active("web") {
 			return nil
 		}
-		r.OnStart(func(ctx context.Context) error {
+		r.OnReady(func(ctx context.Context) error {
 			ln, err := process.Listen(ctx, "tcp", os.Getenv("HELPER_ADDR"))
 			if err != nil {
 				return err
 			}
-			srv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				fmt.Fprintf(w, "%d %d", node, os.Getpid())
 			})}
-			go srv.Serve(ln)
+			srv.Store(server)
+			go server.Serve(ln)
 			return nil
 		})
-		r.OnDrain(func(ctx context.Context) error { return srv.Shutdown(ctx) })
+		r.OnDrain(func(ctx context.Context) error {
+			server := srv.Load()
+			if server == nil {
+				return nil
+			}
+			if mode == "hang-on-drain" && node == 1 {
+				<-make(chan struct{}) // ignores its deadline; only SIGKILL ends it
+			}
+			return server.Shutdown(ctx)
+		})
+		r.Gate("opened", func(context.Context) error {
+			if mode == "gated" && node > 1 {
+				if _, err := os.Stat(filepath.Join(dir, "open")); err != nil {
+					return errors.New("waiting for the test to open the gate")
+				}
+			}
+			return nil
+		})
 		return nil
 	})
 	app, err := galleon.New(
@@ -90,6 +125,7 @@ func mustNode() uint64 {
 
 type harness struct {
 	t    *testing.T
+	dir  string
 	addr string
 	sup  *process.Supervisor
 	logs *syncBuf
@@ -106,12 +142,12 @@ func newHarness(t *testing.T, n int, mode string, configure ...func(*process.Sup
 	addr := ln.Addr().String()
 	ln.Close()
 	logs := &syncBuf{}
-	h := &harness{t: t, addr: addr, logs: logs, done: make(chan error, 1)}
+	h := &harness{t: t, dir: t.TempDir(), addr: addr, logs: logs, done: make(chan error, 1)}
 	h.sup = &process.Supervisor{
 		Processes:    n,
 		Path:         os.Args[0],
 		Args:         []string{"-test.run=^TestHelperWorker$"},
-		Env:          []string{"GALLEON_TEST_HELPER=1", "HELPER_MODE=" + mode, "HELPER_ADDR=" + addr, "HELPER_DIR=" + t.TempDir()},
+		Env:          []string{"GALLEON_TEST_HELPER=1", "HELPER_MODE=" + mode, "HELPER_ADDR=" + addr, "HELPER_DIR=" + h.dir},
 		Logger:       slog.New(slog.NewTextHandler(logs, nil)),
 		ReadyTimeout: 10 * time.Second,
 		StopTimeout:  5 * time.Second,
@@ -120,7 +156,6 @@ func newHarness(t *testing.T, n int, mode string, configure ...func(*process.Sup
 	for _, c := range configure {
 		c(h.sup)
 	}
-	h.sup.Init()
 	ctx, cancel := context.WithCancel(context.Background())
 	h.stop = cancel
 	go func() { h.done <- h.sup.Run(ctx) }()
@@ -192,15 +227,13 @@ func TestUpgradeReplacesTheGeneration(t *testing.T) {
 	// After the old generation drains, every response comes from generation 2.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		alive := 0
+		running := 0
 		for pid := range old {
-			var p int
-			fmt.Sscan(pid, &p)
-			if proc, err := os.FindProcess(p); err == nil && proc.Signal(syscall.Signal(0)) == nil {
-				alive++
+			if alive(pid) {
+				running++
 			}
 		}
-		if alive == 0 {
+		if running == 0 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -227,9 +260,108 @@ func TestFailedUpgradeKeepsTheOldGeneration(t *testing.T) {
 	}
 }
 
+func alive(pid string) bool {
+	var p int
+	fmt.Sscan(pid, &p)
+	proc, err := os.FindProcess(p)
+	return err == nil && proc.Signal(syscall.Signal(0)) == nil
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting until %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestStuckRetiredWorkerIsKilled(t *testing.T) {
+	h := newHarness(t, 1, "hang-on-drain", func(s *process.Supervisor) { s.StopTimeout = time.Second })
+	old := h.waitWorkers("1", 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := h.sup.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for pid := range old {
+		eventually(t, "the stuck generation-1 worker is killed", func() bool { return !alive(pid) })
+	}
+	if !strings.Contains(h.logs.String(), "did not stop in time; killing it") {
+		t.Fatalf("kill not logged:\n%s", h.logs)
+	}
+}
+
+func TestCrashRightAfterUpgradeIsRestarted(t *testing.T) {
+	h := newHarness(t, 2, "crash-after-upgrade")
+	h.waitWorkers("1", 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := h.sup.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "both generation-2 workers have crashed once", func() bool {
+		a, _ := os.Stat(filepath.Join(h.dir, "crashed-0"))
+		b, _ := os.Stat(filepath.Join(h.dir, "crashed-1"))
+		return a != nil && b != nil
+	})
+	time.Sleep(500 * time.Millisecond) // past the crash
+	h.waitWorkers("2", 2)
+}
+
+func TestUpgradeWaitsForReadinessGates(t *testing.T) {
+	h := newHarness(t, 1, "gated")
+	h.waitWorkers("1", 1)
+	done := make(chan error, 1)
+	go func() { done <- h.sup.Upgrade(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("upgrade finished before the new generation's gate passed: %v", err)
+	case <-time.After(1500 * time.Millisecond):
+	}
+	for range 10 {
+		if g, _, err := h.get(); err == nil && g != "1" {
+			t.Fatalf("old generation must be serving alone until the gate passes, got %q", g)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(h.dir, "open"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("upgrade did not finish once the gate passed")
+	}
+}
+
+func TestStoppingMidUpgradeReleasesUpgrade(t *testing.T) {
+	h := newHarness(t, 1, "never-ready-after-1", func(s *process.Supervisor) { s.ReadyTimeout = time.Minute })
+	h.waitWorkers("1", 1)
+	done := make(chan error, 1)
+	go func() { done <- h.sup.Upgrade(context.Background()) }()
+	time.Sleep(500 * time.Millisecond)
+	h.stop()
+	select {
+	case err := <-done:
+		if !errors.Is(err, process.ErrStopped) {
+			t.Fatalf("Upgrade = %v, want ErrStopped", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Upgrade still blocked after the supervisor stopped")
+	}
+	if err := h.sup.Upgrade(context.Background()); !errors.Is(err, process.ErrStopped) {
+		t.Fatalf("Upgrade after Run returned = %v, want ErrStopped", err)
+	}
+}
+
 func TestStopEndsEveryWorker(t *testing.T) {
 	h := newHarness(t, 2, "")
-	h.waitWorkers("1", 2)
+	pids := h.waitWorkers("1", 2)
 	h.stop()
 	select {
 	case err := <-h.done:
@@ -242,6 +374,11 @@ func TestStopEndsEveryWorker(t *testing.T) {
 	h.done <- nil // for the cleanup
 	if _, _, err := h.get(); err == nil {
 		t.Fatal("port still served after stop")
+	}
+	for pid := range pids {
+		if alive(pid) {
+			t.Fatalf("worker %s still running after Run returned", pid)
+		}
 	}
 }
 

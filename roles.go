@@ -22,11 +22,17 @@ func Roles(roles ...Role) Option {
 	return func(s *settings) { s.roles = append(s.roles[:0:0], roles...) }
 }
 
-// Active reports whether this process runs role. Asking also declares the role
-// as known, so a configured role that no module asks about fails boot as a typo.
-func (r *Registry) Active(role Role) bool {
-	r.app.knownRoles[role] = true
-	return r.app.runs(role)
+// Active reports whether this process runs any of roles. Asking also declares
+// every role passed as known, so a configured role that no module asks about
+// fails boot as a typo. Pass all the roles a plane serves in one call rather
+// than combining calls with ||, which would stop declaring at the first match.
+func (r *Registry) Active(roles ...Role) bool {
+	active := false
+	for _, role := range roles {
+		r.app.knownRoles[role] = true
+		active = active || r.app.runs(role)
+	}
+	return active
 }
 
 // Roles returns the roles this process runs.
@@ -44,11 +50,11 @@ func (a *App) checkRoles() {
 	}
 }
 
-// notifySupervisorWhenReady reports readiness to a supervisor the first time
-// every readiness gate passes, so an upgrade only retires the old generation
-// once this one can serve.
-func (a *App) notifySupervisorWhenReady() {
-	if !process.Supervised() {
+// watchReadiness waits, after Start, until every readiness gate first passes,
+// then runs the OnReady hooks and reports readiness to a supervisor, so an
+// upgrade only retires the old generation once this one serves.
+func (a *App) watchReadiness() {
+	if len(a.readyHooks) == 0 && !process.Supervised() {
 		return
 	}
 	go func() {
@@ -62,12 +68,22 @@ func (a *App) notifySupervisorWhenReady() {
 				return
 			}
 			if a.Ready(context.Background()) == nil {
-				if err := process.NotifyReady(); err != nil {
-					a.log.Error("reporting readiness to the supervisor failed", "error", err)
-				}
-				return
+				break
 			}
 			<-t.C
+		}
+		for _, h := range a.readyHooks {
+			hctx, cancel := context.WithTimeout(context.Background(), a.settings.startTimeout)
+			err := h.fn(hctx)
+			cancel()
+			if err != nil {
+				// Not reporting ready lets a supervisor roll the upgrade back.
+				a.log.Error("ready hook failed; not reporting ready", "module", h.module, "site", h.site, "error", err)
+				return
+			}
+		}
+		if err := process.NotifyReady(); err != nil {
+			a.log.Error("reporting readiness to the supervisor failed", "error", err)
 		}
 	}()
 }
