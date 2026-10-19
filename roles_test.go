@@ -129,3 +129,50 @@ func TestReadyHookNeverRunsOnceShutdownBegins(t *testing.T) {
 		t.Fatal("OnReady ran after shutdown")
 	}
 }
+
+func TestShutdownDuringAReadyHookIsClean(t *testing.T) {
+	entered := make(chan struct{})
+	mod := galleon.ModuleFunc("web", func(r *galleon.Registry) error {
+		r.OnReady(func(ctx context.Context) error {
+			close(entered)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		return nil
+	})
+	app, err := galleon.New(base(mod)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx) }()
+	<-entered
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("a hook cancelled by shutdown is not a failure, got %v", err)
+	}
+}
+
+func TestShutdownIsNotHeldByABlockedReadyHook(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	mod := galleon.ModuleFunc("web", func(r *galleon.Registry) error {
+		r.OnReady(func(context.Context) error { close(entered); <-release; return nil })
+		return nil
+	})
+	app, err := galleon.New(base(mod)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = app.Start(context.Background())
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_ = app.Shutdown(ctx)
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Shutdown took %v; it must not wait past its deadline for a hook", d)
+	}
+}

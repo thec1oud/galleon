@@ -59,11 +59,9 @@ func (a *App) checkRoles() {
 // draining has begun. A failing hook is fatal: the app stops reporting ready
 // and Run returns the error, so a supervisor restarts the worker instead of
 // leaving it running with nothing listening.
-func (a *App) watchReadiness() {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+func (a *App) watchReadiness(ctx context.Context) {
 	a.mu.Lock()
-	a.readyCancel, a.readyDone = cancel, done
+	cancel, done := a.readyCancel, a.readyDone
 	a.mu.Unlock()
 	if len(a.readyHooks) == 0 && !process.Supervised() {
 		cancel()
@@ -90,6 +88,9 @@ func (a *App) watchReadiness() {
 			err := h.fn(hctx)
 			hcancel()
 			if err != nil {
+				if ctx.Err() != nil {
+					return // cancelled by Shutdown: not a failure
+				}
 				a.die(fmt.Errorf("ready hook of module %q (%s): %w", h.module, h.site, err))
 				return
 			}
@@ -100,14 +101,22 @@ func (a *App) watchReadiness() {
 	}()
 }
 
-// stopWatchingReadiness cancels watchReadiness and waits until it has returned.
-func (a *App) stopWatchingReadiness() {
+// stopWatchingReadiness cancels watchReadiness and waits until it has
+// returned, or until ctx ends, so a hook that ignores its context can't hang
+// shutdown.
+func (a *App) stopWatchingReadiness(ctx context.Context) error {
 	a.mu.Lock()
 	cancel, done := a.readyCancel, a.readyDone
 	a.mu.Unlock()
-	if cancel != nil {
-		cancel()
-		<-done
+	if cancel == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

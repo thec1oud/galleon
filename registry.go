@@ -73,7 +73,8 @@ func (r *Registry) OnStart(fn func(ctx context.Context) error) {
 // in registration order. Listeners should start accepting here rather than in
 // OnStart: with shared ports, a socket gets connections as soon as it listens,
 // so a worker of a new generation would otherwise take traffic before it is
-// ready.
+// ready. A hook must return promptly: start serving in a goroutine (for
+// example go srv.Serve(ln)) and honour ctx, which Shutdown cancels.
 func (r *Registry) OnReady(fn func(ctx context.Context) error) {
 	r.app.readyHooks = append(r.app.readyHooks, hook{module: r.module, site: callerSite(2), fn: fn})
 }
