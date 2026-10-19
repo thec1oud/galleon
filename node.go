@@ -8,12 +8,13 @@ import (
 	"strconv"
 
 	"github.com/thec1oud/galleon/coord"
+	"github.com/thec1oud/galleon/process"
 )
 
 // GenerationEnv names the environment variable a supervisor sets on the
 // processes it starts, so each generation of workers is distinguishable during
 // a zero-downtime upgrade.
-const GenerationEnv = "GALLEON_GENERATION"
+const GenerationEnv = process.EnvGeneration
 
 // Node identifies this process in coordination, telemetry and leases. It is
 // provided to dependency injection as Node.
@@ -40,7 +41,11 @@ func currentNode() (Node, error) {
 		host = "unknown"
 	}
 	var gen uint64
-	if s := os.Getenv(GenerationEnv); s != "" {
+	s := process.Generation()
+	if v, ok := os.LookupEnv(GenerationEnv); ok {
+		s = v // set directly, without a supervisor
+	}
+	if s != "" {
 		if gen, err = strconv.ParseUint(s, 10, 64); err != nil {
 			return Node{Host: host, PID: os.Getpid()}, fmt.Errorf("%s=%q is not a generation number", GenerationEnv, s)
 		}

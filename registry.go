@@ -69,6 +69,20 @@ func (r *Registry) OnStart(fn func(ctx context.Context) error) {
 	r.app.startHooks = append(r.app.startHooks, hook{module: r.module, site: callerSite(2), fn: fn})
 }
 
+// OnReady runs once, the first time every readiness gate passes after Start,
+// in registration order. Listeners should start accepting here rather than in
+// OnStart: with shared ports, a socket gets connections as soon as it listens,
+// so a worker of a new generation would otherwise take traffic before it is
+// ready. A hook must return promptly: start serving in a goroutine (for
+// example go srv.Serve(ln)). ctx stays live after the hook returns and is
+// cancelled as soon as Shutdown begins, before the drain grace and OnDrain,
+// so it must not become the context of requests that should finish while
+// draining; stop servers in OnDrain instead. A hook still running when
+// Shutdown begins should return.
+func (r *Registry) OnReady(fn func(ctx context.Context) error) {
+	r.app.readyHooks = append(r.app.readyHooks, hook{module: r.module, site: callerSite(2), fn: fn})
+}
+
 // OnStop runs during shutdown, in reverse registration order, before providers stop.
 func (r *Registry) OnStop(fn func(ctx context.Context) error) {
 	r.app.stopHooks = append(r.app.stopHooks, hook{module: r.module, site: callerSite(2), fn: fn})

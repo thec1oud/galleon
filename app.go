@@ -23,6 +23,7 @@ import (
 
 	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/coord"
+	"github.com/thec1oud/galleon/process"
 )
 
 // Deployment declares how many instances of the app will run. It lets boot
@@ -64,6 +65,7 @@ type settings struct {
 	meterProvider   metric.MeterProvider
 	ownTracer       bool
 	ownMeter        bool
+	roles           []Role
 }
 
 // Option configures an App.
@@ -149,10 +151,12 @@ type App struct {
 	configOwners map[string]string
 	configReport []ConfigValue
 
+	knownRoles map[Role]bool
 	needs      []need
 	requires   []require
 	gates      []gate
 	startHooks []hook
+	readyHooks []hook
 	stopHooks  []hook
 	drainHooks []hook
 
@@ -162,6 +166,11 @@ type App struct {
 	state        state
 	started      []*provider // providers whose Start succeeded, in order
 	fullyStarted bool        // every provider and start hook succeeded
+	sealed       bool        // New has returned; registrations are closed
+	readyCancel  context.CancelFunc
+	readyDone    chan struct{}
+	fatal        chan struct{} // closed by die
+	fatalErr     error
 }
 
 // New configures, registers and validates the whole app. Every wiring, config
@@ -178,6 +187,9 @@ func New(opts ...Option) (*App, error) {
 	}
 	if s.name == "" {
 		s.name = "app"
+	}
+	if len(s.roles) == 0 {
+		s.roles = []Role{RoleAll}
 	}
 	if s.clock == nil {
 		s.clock = clock.System()
@@ -204,6 +216,8 @@ func New(opts ...Option) (*App, error) {
 		providers:    map[reflectType]*provider{},
 		configRaw:    map[string]json.RawMessage{},
 		configOwners: map[string]string{},
+		knownRoles:   map[Role]bool{},
+		fatal:        make(chan struct{}),
 	}
 
 	if nodeErr != nil {
@@ -247,6 +261,7 @@ func New(opts ...Option) (*App, error) {
 		}
 	}
 	a.checkCoordination()
+	a.checkRoles()
 
 	if order, err := a.resolveGraph(); err != nil {
 		a.bootErrs = append(a.bootErrs, err)
@@ -256,6 +271,7 @@ func New(opts ...Option) (*App, error) {
 	if len(a.bootErrs) > 0 {
 		return nil, a.failBoot(&BootError{Errs: a.bootErrs})
 	}
+	a.sealed = true
 	return a, nil
 }
 
@@ -319,10 +335,16 @@ func (a *App) checkCoordination() {
 	if caps.Scope == coord.ScopeCluster || len(a.needs) == 0 {
 		return
 	}
-	switch a.settings.deployment {
+	deployment := a.settings.deployment
+	if process.Supervised() {
+		// Workers of one supervisor are separate processes: a process-scoped
+		// backend gives each its own locks and leaders.
+		deployment = MultiNode
+	}
+	switch deployment {
 	case MultiNode:
 		if !a.settings.allowPerProcess {
-			a.bootErrs = append(a.bootErrs, fmt.Errorf("deployment is multi-node but coordination backend %q only guarantees within one process; "+
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("the app runs as several processes (multi-node, or under a supervisor) but coordination backend %q only guarantees within one process; "+
 				"use a cluster backend, or set galleon.AllowPerProcessGuarantees() to accept per-process guarantees", caps.Name))
 			return
 		}
@@ -390,8 +412,13 @@ func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	a.state = stateStarted
 	a.fullyStarted = true
+	// Set up under the same lock as stateStarted, so a concurrent Shutdown
+	// always finds the watcher to cancel.
+	readyCtx, readyCancel := context.WithCancel(context.Background())
+	a.readyCancel, a.readyDone = readyCancel, make(chan struct{})
 	a.mu.Unlock()
-	a.log.Info("started", "providers", len(a.started), "deployment", a.settings.deployment.String(), "coordination", a.backend.Capabilities().Name)
+	a.watchReadiness(readyCtx)
+	a.log.Info("started", "roles", a.settings.roles, "providers", len(a.started), "deployment", a.settings.deployment.String(), "coordination", a.backend.Capabilities().Name)
 	return nil
 }
 
@@ -403,6 +430,12 @@ func (a *App) Ready(ctx context.Context) error {
 	a.mu.Unlock()
 	switch st {
 	case stateStarted:
+		a.mu.Lock()
+		fatal := a.fatalErr
+		a.mu.Unlock()
+		if fatal != nil {
+			return fatal
+		}
 	case stateDraining:
 		return errors.New("draining")
 	default:
@@ -439,6 +472,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	}
 	a.state = stateDraining
 	a.mu.Unlock()
+	if err := a.stopWatchingReadiness(ctx); err != nil {
+		a.log.Warn("ready hook still running at shutdown; draining anyway", "error", err)
+	}
 	a.log.Info("draining", "grace", a.settings.drainGrace)
 
 	if a.settings.drainGrace > 0 {
@@ -505,17 +541,26 @@ func (a *App) runHook(ctx context.Context, h hook, kind string) error {
 	return nil
 }
 
-// Run starts the app, waits for ctx to end or for SIGINT/SIGTERM, then shuts down.
+// Run starts the app, waits for ctx to end, for SIGINT/SIGTERM, or for a fatal
+// error such as a failed OnReady hook, then shuts down. It returns the fatal
+// error, if any, so the process can exit non-zero.
 func (a *App) Run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := a.Start(ctx); err != nil {
 		return err
 	}
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-a.fatal:
+	}
 	sctx, cancel := context.WithTimeout(context.Background(), a.settings.drainGrace+a.settings.stopTimeout)
 	defer cancel()
-	return a.Shutdown(sctx)
+	err := a.Shutdown(sctx)
+	a.mu.Lock()
+	fatal := a.fatalErr
+	a.mu.Unlock()
+	return errors.Join(fatal, err)
 }
 
 // Name returns the app's name.
