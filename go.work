@@ -1,0 +1,5 @@
+go 1.24
+
+// Every module in this repository is listed here. Add new modules
+// (pg, jobs, web, adapters/...) with `go work use ./<dir>`.
+use .

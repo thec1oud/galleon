@@ -1,0 +1,165 @@
+package galleon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+)
+
+type provider struct {
+	typ        reflect.Type
+	ctor       reflect.Value
+	params     []reflect.Type
+	returnsErr bool
+	module     string
+	site       string
+
+	value reflect.Value
+	built bool
+}
+
+func (p *provider) describe() string {
+	return fmt.Sprintf("%s (module %q, %s)", p.typ, p.module, p.site)
+}
+
+func (a *App) addProvider(r *Registry, p *provider) {
+	if prev, ok := a.providers[p.typ]; ok {
+		r.errorf("%s is already provided by %s", p.typ, prev.describe())
+		return
+	}
+	a.providers[p.typ] = p
+	a.providerOrder = append(a.providerOrder, p)
+}
+
+// resolveGraph checks that every dependency is provided and that there are no
+// cycles, and returns providers in an order where dependencies come first.
+func (a *App) resolveGraph() ([]*provider, error) {
+	var errs []error
+	for _, p := range a.providerOrder {
+		for _, dep := range p.params {
+			if _, ok := a.providers[dep]; !ok {
+				errs = append(errs, fmt.Errorf("%s needs %s, but nothing provides it%s", p.describe(), dep, suggest(dep, a.providers)))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+
+	const (
+		unvisited = iota
+		visiting
+		done
+	)
+	state := map[*provider]int{}
+	var order []*provider
+	var stack []*provider
+	var visit func(p *provider) error
+	visit = func(p *provider) error {
+		switch state[p] {
+		case done:
+			return nil
+		case visiting:
+			var path []string
+			start := 0
+			for i, s := range stack {
+				if s == p {
+					start = i
+				}
+			}
+			for _, s := range stack[start:] {
+				path = append(path, s.typ.String())
+			}
+			path = append(path, p.typ.String())
+			return fmt.Errorf("dependency cycle: %s (first registered at %s)", strings.Join(path, " -> "), stack[start].site)
+		}
+		state[p] = visiting
+		stack = append(stack, p)
+		for _, dep := range p.params {
+			if err := visit(a.providers[dep]); err != nil {
+				return err
+			}
+		}
+		stack = stack[:len(stack)-1]
+		state[p] = done
+		order = append(order, p)
+		return nil
+	}
+	for _, p := range a.providerOrder {
+		if err := visit(p); err != nil {
+			return nil, err
+		}
+	}
+	return order, nil
+}
+
+// suggest names a provided type that would satisfy dep with a pointer/value or
+// interface adjustment, the most common wiring mistake.
+func suggest(dep reflect.Type, providers map[reflect.Type]*provider) string {
+	for t := range providers {
+		switch {
+		case dep.Kind() == reflect.Pointer && dep.Elem() == t,
+			t.Kind() == reflect.Pointer && t.Elem() == dep:
+			return fmt.Sprintf(" (did you mean %s?)", t)
+		case dep.Kind() == reflect.Interface && t.Implements(dep):
+			return fmt.Sprintf(" (%s implements it: provide it as %s)", t, dep)
+		}
+	}
+	return ""
+}
+
+func (a *App) build(p *provider) error {
+	if p.built {
+		return nil
+	}
+	args := make([]reflect.Value, len(p.params))
+	for i, dep := range p.params {
+		args[i] = a.providers[dep].value
+	}
+	out := p.ctor.Call(args)
+	if p.returnsErr && !out[1].IsNil() {
+		return fmt.Errorf("constructing %s: %w", p.describe(), out[1].Interface().(error))
+	}
+	v := reflect.New(p.typ).Elem()
+	v.Set(out[0])
+	p.value = v
+	p.built = true
+	return nil
+}
+
+// Resolve returns the instance of T. It only works after Start.
+func Resolve[T any](a *App) (T, error) {
+	var zero T
+	a.mu.Lock()
+	started := a.state >= stateStarted
+	a.mu.Unlock()
+	if !started {
+		return zero, errors.New("galleon: Resolve called before Start")
+	}
+	p, ok := a.providers[reflect.TypeFor[T]()]
+	if !ok {
+		return zero, fmt.Errorf("galleon: nothing provides %s", reflect.TypeFor[T]())
+	}
+	return p.value.Interface().(T), nil
+}
+
+// MustResolve is Resolve for tests and main functions.
+func MustResolve[T any](a *App) T {
+	v, err := Resolve[T](a)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// Starter and Stopper are implemented by provided values that hold resources.
+type Starter interface {
+	Start(ctx context.Context) error
+}
+type Stopper interface {
+	Stop(ctx context.Context) error
+}
+
+type reflectType = reflect.Type
