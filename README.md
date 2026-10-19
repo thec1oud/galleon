@@ -10,7 +10,7 @@ This repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each mod
 
 | Module | Path | Contents |
 |---|---|---|
-| `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness), the error model, coordination interfaces and the in-process `local` backend |
+| `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness, node identity, OpenTelemetry and slog), the clock seam, the error model, coordination interfaces and the in-process `local` backend |
 
 Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `testkit`, `pg`, `coord-pg`, `jobs`, `web`, `realtime`, `http3`, `adapters/*`, `cmd/galleon`.
 

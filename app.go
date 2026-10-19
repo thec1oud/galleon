@@ -17,6 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/coord"
 )
 
@@ -54,6 +59,11 @@ type settings struct {
 	stopTimeout     time.Duration
 	drainGrace      time.Duration
 	gateTimeout     time.Duration
+	clock           clock.Clock
+	tracerProvider  trace.TracerProvider
+	meterProvider   metric.MeterProvider
+	ownTracer       bool
+	ownMeter        bool
 }
 
 // Option configures an App.
@@ -67,7 +77,12 @@ func Coordination(b coord.Backend) Option { return func(s *settings) { s.backend
 
 func Modules(m ...Module) Option { return func(s *settings) { s.modules = append(s.modules, m...) } }
 
+// Logger sets the logger. The kernel wraps its handler with ContextHandler and
+// adds the app name and node to every record.
 func Logger(l *slog.Logger) Option { return func(s *settings) { s.logger = l } }
+
+// Clock sets the clock the app provides to modules. The default is clock.System().
+func Clock(c clock.Clock) Option { return func(s *settings) { s.clock = c } }
 
 func Deploy(d Deployment) Option { return func(s *settings) { s.deployment = d } }
 
@@ -121,6 +136,8 @@ const (
 type App struct {
 	name     string
 	log      *slog.Logger
+	level    *slog.LevelVar
+	node     Node
 	backend  coord.Backend
 	settings settings
 
@@ -162,12 +179,26 @@ func New(opts ...Option) (*App, error) {
 	if s.name == "" {
 		s.name = "app"
 	}
-	if s.logger == nil {
-		s.logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if s.clock == nil {
+		s.clock = clock.System()
 	}
+	if s.tracerProvider == nil {
+		s.tracerProvider = otel.GetTracerProvider()
+	}
+	if s.meterProvider == nil {
+		s.meterProvider = otel.GetMeterProvider()
+	}
+	var level *slog.LevelVar
+	if s.logger == nil {
+		level = new(slog.LevelVar)
+		s.logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	}
+	node, nodeErr := currentNode()
 	a := &App{
 		name:         s.name,
-		log:          s.logger.With("app", s.name),
+		log:          slog.New(ContextHandler(s.logger.Handler())).With("app", s.name, "node", node.String()),
+		level:        level,
+		node:         node,
 		backend:      s.backend,
 		settings:     s,
 		providers:    map[reflectType]*provider{},
@@ -175,12 +206,19 @@ func New(opts ...Option) (*App, error) {
 		configOwners: map[string]string{},
 	}
 
+	if nodeErr != nil {
+		a.bootErrs = append(a.bootErrs, nodeErr)
+	}
 	if err := a.loadConfig(); err != nil {
-		return nil, err
+		return nil, a.failBoot(&BootError{Errs: append(a.bootErrs, err)})
 	}
 
 	kernel := &Registry{app: a, module: "galleon"}
 	Supply[*slog.Logger](kernel, a.log)
+	Supply[clock.Clock](kernel, s.clock)
+	Supply[Node](kernel, node)
+	Supply[trace.TracerProvider](kernel, s.tracerProvider)
+	Supply[metric.MeterProvider](kernel, s.meterProvider)
 	if a.backend != nil {
 		Supply[coord.Backend](kernel, a.backend)
 	}
@@ -216,9 +254,18 @@ func New(opts ...Option) (*App, error) {
 		a.buildOrder = order
 	}
 	if len(a.bootErrs) > 0 {
-		return nil, &BootError{Errs: a.bootErrs}
+		return nil, a.failBoot(&BootError{Errs: a.bootErrs})
 	}
 	return a, nil
+}
+
+// failBoot releases the telemetry providers the app was handed, since no App
+// is returned to shut them down later.
+func (a *App) failBoot(err error) error {
+	if terr := shutdownTelemetry(context.Background(), &a.settings); terr != nil {
+		return errors.Join(err, terr)
+	}
+	return err
 }
 
 // BootError collects every problem found while building the app.
@@ -292,7 +339,11 @@ func (a *App) checkCoordination() {
 func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	if a.state != stateBuilt {
+		st := a.state
 		a.mu.Unlock()
+		if st == stateStopped {
+			return errors.New("galleon: Start called after Shutdown; an app runs once")
+		}
 		return errors.New("galleon: Start called twice")
 	}
 	a.state = stateStarting
@@ -303,6 +354,9 @@ func (a *App) Start(ctx context.Context) error {
 		defer cancel()
 		if serr := a.stopAll(stopCtx); serr != nil {
 			err = errors.Join(err, serr)
+		}
+		if terr := shutdownTelemetry(stopCtx, &a.settings); terr != nil {
+			err = errors.Join(err, terr)
 		}
 		a.mu.Lock()
 		a.state = stateStopped
@@ -370,7 +424,16 @@ func (a *App) Ready(ctx context.Context) error {
 // stop hooks, then providers in reverse dependency order.
 func (a *App) Shutdown(ctx context.Context) error {
 	a.mu.Lock()
-	if a.state != stateStarted {
+	switch a.state {
+	case stateStarted:
+	case stateBuilt:
+		// Never started: nothing to drain or stop, but the telemetry
+		// providers the app was handed still need flushing. Shutdown is
+		// final, so the app can't be started afterwards.
+		a.state = stateStopped
+		a.mu.Unlock()
+		return shutdownTelemetry(ctx, &a.settings)
+	default:
 		a.mu.Unlock()
 		return nil
 	}
@@ -399,6 +462,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.state = stateStopped
 	a.mu.Unlock()
 	a.log.Info("stopped")
+	if err := shutdownTelemetry(ctx, &a.settings); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
@@ -454,6 +520,9 @@ func (a *App) Run(ctx context.Context) error {
 
 // Name returns the app's name.
 func (a *App) Name() string { return a.name }
+
+// Node returns this process's identity.
+func (a *App) Node() Node { return a.node }
 
 // Coordination returns the configured backend.
 func (a *App) Coordination() coord.Backend { return a.backend }
