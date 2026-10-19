@@ -17,6 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/coord"
 )
 
@@ -54,6 +59,11 @@ type settings struct {
 	stopTimeout     time.Duration
 	drainGrace      time.Duration
 	gateTimeout     time.Duration
+	clock           clock.Clock
+	tracerProvider  trace.TracerProvider
+	meterProvider   metric.MeterProvider
+	ownTracer       bool
+	ownMeter        bool
 }
 
 // Option configures an App.
@@ -67,7 +77,12 @@ func Coordination(b coord.Backend) Option { return func(s *settings) { s.backend
 
 func Modules(m ...Module) Option { return func(s *settings) { s.modules = append(s.modules, m...) } }
 
+// Logger sets the logger. The kernel wraps its handler with ContextHandler and
+// adds the app name and node to every record.
 func Logger(l *slog.Logger) Option { return func(s *settings) { s.logger = l } }
+
+// Clock sets the clock the app provides to modules. The default is clock.System().
+func Clock(c clock.Clock) Option { return func(s *settings) { s.clock = c } }
 
 func Deploy(d Deployment) Option { return func(s *settings) { s.deployment = d } }
 
@@ -121,6 +136,8 @@ const (
 type App struct {
 	name     string
 	log      *slog.Logger
+	level    *slog.LevelVar
+	node     Node
 	backend  coord.Backend
 	settings settings
 
@@ -162,12 +179,29 @@ func New(opts ...Option) (*App, error) {
 	if s.name == "" {
 		s.name = "app"
 	}
+	if s.clock == nil {
+		s.clock = clock.System()
+	}
+	if s.tracerProvider == nil {
+		s.tracerProvider = otel.GetTracerProvider()
+	}
+	if s.meterProvider == nil {
+		s.meterProvider = otel.GetMeterProvider()
+	}
+	var level *slog.LevelVar
 	if s.logger == nil {
-		s.logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+		level = new(slog.LevelVar)
+		s.logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	}
+	node, err := currentNode()
+	if err != nil {
+		return nil, fmt.Errorf("galleon: %w", err)
 	}
 	a := &App{
 		name:         s.name,
-		log:          s.logger.With("app", s.name),
+		log:          slog.New(ContextHandler(s.logger.Handler())).With("app", s.name, "node", node.String()),
+		level:        level,
+		node:         node,
 		backend:      s.backend,
 		settings:     s,
 		providers:    map[reflectType]*provider{},
@@ -181,6 +215,10 @@ func New(opts ...Option) (*App, error) {
 
 	kernel := &Registry{app: a, module: "galleon"}
 	Supply[*slog.Logger](kernel, a.log)
+	Supply[clock.Clock](kernel, s.clock)
+	Supply[Node](kernel, node)
+	Supply[trace.TracerProvider](kernel, s.tracerProvider)
+	Supply[metric.MeterProvider](kernel, s.meterProvider)
 	if a.backend != nil {
 		Supply[coord.Backend](kernel, a.backend)
 	}
@@ -304,6 +342,9 @@ func (a *App) Start(ctx context.Context) error {
 		if serr := a.stopAll(stopCtx); serr != nil {
 			err = errors.Join(err, serr)
 		}
+		if terr := a.shutdownTelemetry(stopCtx); terr != nil {
+			err = errors.Join(err, fmt.Errorf("flushing telemetry: %w", terr))
+		}
 		a.mu.Lock()
 		a.state = stateStopped
 		a.mu.Unlock()
@@ -399,6 +440,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.state = stateStopped
 	a.mu.Unlock()
 	a.log.Info("stopped")
+	if err := a.shutdownTelemetry(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("flushing telemetry: %w", err))
+	}
 	return errors.Join(errs...)
 }
 
@@ -454,6 +498,9 @@ func (a *App) Run(ctx context.Context) error {
 
 // Name returns the app's name.
 func (a *App) Name() string { return a.name }
+
+// Node returns this process's identity.
+func (a *App) Node() Node { return a.node }
 
 // Coordination returns the configured backend.
 func (a *App) Coordination() coord.Backend { return a.backend }
