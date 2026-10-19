@@ -347,4 +347,12 @@ func TestReplaceRefusesKernelValuesAndDuplicates(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "is already replaced at") {
 		t.Fatalf("a second Replace of the same type should fail, got %v", err)
 	}
+	_, err = galleon.New(append(base(), galleon.Replace[galleon.Node](galleon.Node{Host: "fake"}))...)
+	if err == nil || !strings.Contains(err.Error(), "the kernel provides galleon.Node") {
+		t.Fatalf("every kernel value should be refused, got %v", err)
+	}
+	_, err = galleon.New(append(base(mod), galleon.Replace[Mailer](nil))...)
+	if err == nil || !strings.Contains(err.Error(), "the replacement is nil") {
+		t.Fatalf("a nil replacement should fail boot, got %v", err)
+	}
 }

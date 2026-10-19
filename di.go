@@ -186,8 +186,9 @@ func Replace[T any](value T) Option {
 	return func(s *settings) { s.replacements = append(s.replacements, r) }
 }
 
-// kernelOptions names the option to use instead of Replace for the values the
-// kernel itself provides, since the kernel also uses them directly.
+// kernelOptions names the option to set instead of Replace for the values the
+// kernel provides, where there is one. Every kernel value is refused by
+// Replace, since the kernel also uses them directly.
 var kernelOptions = map[reflect.Type]string{
 	reflect.TypeFor[*slog.Logger]():         "galleon.Logger",
 	reflect.TypeFor[clock.Clock]():          "galleon.Clock",
@@ -199,8 +200,8 @@ var kernelOptions = map[reflect.Type]string{
 func (a *App) applyReplacements() {
 	replaced := map[reflect.Type]string{}
 	for _, r := range a.settings.replacements {
-		if opt, ok := kernelOptions[r.typ]; ok {
-			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): the kernel provides %s and uses it itself; set it with %s instead", r.typ, r.site, r.typ, opt))
+		if isNil(r.value) {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): the replacement is nil", r.typ, r.site))
 			continue
 		}
 		if prev, ok := replaced[r.typ]; ok {
@@ -213,8 +214,24 @@ func (a *App) applyReplacements() {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): nothing provides %s%s", r.typ, r.site, r.typ, suggest(r.typ, a.providers)))
 			continue
 		}
+		if p.module == kernelModule {
+			hint := ""
+			if opt, ok := kernelOptions[r.typ]; ok {
+				hint = "; set it with " + opt + " instead"
+			}
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): the kernel provides %s and uses it itself%s", r.typ, r.site, r.typ, hint))
+			continue
+		}
 		p.ctor, p.params = reflect.Value{}, nil
 		p.value, p.built = r.value, true
 		p.module, p.site = "replaced", r.site
 	}
+}
+
+func isNil(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Interface, reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return v.IsNil()
+	}
+	return false
 }

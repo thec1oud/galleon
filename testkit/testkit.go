@@ -33,7 +33,8 @@ type Harness struct {
 // prints them only if the test fails. opts are applied after those defaults,
 // so any of them can be overridden; use galleon.Replace to swap in fakes.
 //
-// The in-process coordination backend keeps real time: advancing Clock does
+// If opts replace the logger or the clock, the app no longer uses Logs or
+// Clock. The in-process coordination backend keeps real time: advancing Clock does
 // not expire its leases, TTLs or counter windows.
 func New(t testing.TB, opts ...galleon.Option) *Harness {
 	t.Helper()
@@ -48,7 +49,7 @@ func New(t testing.TB, opts ...galleon.Option) *Harness {
 	}
 	app, err := galleon.New(append(defaults, opts...)...)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v\n%s", err, h.Logs)
 	}
 	if err := app.Start(context.Background()); err != nil {
 		t.Fatalf("starting app: %v\n%s", err, h.Logs)

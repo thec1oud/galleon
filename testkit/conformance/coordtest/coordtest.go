@@ -292,6 +292,13 @@ func acquireWaits(t *testing.T, f Factory) {
 		}
 		_ = r.l.Release(context.Background())
 	case <-time.After(5 * time.Second):
+		// If the waiter acquires after all, release it so a shared store
+		// isn't left locked for later tests.
+		go func() {
+			if r := <-got; r.err == nil {
+				_ = r.l.Release(context.Background())
+			}
+		}()
 		t.Fatal("waiter was not woken by Release")
 	}
 }
@@ -329,9 +336,17 @@ func election(t *testing.T, f Factory) {
 		t.Fatal(err)
 	}
 	self := selfID(ns[0])
-	id, ok, _ := ns[len(ns)-1].Leader("conformance").Leader(ctx(t))
-	if !ok || (self != "" && id != self) {
-		t.Fatalf("leader = %q (ok=%v), want %q", id, ok, self)
+	// A peer's view of the leader may lag; give it the same 5s as elsewhere.
+	var id coord.NodeID
+	var ok bool
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		id, ok, _ = ns[len(ns)-1].Leader("conformance").Leader(ctx(t))
+		if ok && (self == "" || id == self) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("leader = %q (ok=%v), want %q", id, ok, self)
+		}
 	}
 	expect(id)
 

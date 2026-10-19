@@ -228,7 +228,7 @@ func New(opts ...Option) (*App, error) {
 		return nil, a.failBoot(&BootError{Errs: append(a.bootErrs, err)})
 	}
 
-	kernel := &Registry{app: a, module: "galleon"}
+	kernel := &Registry{app: a, module: kernelModule}
 	Supply[*slog.Logger](kernel, a.log)
 	Supply[clock.Clock](kernel, s.clock)
 	Supply[Node](kernel, node)
@@ -285,6 +285,9 @@ func (a *App) failBoot(err error) error {
 	}
 	return err
 }
+
+// kernelModule is the module name the kernel's own values are registered under.
+const kernelModule = "galleon"
 
 // BootError collects every problem found while building the app.
 type BootError struct{ Errs []error }
