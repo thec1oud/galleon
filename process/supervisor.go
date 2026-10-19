@@ -28,8 +28,10 @@ import (
 type Supervisor struct {
 	Processes int
 	// Path is the binary to run. Empty means the running executable, resolved
-	// once per generation, so an upgrade picks up a replaced binary while
-	// crash restarts keep their generation's binary.
+	// once per generation, so an upgrade picks up a binary replaced at that
+	// path. Crash restarts run whatever is at their generation's path, so a
+	// binary replaced in place before a failed upgrade is also what crashed
+	// workers of the old generation restart on.
 	Path string
 	// Args are the worker's arguments. Nil means this process's arguments.
 	Args []string
