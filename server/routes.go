@@ -177,6 +177,10 @@ func addHeaders(dst, src http.Header) {
 	}
 }
 
+// reservedPrefixes begin the canonical keys of headers that are the
+// transport's.
+var reservedPrefixes = []string{"Trailer-", "Proxy-", "Grpc-", "Connect-"}
+
 // reservedHeader reports whether an interceptor's response header k, in
 // canonical form, is the transport's: framing, negotiation and hop-by-hop
 // headers, trailers, and gRPC's and Connect's own. HTTP and RPC refuse the
@@ -191,7 +195,7 @@ func reservedHeader(k string) bool {
 	if len(k) >= len(http.TrailerPrefix) && strings.EqualFold(k[:len(http.TrailerPrefix)], http.TrailerPrefix) {
 		return true
 	}
-	for _, p := range []string{"Trailer-", "Proxy-", "Grpc-", "Connect-"} {
+	for _, p := range reservedPrefixes {
 		if strings.HasPrefix(k, p) {
 			return true
 		}

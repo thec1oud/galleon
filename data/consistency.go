@@ -55,9 +55,10 @@ var (
 // BoundedStaleness reads a replica whose tracked lag, plus the age of the
 // reading it was tracked by, is at most d, or the primary when none is. A
 // replica whose lag can't be told never qualifies. Lag is tracked by
-// polling, so even a caught-up replica may be up to a poll behind: a d
-// below about one poll reads the primary, and a d of zero or less always
-// does.
+// polling, so even a caught-up replica may be about a poll behind, and up
+// to the tracker's staleness bound when polls are slow: a d below about
+// one poll reads the primary, and a d of zero always does. A negative d
+// is refused when the read begins.
 func BoundedStaleness(d time.Duration) Level {
 	return Level{kind: BoundedStalenessKind, bound: d}
 }

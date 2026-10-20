@@ -6,9 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"sync/atomic"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
 	"github.com/thec1oud/galleon/op"
@@ -30,6 +33,9 @@ type causal struct {
 	pending atomic.Uint64
 	// wrote is set once a root write transaction has committed something.
 	wrote atomic.Bool
+	// reissue is set once a token of unknownFloor is clamped, so the
+	// response carries the clamped floor in its place.
+	reissue atomic.Bool
 }
 
 // raise raises the floor to lsn; it never lowers it.
@@ -96,6 +102,9 @@ func (m *Manager) floor(ctx context.Context) uint64 {
 			// and an unknown one sends the reads to the primary.
 			if cur, err := m.primaryLSN(ctx); err == nil {
 				clamped = min(tok, cur)
+				if tok == unknownFloor {
+					c.reissue.Store(true)
+				}
 			}
 		}
 		c.raise(clamped)
@@ -114,7 +123,67 @@ func (m *Manager) primaryLSN(ctx context.Context) (uint64, error) {
 	if err := pool.QueryRow(ctx, "SELECT pg_current_wal_insert_lsn()::text").Scan(&s); err != nil {
 		return 0, err
 	}
-	return parseLSN(s)
+	lsn, err := parseLSN(s)
+	return m.atRecordEnd(lsn), err
+}
+
+// walLayout is how a primary lays out its WAL: pages of block bytes, in
+// segments of seg bytes, each page starting with a header, long on a
+// segment's first page and short on the others.
+type walLayout struct {
+	block, seg  uint64
+	short, long uint64 // the headers' sizes
+}
+
+// The page headers' sizes before alignment: XLogPageHeaderData and
+// XLogLongPageHeaderData.
+const (
+	shortPageHeader = 20
+	longPageHeader  = 36
+)
+
+// readWALLayout reads the primary's WAL layout. The headers are aligned to
+// the server's MAXALIGN, 8 on every 64-bit build, which pg_control_init
+// tells where it may be called.
+func readWALLayout(ctx context.Context, pool *pgxpool.Pool) (walLayout, error) {
+	var block, seg int64
+	err := pool.QueryRow(ctx, "SELECT current_setting('wal_block_size')::int8, (SELECT setting::int8 FROM pg_settings WHERE name = 'wal_segment_size')").Scan(&block, &seg)
+	if err != nil {
+		return walLayout{}, err
+	}
+	if block <= 0 || seg < block || seg%block != 0 {
+		return walLayout{}, fmt.Errorf("a WAL block size of %d and segment size of %d", block, seg)
+	}
+	align := int64(8)
+	var a int64
+	if pool.QueryRow(ctx, "SELECT max_data_alignment FROM pg_control_init()").Scan(&a) == nil && a > 0 {
+		align = a
+	}
+	up := func(n int64) uint64 { return uint64((n + align - 1) / align * align) }
+	return walLayout{block: uint64(block), seg: uint64(seg), short: up(shortPageHeader), long: up(longPageHeader)}, nil
+}
+
+// atRecordEnd is lsn, an insert position, as the end of the last record
+// before it. An insert position just past a page header is where the next
+// record will start, while a replica that has replayed everything before
+// it stops at the page boundary, and would never be found past it on an
+// idle primary. Nothing lies between the boundary and the header's end, so
+// the boundary is exact. Without a layout, lsn is as it is.
+func (m *Manager) atRecordEnd(lsn uint64) uint64 {
+	if w := m.wal.Load(); w != nil {
+		return w.recordEnd(lsn)
+	}
+	return lsn
+}
+
+func (w *walLayout) recordEnd(lsn uint64) uint64 {
+	switch inSeg := lsn % w.seg; {
+	case inSeg == w.long:
+		return lsn - w.long
+	case inSeg >= w.block && lsn%w.block == w.short:
+		return lsn - w.short
+	}
+	return lsn
 }
 
 // A causal token is base64url, without padding, of
@@ -238,13 +307,14 @@ func (m *Manager) takeToken(ctx context.Context, call *op.Call, c *causal) {
 	c.pending.Store(lsn)
 }
 
-// giveToken sets the response's token once the call has committed a write.
-// A response with a token is the answer for one client, so it is marked
+// giveToken sets the response's token once the call has committed a write,
+// or has clamped a token of unknownFloor, so the client stops bringing back
+// a floor that sends its reads to the primary. A response with a token is the answer for one client, so it is marked
 // "Cache-Control: private, no-store", unless the call set its own: a cache
 // that kept it would hand one client's token to others, or replay a stale
 // one.
 func (m *Manager) giveToken(call *op.Call, c *causal) {
-	if m.keys == nil || call.Response == nil || call.Response.Header == nil || !c.wrote.Load() {
+	if m.keys == nil || call.Response == nil || call.Response.Header == nil || !(c.wrote.Load() || c.reissue.Load()) {
 		return
 	}
 	// unknownFloor is signed as it is (see commitWrite): the next request

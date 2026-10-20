@@ -79,6 +79,9 @@ type Manager struct {
 	keys    *keyring // nil without a token key
 	clock   clock.Clock
 	metrics *metrics
+	// wal is the primary's WAL page layout, read when it starts; nil
+	// before, or if it couldn't be read.
+	wal atomic.Pointer[walLayout]
 }
 
 var _ data.Manager = (*Manager)(nil)
@@ -273,6 +276,13 @@ func (m *Manager) Start(ctx context.Context) error {
 			cerr := m.closePools(context.Background())
 			return errors.Join(fmt.Errorf("pg: source %q: %w", name, classify(ctx, err)), cerr)
 		}
+		if name == data.PrimarySource {
+			if w, err := readWALLayout(ctx, pool); err == nil {
+				m.wal.Store(&w)
+			} else {
+				m.logger().WarnContext(ctx, "the primary's WAL layout couldn't be read; a write ending at a WAL page may make its ReadYourWrites reads wait for more WAL", "error", err)
+			}
+		}
 	}
 	if m.topo != nil {
 		// A replica that can't be reached doesn't stop the start: reads
@@ -284,6 +294,9 @@ func (m *Manager) Start(ctx context.Context) error {
 				return errors.Join(fmt.Errorf("pg: replica %q: %w", r.src.name, err), cerr)
 			}
 			r.src.pool.Store(pool)
+		}
+		if m.topo.maxLag < m.topo.staleAfter() {
+			m.logger().WarnContext(ctx, "pg: max_lag is below the tracker's staleness bound, which a caught-up replica's lag can reach: replicas may leave rotation while caught up", "max_lag", m.topo.maxLag, "staleness_bound", m.topo.staleAfter())
 		}
 		m.topo.start(m, m.sources[data.PrimarySource])
 	}

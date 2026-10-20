@@ -623,6 +623,7 @@ func (r *root) commitWrite(ctx context.Context, tx pgx.Tx) error {
 	if perr == nil {
 		if len(res) == 3 && len(res[2].Rows) == 1 {
 			lsn, perr = parseLSN(string(res[2].Rows[0][0]))
+			lsn = r.m.atRecordEnd(lsn)
 		} else {
 			perr = errors.New("no position after the commit")
 		}

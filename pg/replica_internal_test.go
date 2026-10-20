@@ -519,8 +519,6 @@ func TestBoundedStalenessCountsTheReadingsAge(t *testing.T) {
 	}
 }
 
-// Stop clears the readings while reads choose by them; a read never
-// trips over a reading that went away after it was chosen.
 // A replica caught up with the primary's latest sample is behind by as
 // much as that sample is old: the primary may have written since.
 func TestAReplicaCaughtUpWithAnOldSampleIsAsFarBehindAsItsAge(t *testing.T) {
@@ -543,10 +541,8 @@ func TestAReplicaCaughtUpWithAnOldSampleIsAsFarBehindAsItsAge(t *testing.T) {
 func TestNoBoundedStalenessOfZeroReadsAReplica(t *testing.T) {
 	f := newFakeTracker(t, Config{MaxLag: time.Second}, "")
 	f.set(0, 1000, 0) // as caught up as a reading can say, taken now
-	for _, d := range []time.Duration{0, -time.Second} {
-		if got, _ := f.where(context.Background(), data.BoundedStaleness(d)); got != data.PrimarySource {
-			t.Errorf("BoundedStaleness(%v) read %s", d, got)
-		}
+	if got, _ := f.where(context.Background(), data.BoundedStaleness(0)); got != data.PrimarySource {
+		t.Errorf("BoundedStaleness(0) read %s", got)
 	}
 }
 
@@ -574,6 +570,8 @@ func TestAStalePrimaryHistoryNeverReadsAsNoLagInBytes(t *testing.T) {
 	}
 }
 
+// Stop clears the readings while reads choose by them; a read never
+// trips over a reading that went away after it was chosen.
 func TestReadsRouteSafelyWhileTheTrackerStops(t *testing.T) {
 	for _, sel := range []Selection{LeastLag, Random, RoundRobin, Nearest} {
 		f := newFakeTracker(t, Config{Select: sel, Zone: "a"}, "a", "a", "b")
@@ -701,5 +699,70 @@ func TestATokensResponseKeepsTheCallsOwnCacheControl(t *testing.T) {
 	m.giveToken(call, c)
 	if call.Response.Header.Get(ConsistencyHeader) == "" || call.Response.Header.Get("Cache-Control") != "no-cache" {
 		t.Fatalf("%v", call.Response.Header)
+	}
+}
+
+func TestInsertPositionsJustPastAPageHeaderMoveBackToTheBoundary(t *testing.T) {
+	const block, seg = 8192, 16 << 20
+	w := &walLayout{block: block, seg: seg, short: 24, long: 40}
+	for _, c := range []struct {
+		what     string
+		lsn, end uint64
+	}{
+		{"past a page's short header", 5*seg + 3*block + 24, 5*seg + 3*block},
+		{"past a segment's long header", 5*seg + 40, 5 * seg},
+		{"past the first segment's long header", 40, 0},
+		{"mid-page", 5*seg + 3*block + 1000, 5*seg + 3*block + 1000},
+		{"at a page boundary", 5*seg + 3*block, 5*seg + 3*block},
+		{"24 into a segment's first page, inside its long header", 5*seg + 24, 5*seg + 24},
+		{"40 into a page other than a segment's first", 5*seg + 3*block + 40, 5*seg + 3*block + 40},
+	} {
+		if got := w.recordEnd(c.lsn); got != c.end {
+			t.Errorf("%s: %d is %d, want %d", c.what, c.lsn, got, c.end)
+		}
+	}
+	// A 32-bit build aligns the headers to 4.
+	w = &walLayout{block: block, seg: seg, short: 20, long: 36}
+	if got := w.recordEnd(3*block + 20); got != 3*block {
+		t.Errorf("a short header of 20: %d", got)
+	}
+	// Without a layout, positions are as they are.
+	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.atRecordEnd(3*block + 24); got != 3*block+24 {
+		t.Errorf("without a layout: %d", got)
+	}
+}
+
+func TestAClampedUnknownTokenIsReissued(t *testing.T) {
+	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}, TokenKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &causal{}
+	c.raise(1234)
+	call := &op.Call{Response: &op.Response{Header: http.Header{}}}
+	m.giveToken(call, c)
+	if call.Response.Header.Get(ConsistencyHeader) != "" {
+		t.Fatal("a call that neither wrote nor clamped an unknown token sent one")
+	}
+	c.reissue.Store(true)
+	m.giveToken(call, c)
+	tok := call.Response.Header.Get(ConsistencyHeader)
+	if lsn, result := m.keys.verify(tok, m.clock.Now()); result != tokenAccepted || lsn != 1234 {
+		t.Fatalf("reissued %d, %s", lsn, result)
+	}
+}
+
+func TestLogsSayUnknownLagIsUnknown(t *testing.T) {
+	rd := &reading{lag: unknownLag, lagBytes: unknownBytes}
+	if lagAttr(rd) != "unknown" || lagBytesAttr(rd) != "unknown" {
+		t.Errorf("%v, %v", lagAttr(rd), lagBytesAttr(rd))
+	}
+	rd = &reading{lag: time.Second, lagBytes: 10}
+	if lagAttr(rd) != time.Second || lagBytesAttr(rd) != int64(10) {
+		t.Errorf("%v, %v", lagAttr(rd), lagBytesAttr(rd))
 	}
 }

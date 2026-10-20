@@ -123,7 +123,8 @@ func (h *history) latest() (sample, bool) {
 // lag is how far a replica that has replayed replay, read at at, is behind
 // the primary: in bytes against the latest sample, and in time since the
 // newest sample it has passed, so even a replica past the latest is as far
-// behind as that sample is old, up to a poll. Both are unknown without
+// behind as that sample is old: about a poll, and up to fresh (the
+// staleness bound) when the primary's poller is slow. Both are unknown without
 // samples or when the latest is older than fresh: the tracker has stopped
 // hearing from the primary, which may have moved on since, so the history
 // tells nothing of the replica. The time is unknown too when it has passed
@@ -405,19 +406,27 @@ func (t *topology) pollReplica(ctx context.Context, m *Manager, r *replica) {
 			log := m.logger()
 			switch {
 			case in:
-				log.Info("replica joined rotation", "replica", r.src.name, "lag", rd.lag, "lag_bytes", rd.lagBytes)
+				log.Info("replica joined rotation", "replica", r.src.name, "lag", lagAttr(rd), "lag_bytes", lagBytesAttr(rd))
 			default:
-				lag, bytes := any(rd.lag), any(rd.lagBytes)
-				if rd.lag == unknownLag {
-					lag = "unknown"
-				}
-				if rd.lagBytes == unknownBytes {
-					bytes = "unknown"
-				}
-				log.Warn("replica left rotation", "replica", r.src.name, "reason", why, "lag", lag, "lag_bytes", bytes)
+				log.Warn("replica left rotation", "replica", r.src.name, "reason", why, "lag", lagAttr(rd), "lag_bytes", lagBytesAttr(rd))
 			}
 		}
 	})
+}
+
+// lagAttr and lagBytesAttr are rd's lag for a log, "unknown" when it is.
+func lagAttr(rd *reading) any {
+	if rd.lag == unknownLag {
+		return "unknown"
+	}
+	return rd.lag
+}
+
+func lagBytesAttr(rd *reading) any {
+	if rd.lagBytes == unknownBytes {
+		return "unknown"
+	}
+	return rd.lagBytes
 }
 
 // read takes one reading through p.

@@ -3,9 +3,12 @@ package datatest_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -843,11 +846,20 @@ func TestAWriteWhosePositionCantBeReadStillCarriesReadYourWrites(t *testing.T) {
 		t.Fatal("a write that committed, of unknown position, sent no token")
 	}
 	with := http.Header{pg.ConsistencyHeader: {tok}}
-	if out, _ := post(t, blind, "/notes/get", 1, with); !out.Found || out.OnReplica {
-		t.Fatalf("an app that can't ask the primary its position: %+v", out)
+	if out, rh := post(t, blind, "/notes/get", 1, with); !out.Found || out.OnReplica || rh.Get(pg.ConsistencyHeader) != "" {
+		t.Fatalf("an app that can't ask the primary its position: %+v, token %q", out, rh.Get(pg.ConsistencyHeader))
 	}
-	if out, _ := post(t, sighted, "/notes/get", 1, with); !out.Found || out.OnReplica {
+	out, rh := post(t, sighted, "/notes/get", 1, with)
+	if !out.Found || out.OnReplica {
 		t.Fatalf("an app that can, with the replica paused: %+v", out)
+	}
+	// Having clamped it, the app sends the clamped floor in its place.
+	fresh := rh.Get(pg.ConsistencyHeader)
+	if lsn := tokenLSN(t, fresh); lsn == 0 || lsn == math.MaxUint64 {
+		t.Fatalf("the clamped token was reissued at %d", lsn)
+	}
+	if out, _ := post(t, sighted, "/notes/get", 1, http.Header{pg.ConsistencyHeader: {fresh}}); !out.Found {
+		t.Fatalf("with the reissued token: %+v", out)
 	}
 	e.rep.Resume()
 	// The insert position the token is clamped to can sit past what has
@@ -861,6 +873,31 @@ func TestAWriteWhosePositionCantBeReadStillCarriesReadYourWrites(t *testing.T) {
 		}
 		return out.OnReplica
 	})
+}
+
+// tokenLSN is the position a causal token carries, for tests: the token
+// is opaque to clients.
+func tokenLSN(t *testing.T, tok string) uint64 {
+	t.Helper()
+	b, err := base64.RawURLEncoding.DecodeString(tok)
+	if err != nil || len(b) < 9 {
+		t.Fatalf("token %q: %v", tok, err)
+	}
+	return binary.BigEndian.Uint64(b[1:9])
+}
+
+func TestStartWarnsWhenMaxLagIsBelowTheStalenessBound(t *testing.T) {
+	e := newReplicaEnv(t)
+	for _, c := range []struct {
+		maxLag time.Duration
+		warns  bool
+	}{{100 * time.Millisecond, true}, {time.Second, false}} {
+		logs := &syncBuffer{}
+		e.manager(pg.Config{MaxLag: c.maxLag}, pg.Logger(slog.New(slog.NewTextHandler(logs, nil))))
+		if got := strings.Contains(logs.String(), "max_lag is below the tracker's staleness bound"); got != c.warns {
+			t.Errorf("MaxLag %v: warned %v:\n%s", c.maxLag, got, logs)
+		}
+	}
 }
 
 // When the tracker can't read the primary's position, though the pools
@@ -889,4 +926,103 @@ func TestAReplicaLagsWhenTheTrackerLosesThePrimary(t *testing.T) {
 	if found, _, err := e.where(context.Background(), m, 1, data.BoundedStaleness(time.Hour)); err != nil || !found {
 		t.Fatalf("a bounded read found %v, %v", found, err)
 	}
+}
+
+// A write whose commit ends exactly at a WAL page boundary leaves the
+// insert position past the next page's header, where no replica stops: on
+// an idle primary, its ReadYourWrites read still finds a replica.
+func TestAWriteEndingAtAWALPageIsReadOnTheReplica(t *testing.T) {
+	e := newReplicaEnv(t)
+	m := e.manager(pg.Config{MaxLag: time.Hour})
+	e.untilOnReplica(m, true)
+	ctx := context.Background()
+	conn, err := e.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	var block int64
+	if err := conn.QueryRow(ctx, "SELECT current_setting('wal_block_size')::int8").Scan(&block); err != nil {
+		t.Fatal(err)
+	}
+	insert := func() int64 {
+		t.Helper()
+		var lsn int64
+		if err := conn.QueryRow(ctx, "SELECT (pg_current_wal_insert_lsn() - '0/0')::int8").Scan(&lsn); err != nil {
+			t.Fatal(err)
+		}
+		return lsn
+	}
+	pad := func(n int64) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, "SELECT pg_logical_emit_message(false, 'p', repeat('x', $1::int))", n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(cctx context.Context, id int) {
+		t.Helper()
+		if err := m.Write(cctx, func(ctx context.Context, w data.WriteTx) error {
+			_, err := w.Exec(ctx, "INSERT INTO "+e.table+" (id) VALUES ($1)", id)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Other WAL, a checkpoint's full-page images among it, can land
+	// between the padding and the write: each try measures the write, pads
+	// up to where it will end at a page, and checks that it did.
+	for try, id := 0, 1; try < 50; try++ {
+		before := insert()
+		write(pg.CausalContext(ctx), id)
+		id++
+		after := insert()
+		size := after - before
+		if after/block != before/block {
+			size -= 24 // it crossed into a page, and its header
+		}
+		for range 20 {
+			at := insert()
+			gap := block - at%block
+			if gap == size {
+				break
+			}
+			// A message is its content and 52 bytes, aligned to 8, so 56
+			// or more; 55 once its data passes 255 bytes and takes a long
+			// length. Short of room, pad into the next page.
+			n := gap - size - 52
+			if n > 229 {
+				n = gap - size - 55
+			}
+			if n < 4 {
+				n = 200
+			}
+			pad(n)
+		}
+		at := insert()
+		if block-at%block != size {
+			continue
+		}
+		cctx := pg.CausalContext(ctx)
+		write(cctx, id)
+		if after := insert(); after != at+size+24 && after != at+size+40 {
+			id++
+			continue // something else wrote too, or this write grew
+		}
+		var found bool
+		err := m.Read(cctx, func(ctx context.Context, r data.ReadTx) error {
+			var on bool
+			if err := r.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+e.table+" WHERE id = $1), pg_is_in_recovery()", id).Scan(&found, &on); err != nil {
+				return err
+			}
+			if !on {
+				t.Error("the read ran on the primary")
+			}
+			return nil
+		}, data.Consistency(data.ReadYourWrites.Wait(3*time.Second).OrFail()))
+		if err != nil || !found {
+			t.Fatalf("a write ending at a page, after %d tries: found %v, %v", try+1, found, err)
+		}
+		return
+	}
+	t.Fatal("no write could be made to end at a WAL page in 50 tries")
 }
