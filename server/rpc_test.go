@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -16,11 +17,13 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/embedded"
 	"go.opentelemetry.io/otel/trace/noop"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/thec1oud/galleon"
 	"github.com/thec1oud/galleon/coord/local"
+	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/op"
 	"github.com/thec1oud/galleon/server"
 )
@@ -79,6 +82,15 @@ func bootRPC(t *testing.T, roles []galleon.Role, extra ...galleon.Module) *rpcEn
 			return nil, errors.New("database password is hunter2")
 		})
 		r.Operation(limitedRPC, func(context.Context, *GreetIn) (*GreetOut, error) { return &GreetOut{}, nil })
+		r.Operation(op.Unary[GreetIn, GreetOut]("greet.panic").RPC("greet.v1.Greeter", "Panic").Public(), func(context.Context, *GreetIn) (*GreetOut, error) {
+			panic("boom")
+		})
+		r.Operation(op.Unary[GreetIn, GreetOut]("greet.down").RPC("greet.v1.Greeter", "Down").Public(), func(context.Context, *GreetIn) (*GreetOut, error) {
+			return nil, errs.New(errs.Unavailable, "greet.down", "try later")
+		})
+		r.Operation(op.Unary[wrapperspb.StringValue, wrapperspb.StringValue]("greet.nothing").RPC("greet.v1.Greeter", "Nothing").Public(), func(context.Context, *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
+			return nil, nil
+		})
 		return nil
 	})
 	opts := []galleon.Option{
@@ -230,8 +242,8 @@ func TestRPCDecodeHonoursPolicies(t *testing.T) {
 	if err := raw("Fail", `{"name":"a","extra":1}`); connect.CodeOf(err) != connect.CodeInternal {
 		t.Fatalf("AllowUnknownFields lets them through to the handler: %v", err)
 	}
-	if err := raw("Hello", `{"name":"`+strings.Repeat("a", 100)+`"}`); connect.CodeOf(err) != connect.CodeResourceExhausted {
-		t.Fatalf("the operation's body limit applies: %v", err)
+	if err := raw("Hello", `{"name":"`+strings.Repeat("a", 100)+`"}`); connect.CodeOf(err) != connect.CodeInvalidArgument || errorCode(err) != "galleon.body_too_large" {
+		t.Fatalf("the operation's body limit applies, with the same error as over HTTP: %v", err)
 	}
 	if err := raw("Hello", `{"name":`); connect.CodeOf(err) != connect.CodeInvalidArgument {
 		t.Fatalf("malformed JSON: %v", err)
@@ -407,4 +419,153 @@ func (s *recSpan) attr(k attribute.Key) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.attrs[k]
+}
+
+func TestRPCPanicsAreInternalErrors(t *testing.T) {
+	e := bootRPC(t, nil)
+	for name, opts := range map[string][]connect.ClientOption{
+		"connect":  {connect.WithCodec(jsonCodec{})},
+		"grpc":     {connect.WithCodec(jsonCodec{}), connect.WithGRPC()},
+		"grpc-web": {connect.WithCodec(jsonCodec{}), connect.WithGRPCWeb()},
+	} {
+		_, _, err := greet[GreetIn, GreetOut](e, "Panic", &GreetIn{Name: "a"}, opts...)
+		if connect.CodeOf(err) != connect.CodeInternal || errorCode(err) != "galleon.internal" {
+			t.Errorf("%s: got %v (%s)", name, err, errorCode(err))
+		}
+	}
+	if !strings.Contains(e.logs.String(), "panic while serving an rpc") {
+		t.Fatal("the panic must be logged")
+	}
+}
+
+func TestBinaryProtobufRejectsUnknownFields(t *testing.T) {
+	e := bootRPC(t, nil)
+	// Field 1 is the value; field 99 is unknown to StringValue.
+	body := string([]byte{0x0a, 0x02, 'b', 'o', 0xf8, 0x06, 0x01})
+	c := connect.NewClient[string, wrapperspb.StringValue](e.c, e.url+"/greet.v1.Greeter/Proto", connect.WithCodec(rawProto{}), connect.WithGRPC())
+	_, err := c.CallUnary(context.Background(), connect.NewRequest(&body))
+	if connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("got %v", err)
+	}
+}
+
+type rawProto struct{}
+
+func (rawProto) Name() string                    { return "proto" }
+func (rawProto) Marshal(v any) ([]byte, error)   { return []byte(*v.(*string)), nil }
+func (rawProto) Unmarshal(b []byte, v any) error { return proto.Unmarshal(b, v.(proto.Message)) }
+
+func TestNilOutputOfAWellKnownType(t *testing.T) {
+	e := bootRPC(t, nil)
+	for name, opts := range map[string][]connect.ClientOption{
+		"proto":     {connect.WithGRPC()},
+		"protojson": {connect.WithGRPC(), connect.WithProtoJSON()},
+		"connect":   {connect.WithProtoJSON()},
+	} {
+		out, _, err := greet[wrapperspb.StringValue, wrapperspb.StringValue](e, "Nothing", wrapperspb.String("x"), opts...)
+		if err != nil || out.GetValue() != "" {
+			t.Errorf("%s: got %v, %v", name, out, err)
+		}
+	}
+}
+
+func TestJSONWithACharset(t *testing.T) {
+	e := bootRPC(t, nil)
+	res, err := e.c.Post(e.url+"/greet.v1.Greeter/Hello", "application/json; charset=utf-8", strings.NewReader(`{"name":"ann"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var out GreetOut
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil || res.StatusCode != 200 || out.Greeting != "hello ann" {
+		t.Fatalf("got %d %+v %v", res.StatusCode, out, err)
+	}
+}
+
+func TestServerErrorsMarkTheSpanOverGRPC(t *testing.T) {
+	e := bootRPC(t, nil)
+	_, _, err := greet[GreetIn, GreetOut](e, "Down", &GreetIn{Name: "a"}, connect.WithCodec(jsonCodec{}), connect.WithGRPC())
+	if connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Fatal(err)
+	}
+	s := e.tp.find("greet.v1.Greeter/Down")
+	if s == nil || s.attr("error.type") != "UNAVAILABLE" || s.attr("rpc.response.status_code") != "UNAVAILABLE" {
+		t.Fatalf("got %v", s)
+	}
+}
+
+func TestGRPCWebErrorDetails(t *testing.T) {
+	e := bootRPC(t, nil)
+	_, _, err := greet[GreetIn, GreetOut](e, "Hello", &GreetIn{}, connect.WithCodec(jsonCodec{}), connect.WithGRPCWeb())
+	if d := details(t, err); d["code"] != "galleon.invalid_input" {
+		t.Fatalf("got %v", d)
+	}
+}
+
+func TestAWildcardHTTPRouteOverAProcedureFailsBoot(t *testing.T) {
+	for name, roles := range map[string][]galleon.Role{"web": {server.RoleWeb}, "rpc": {server.RoleRPC}} {
+		_, err := galleon.New(
+			galleon.Coordination(local.New()), galleon.Deploy(galleon.SingleNode),
+			galleon.Logger(slog.New(slog.DiscardHandler)), galleon.Roles(roles...),
+			galleon.Modules(galleon.ModuleFunc("greet", func(r *galleon.Registry) error {
+				r.Operation(op.Unary[GreetIn, GreetOut]("greet.any").HTTP("POST", "/greet.v1.Greeter/{m}").Public(), func(context.Context, *GreetIn) (*GreetOut, error) { return nil, nil })
+				r.Operation(greetRPC, func(context.Context, *GreetIn) (*GreetOut, error) { return nil, nil })
+				return nil
+			}), server.Module()),
+		)
+		if err == nil || !strings.Contains(err.Error(), "conflicts with") {
+			t.Errorf("%s role: got %v", name, err)
+		}
+	}
+}
+
+// upperCodec is a server codec under application/x-upper: the body is the
+// name, and the reply is the greeting in capitals.
+type upperCodec struct{}
+
+func (upperCodec) MediaType() string { return "application/x-upper" }
+func (upperCodec) Encode(w io.Writer, v any) error {
+	_, err := io.WriteString(w, strings.ToUpper(v.(*GreetOut).Greeting))
+	return err
+}
+func (upperCodec) Decode(r io.Reader, v any, _ op.UnknownFields) error {
+	b, err := io.ReadAll(r)
+	v.(*GreetIn).Name = string(b)
+	return err
+}
+
+type rawName struct{}
+
+func (rawName) Name() string                    { return "x-upper" }
+func (rawName) Marshal(v any) ([]byte, error)   { return []byte(*v.(*string)), nil }
+func (rawName) Unmarshal(b []byte, v any) error { *v.(*string) = string(b); return nil }
+
+func TestServerCodecsServeRPC(t *testing.T) {
+	app, err := galleon.New(
+		galleon.Coordination(local.New()), galleon.Deploy(galleon.SingleNode),
+		galleon.Logger(slog.New(slog.DiscardHandler)), galleon.DrainGrace(0),
+		galleon.ConfigJSON([]byte(`{"http":{"addr":"127.0.0.1:0"}}`)),
+		galleon.Modules(galleon.ModuleFunc("greet", func(r *galleon.Registry) error {
+			r.Operation(greetRPC, func(_ context.Context, in *GreetIn) (*GreetOut, error) {
+				return &GreetOut{Greeting: "hello " + in.Name}, nil
+			})
+			return nil
+		}), server.Module(server.Codecs(upperCodec{}))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer app.Shutdown(context.Background())
+	url := "http://" + listening(t, &env{srv: galleon.MustResolve[*server.Server](app)})
+	hc := h2c()
+	defer hc.CloseIdleConnections()
+	c := connect.NewClient[string, string](hc, url+"/greet.v1.Greeter/Hello", connect.WithCodec(rawName{}), connect.WithGRPC())
+	name := "ann"
+	res, err := c.CallUnary(context.Background(), connect.NewRequest(&name))
+	if err != nil || *res.Msg != "HELLO ANN" {
+		t.Fatalf("got %v, %v", res, err)
+	}
 }

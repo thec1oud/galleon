@@ -24,14 +24,6 @@ import (
 func (s *Server) routeAll(ops *galleon.Operations) (_ *http.ServeMux, err error) {
 	mux := http.NewServeMux()
 	var methods []string
-	procedures := map[string]string{} // path -> operation ID
-	for _, x := range ops.All() {
-		for _, b := range x.Desc.Bindings {
-			if rb, ok := b.(op.RPC); ok {
-				procedures[procedure(rb)] = x.Desc.ID
-			}
-		}
-	}
 	for _, x := range ops.All() {
 		var binder bind.Func
 		if s.serveHTTP && slices.ContainsFunc(x.Desc.Bindings, func(b op.Binding) bool { _, ok := b.(op.HTTP); return ok }) {
@@ -53,9 +45,6 @@ func (s *Server) routeAll(ops *galleon.Operations) (_ *http.ServeMux, err error)
 			hb, ok := b.(op.HTTP)
 			if !ok || !s.serveHTTP {
 				continue
-			}
-			if id, ok := procedures[hb.Path]; ok {
-				return nil, fmt.Errorf("http: operation %q (module %q, %s) binds %v, the path of an RPC procedure of operation %q", x.Desc.ID, x.Module, x.Site, hb, id)
 			}
 			pattern := hb.Method + " " + hb.Path
 			h := &opHandler{s: s, x: x, b: hb, binder: binder, in: in, out: out}
