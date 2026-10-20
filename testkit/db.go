@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/internal/dsn"
 	"github.com/thec1oud/galleon/pg"
 )
 
@@ -194,20 +195,22 @@ func (d *Database) Module() galleon.Module { return pg.Module(pg.Use(d.manager))
 func (d *Database) DSN() string { return d.dsn }
 
 var packageDBs struct {
-	mu   sync.Mutex
-	dsns map[string]string // by schema hash
+	mu  sync.Mutex
+	dbs map[string]packageDatabase // by schema key
 	// live holds, for as long as the process runs, a session-level
-	// advisory lock on each package database it created: the mark that
-	// the database is in use, even while nothing is connected to it.
-	live   *pgx.Conn
-	marked []string // the databases live marks
+	// advisory lock on each package database in dbs: the mark that the
+	// database is in use, even while nothing is connected to it.
+	live *pgx.Conn
 }
+
+type packageDatabase struct{ name, dsn string }
 
 // liveLock is the advisory lock key, in SQL, that marks database $1 live.
 const liveLock = "hashtext('galleon.testkit.live'), hashtext($1)"
 
 // packageDB returns the DSN of this binary's database for schema, creating
-// the template and the clone the first time.
+// the template and the clone the first time, and again if the database
+// went away while its mark was lost.
 func packageDB(admin string, schema []string) (string, error) {
 	key, tpl, base, err := dbNames(schema)
 	if err != nil {
@@ -215,19 +218,12 @@ func packageDB(admin string, schema []string) (string, error) {
 	}
 	packageDBs.mu.Lock()
 	defer packageDBs.mu.Unlock()
-	if dsn, ok := packageDBs.dsns[key]; ok {
-		return dsn, nil
-	}
-	var rnd [4]byte
-	if _, err := rand.Read(rnd[:]); err != nil {
-		return "", err
-	}
-	// The pid helps tell runs apart; the random part keeps names apart
-	// across hosts sharing a server.
-	name := fmt.Sprintf("%s_%d_%s", base, os.Getpid(), hex.EncodeToString(rnd[:]))
-
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	if d, ok := packageDBs.dbs[key]; ok && liveAlive(ctx) {
+		return d.dsn, nil
+	}
+
 	conn, err := pgx.Connect(ctx, admin)
 	if err != nil {
 		return "", fmt.Errorf("connecting to %s: %w", PostgresEnv, err)
@@ -240,6 +236,15 @@ func packageDB(admin string, schema []string) (string, error) {
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock(hashtext('galleon.testkit'))")
 
+	// Before dropStale, which would otherwise win this run's own marks if
+	// their connection had died.
+	live, err := liveConn(ctx, conn, admin)
+	if err != nil {
+		return "", err
+	}
+	if d, ok := packageDBs.dbs[key]; ok {
+		return d.dsn, nil
+	}
 	var exists bool
 	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", tpl).Scan(&exists); err != nil {
 		return "", err
@@ -249,55 +254,101 @@ func packageDB(admin string, schema []string) (string, error) {
 			return "", err
 		}
 	}
-	// Before dropStale, which would otherwise win this run's own marks if
-	// their connection had died.
-	live, err := liveConn(ctx, admin)
-	if err != nil {
-		return "", err
-	}
 	if err := dropStale(ctx, conn, base); err != nil {
 		return "", err
 	}
-	// Marked before it exists, and under the turn-taking lock, so no other
-	// run sees it unmarked.
-	if _, err := live.Exec(ctx, "SELECT pg_advisory_lock("+liveLock+")", name); err != nil {
-		return "", fmt.Errorf("marking the package database live: %w", err)
-	}
-	dsn, err := withDatabase(admin, name)
-	if err == nil {
-		_, err = conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{tpl}.Sanitize())
-		if err != nil {
-			err = fmt.Errorf("cloning the template: %w", err)
+	for attempt := 1; ; attempt++ {
+		d, err := clone(ctx, conn, live, admin, tpl, base)
+		var pe *pgconn.PgError
+		if (errors.Is(err, errNameTaken) || errors.As(err, &pe) && pe.Code == "42P04") && attempt < 3 { // duplicate_database
+			continue
 		}
+		if err != nil {
+			return "", err
+		}
+		if packageDBs.dbs == nil {
+			packageDBs.dbs = map[string]packageDatabase{}
+		}
+		packageDBs.dbs[key] = d
+		return d.dsn, nil
 	}
+}
+
+// errNameTaken is a package database name another run has marked.
+var errNameTaken = errors.New("the name is another run's")
+
+// clone creates a package database from the template under a new name,
+// marked live before it exists, and under the turn-taking lock, so no
+// other run sees it unmarked. If the name is another's, marked or created,
+// it is left alone; otherwise, if it fails, the mark and the database go.
+func clone(ctx context.Context, conn, live *pgx.Conn, admin, tpl, base string) (packageDatabase, error) {
+	suffix, err := randomSuffix()
 	if err != nil {
-		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		_, derr := conn.Exec(dctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
-		_, uerr := live.Exec(dctx, "SELECT pg_advisory_unlock("+liveLock+")", name)
-		return "", errors.Join(err, derr, uerr)
+		return packageDatabase{}, err
 	}
-	packageDBs.marked = append(packageDBs.marked, name)
-	if packageDBs.dsns == nil {
-		packageDBs.dsns = map[string]string{}
+	// The pid helps tell runs apart; the random part keeps names apart
+	// across hosts sharing a server.
+	name := fmt.Sprintf("%s_%d_%s", base, os.Getpid(), suffix)
+	dsn, err := withDatabase(admin, name)
+	if err != nil {
+		return packageDatabase{}, err
 	}
-	packageDBs.dsns[key] = dsn
-	return dsn, nil
+	var won bool
+	if err := live.QueryRow(ctx, "SELECT pg_try_advisory_lock("+liveLock+")", name).Scan(&won); err != nil {
+		return packageDatabase{}, fmt.Errorf("marking the package database live: %w", err)
+	}
+	if !won {
+		return packageDatabase{}, errNameTaken
+	}
+	_, err = conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{tpl}.Sanitize())
+	if err == nil {
+		return packageDatabase{name: name, dsn: dsn}, nil
+	}
+	err = fmt.Errorf("cloning the template: %w", err)
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var derr error
+	if pe := (*pgconn.PgError)(nil); !errors.As(err, &pe) || pe.Code != "42P04" {
+		_, derr = conn.Exec(dctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+	}
+	_, uerr := live.Exec(dctx, "SELECT pg_advisory_unlock("+liveLock+")", name)
+	return packageDatabase{}, errors.Join(err, derr, uerr)
+}
+
+// randomSuffix ends a package database's name. Tests replace it.
+var randomSuffix = func() (string, error) {
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(rnd[:]), nil
+}
+
+// liveAlive reports whether the connection holding the live marks works.
+func liveAlive(ctx context.Context) bool {
+	l := packageDBs.live
+	if l == nil {
+		return false
+	}
+	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return l.Ping(pctx) == nil
 }
 
 // liveConn returns the connection that holds the live marks, opening it
-// the first time, and again, with the marks taken anew, if it has died.
+// the first time, and again if it has died. Then it marks anew the
+// databases that are still there, and forgets the ones that are gone, so
+// they are created again. conn holds the turn-taking lock, so no other
+// run drops a database meanwhile.
+//
 // It is its own connection, which nothing else uses: a session's advisory
 // locks are reentrant, so one that tried the locks of others' databases
 // would win its own too.
-func liveConn(ctx context.Context, admin string) (*pgx.Conn, error) {
+func liveConn(ctx context.Context, conn *pgx.Conn, admin string) (*pgx.Conn, error) {
+	if liveAlive(ctx) {
+		return packageDBs.live, nil
+	}
 	if l := packageDBs.live; l != nil {
-		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := l.Ping(pctx)
-		cancel()
-		if err == nil {
-			return l, nil
-		}
 		l.Close(context.WithoutCancel(ctx))
 		packageDBs.live = nil
 	}
@@ -307,8 +358,17 @@ func liveConn(ctx context.Context, admin string) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connecting to %s: %w", PostgresEnv, err)
 	}
-	for _, name := range packageDBs.marked {
-		if _, err := l.Exec(cctx, "SELECT pg_advisory_lock("+liveLock+")", name); err != nil {
+	for key, d := range packageDBs.dbs {
+		var exists bool
+		err := conn.QueryRow(cctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", d.name).Scan(&exists)
+		if err == nil && !exists {
+			delete(packageDBs.dbs, key)
+			continue
+		}
+		if err == nil {
+			_, err = l.Exec(cctx, "SELECT pg_advisory_lock("+liveLock+")", d.name)
+		}
+		if err != nil {
 			l.Close(context.WithoutCancel(ctx))
 			return nil, fmt.Errorf("marking the package databases live again: %w", err)
 		}
@@ -414,10 +474,10 @@ func createTemplate(ctx context.Context, conn *pgx.Conn, admin, tpl string, sche
 	return fmt.Errorf("naming the template: %w", err)
 }
 
-// withDatabase returns dsn with its database replaced, in either DSN form.
-func withDatabase(dsn, db string) (string, error) {
-	if pg.IsURLDSN(dsn) {
-		u, err := url.Parse(dsn)
+// withDatabase returns s with its database replaced, in either DSN form.
+func withDatabase(s, db string) (string, error) {
+	if dsn.IsURL(s) {
+		u, err := url.Parse(strings.TrimSpace(s))
 		if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
 			return "", fmt.Errorf("%s is not a postgres:// URL or a keyword/value string", PostgresEnv)
 		}
@@ -426,5 +486,5 @@ func withDatabase(dsn, db string) (string, error) {
 		return u.String(), nil
 	}
 	// In the keyword/value form, a later keyword wins.
-	return dsn + " dbname='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(db) + "'", nil
+	return s + " dbname='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(db) + "'", nil
 }

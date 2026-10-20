@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/thec1oud/galleon/coord/local"
 	"github.com/thec1oud/galleon/data"
 	"github.com/thec1oud/galleon/errs"
+	"github.com/thec1oud/galleon/internal/dsn"
 	"github.com/thec1oud/galleon/pg"
 	"github.com/thec1oud/galleon/testkit"
 	"github.com/thec1oud/galleon/testkit/conformance/datatest"
@@ -154,12 +156,12 @@ func TestUseLeavesTheManagerToItsOwner(t *testing.T) {
 }
 
 // withAppName sets application_name in dsn, in either DSN form.
-func withAppName(t *testing.T, dsn, name string) string {
+func withAppName(t *testing.T, s, name string) string {
 	t.Helper()
-	if !pg.IsURLDSN(dsn) {
-		return dsn + " application_name=" + name
+	if !dsn.IsURL(s) {
+		return s + " application_name=" + name
 	}
-	u, err := url.Parse(dsn)
+	u, err := url.Parse(strings.TrimSpace(s))
 	if err != nil {
 		t.Fatal(err)
 	}

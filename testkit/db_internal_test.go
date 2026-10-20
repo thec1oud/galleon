@@ -61,9 +61,7 @@ func TestPackageDatabasesLiveAsLongAsTheirRun(t *testing.T) {
 	})
 	run := func() string {
 		t.Helper()
-		packageDBs.mu.Lock()
-		delete(packageDBs.dsns, key) // as a new run would
-		packageDBs.mu.Unlock()
+		retire(key) // as a new run would
 		dsn, err := packageDB(admin, schema)
 		if err != nil {
 			t.Fatal(err)
@@ -122,6 +120,13 @@ func TestWithDatabaseTellsTheFormsApart(t *testing.T) {
 // database, and a function that gets the package database as a new run of
 // the package would, recording what to drop at the end.
 func fresh(t *testing.T) (key, tpl, base string, conn *pgx.Conn, run func() (string, error)) {
+	key, tpl, base, conn, run, _ = freshAgain(t)
+	return key, tpl, base, conn, run
+}
+
+// freshAgain is fresh, plus a function that gets the package database as a
+// later test of the same run would.
+func freshAgain(t *testing.T) (key, tpl, base string, conn *pgx.Conn, run, again func() (string, error)) {
 	t.Helper()
 	admin := os.Getenv(PostgresEnv)
 	if admin == "" {
@@ -146,9 +151,7 @@ func fresh(t *testing.T) (key, tpl, base string, conn *pgx.Conn, run func() (str
 		conn.Close(ctx)
 	})
 	run = func() (string, error) {
-		packageDBs.mu.Lock()
-		delete(packageDBs.dsns, key)
-		packageDBs.mu.Unlock()
+		retire(key)
 		dsn, err := packageDB(admin, schema)
 		if err != nil {
 			return "", err
@@ -159,7 +162,32 @@ func fresh(t *testing.T) (key, tpl, base string, conn *pgx.Conn, run func() (str
 		}
 		return cfg.Database, nil
 	}
-	return key, tpl, base, conn, run
+	again = func() (string, error) {
+		dsn, err := packageDB(admin, schema)
+		if err != nil {
+			return "", err
+		}
+		cfg, err := pgx.ParseConfig(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Database, nil
+	}
+	return key, tpl, base, conn, run, again
+}
+
+var retired int
+
+// retire makes this process forget it has a database for key, while
+// keeping it marked, as if another run had made it.
+func retire(key string) {
+	packageDBs.mu.Lock()
+	defer packageDBs.mu.Unlock()
+	if d, ok := packageDBs.dbs[key]; ok {
+		retired++
+		packageDBs.dbs[fmt.Sprintf("%s/retired/%d", key, retired)] = d
+		delete(packageDBs.dbs, key)
+	}
 }
 
 // held reports whether a live mark is held on name.
@@ -178,36 +206,87 @@ func held(t *testing.T, conn *pgx.Conn, name string) bool {
 	return !won
 }
 
-// When the connection holding the marks dies, the next package database
-// reopens it and marks this run's databases again, rather than failing or
-// letting them go.
-func TestLiveMarksSurviveTheirConnection(t *testing.T) {
-	_, _, _, conn, run := fresh(t)
-	first, err := run()
-	if err != nil {
-		t.Fatal(err)
-	}
+// killLive ends the backend holding the live marks, and waits for the
+// server to let go of name's mark.
+func killLive(t *testing.T, conn *pgx.Conn, name string) {
+	t.Helper()
 	packageDBs.mu.Lock()
 	pid := packageDBs.live.PgConn().PID()
 	packageDBs.mu.Unlock()
 	if _, err := conn.Exec(context.Background(), "SELECT pg_terminate_backend($1)", pid); err != nil {
 		t.Fatal(err)
 	}
-	// The server ends the backend a moment later.
 	for range 100 {
-		if !held(t, conn, first) {
-			break
+		if !held(t, conn, name) {
+			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	second, err := run()
+	t.Fatal("the marks outlived their connection")
+}
+
+// When the connection holding the marks dies, the run's next DB reopens it
+// and marks the run's databases again, rather than failing or letting
+// them go.
+func TestLiveMarksSurviveTheirConnection(t *testing.T) {
+	_, _, _, conn, run, again := freshAgain(t)
+	first, err := run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	killLive(t, conn, first)
+	got, err := again()
 	if err != nil {
 		t.Fatalf("after the marks' connection died: %v", err)
+	}
+	if got != first {
+		t.Errorf("the run moved from %s to %s", first, got)
+	}
+	if !held(t, conn, first) {
+		t.Errorf("%s isn't marked live", first)
+	}
+	second, err := run()
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, name := range []string{first, second} {
 		if !held(t, conn, name) {
 			t.Errorf("%s isn't marked live", name)
 		}
+	}
+}
+
+// If another run dropped the database while its mark was lost, the run's
+// next DB makes a new one rather than handing out one that is gone.
+func TestADatabaseDroppedWhileUnmarkedIsMadeAgain(t *testing.T) {
+	_, _, base, conn, run, again := freshAgain(t)
+	first, err := run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	killLive(t, conn, first)
+	// Another binary's run, between this run's tests.
+	if err := dropStale(context.Background(), conn, base); err != nil {
+		t.Fatal(err)
+	}
+	got, err := again()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == first {
+		t.Fatalf("handed out %s, which was dropped", first)
+	}
+	dsn, err := withDatabase(os.Getenv(PostgresEnv), got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("the new database: %v", err)
+	}
+	c.Close(context.Background())
+	if !held(t, conn, got) {
+		t.Errorf("%s isn't marked live", got)
 	}
 }
 
@@ -233,7 +312,7 @@ func TestAFailedCloneLeavesNothingBehind(t *testing.T) {
 		t.Fatal("cloning a template in use worked")
 	}
 	packageDBs.mu.Lock()
-	marked := len(packageDBs.marked)
+	marked := len(packageDBs.dbs)
 	pid := packageDBs.live.PgConn().PID()
 	packageDBs.mu.Unlock()
 	var locks int
@@ -249,5 +328,60 @@ func TestAFailedCloneLeavesNothingBehind(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("%d package databases, want the first run's alone", n)
+	}
+}
+
+// A name another run already took, marked or not, is left alone, and a
+// new one is tried.
+func TestACloneNamedLikeAnotherTriesAgain(t *testing.T) {
+	_, _, base, conn, run := fresh(t)
+	if _, err := run(); err != nil { // builds the template
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	name := func(suffix string) string { return fmt.Sprintf("%s_%d_%s", base, os.Getpid(), suffix) }
+	exists := func(name string) bool {
+		t.Helper()
+		var ok bool
+		if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	// One run holds a mark on its name; another creates a database just
+	// after this run looked for stale ones.
+	other, err := pgx.Connect(ctx, os.Getenv(PostgresEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(ctx)
+	if _, err := other.Exec(ctx, "SELECT pg_advisory_lock("+liveLock+")", name("marked")); err != nil {
+		t.Fatal(err)
+	}
+	suffixes := []string{"marked", "created", "free"}
+	orig := randomSuffix
+	randomSuffix = func() (string, error) {
+		s := suffixes[0]
+		suffixes = suffixes[1:]
+		if s == "created" {
+			if _, err := other.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name(s)}.Sanitize()); err != nil {
+				return "", err
+			}
+		}
+		return s, nil
+	}
+	defer func() { randomSuffix = orig }()
+	got, err := run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != name("free") {
+		t.Errorf("got %s, want %s", got, name("free"))
+	}
+	if !exists(name("created")) {
+		t.Error("the other run's database was dropped")
+	}
+	if held(t, conn, name("created")) {
+		t.Error("the other run's name is still marked by this one")
 	}
 }

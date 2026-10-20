@@ -4,14 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
+	"github.com/thec1oud/galleon/internal/dsn"
 )
 
 // Config is the "pg" config section.
@@ -67,63 +70,92 @@ func (s Source) String() string {
 
 var (
 	passwordKV = regexp.MustCompile(`(?i)(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)`)
-	urlDSN     = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
+	// queryParam is a query parameter anywhere in a URL DSN, its value
+	// running to the next '&'.
+	queryParam = regexp.MustCompile(`([?&])([^=&?]*)=([^&]*)`)
 )
 
-// IsURLDSN reports whether dsn is in URL form, scheme://..., whatever the
-// scheme, rather than keyword/value form, whose values may hold "://"
-// themselves.
-func IsURLDSN(dsn string) bool { return urlDSN.MatchString(dsn) }
-
-// redactDSN hides the passwords in either DSN form, valid or not.
-func redactDSN(dsn string) string {
-	if !IsURLDSN(dsn) {
-		return passwordKV.ReplaceAllString(dsn, "${1}xxxxx")
+// redactDSN hides the passwords in either DSN form, valid or not. Since
+// parsers disagree on malformed DSNs, it masks in three ways and leans
+// towards hiding too much:
+//
+//   - The userinfo: in a URL, everything after the first ':' that follows
+//     "scheme://" and comes before the last '@', whatever lies between, so a
+//     password holding '@', '/', '?', '#' or ':' is hidden however a parser
+//     splits it. When the last '@' is in the query or the ':' is a port's,
+//     more than the password goes.
+//   - Parameters: the value of every URL query parameter whose decoded name
+//     is password or sslpassword, or can't be decoded, and of every
+//     keyword/value password or sslpassword.
+//   - What pgx reads: when the DSN carries a password by the above and
+//     pgconn.ParseConfig reads one from the DSN itself, every occurrence of
+//     that password, raw or escaped, is hidden first. One equal to
+//     PGPASSWORD is taken for the environment's and left to the other two
+//     masks. (pgx doesn't expose the sslpassword it reads.)
+//
+// A DSN that carries no password is returned as is.
+func redactDSN(s string) string {
+	masked := maskDSN(s)
+	if masked == s {
+		return s
 	}
-	if u, err := url.Parse(dsn); err == nil {
-		// Read as pgx reads it.
-		if _, ok := u.User.Password(); ok {
-			u.User = url.UserPassword(u.User.Username(), "xxxxx")
+	if pw := dsnPassword(s); pw != "" {
+		userinfo := strings.TrimPrefix(url.UserPassword("", pw).String(), ":")
+		for _, form := range []string{pw, url.QueryEscape(pw), url.PathEscape(pw), userinfo} {
+			s = strings.ReplaceAll(s, form, "xxxxx")
 		}
-		u.RawQuery = redactQuery(u.RawQuery)
-		return u.String()
+		masked = maskDSN(s)
 	}
-	// One url.Parse refuses: everything from the first ':' after the scheme
-	// to the last '@' is taken for the password, since it can hold '@', '/'
-	// or ':' itself. Where that hides more than the password, too much is
-	// hidden rather than too little.
-	i := strings.Index(dsn, "://") + len("://")
-	head, rest := dsn[:i], dsn[i:]
-	if at := strings.LastIndex(rest, "@"); at >= 0 {
-		if c := strings.Index(rest[:at], ":"); c >= 0 {
-			rest = rest[:c+1] + "xxxxx" + rest[at:]
-		}
-	}
-	if q := strings.Index(rest, "?"); q >= 0 {
-		rest = rest[:q+1] + redactQuery(rest[q+1:])
-	}
-	return head + rest
+	return masked
 }
 
-// redactQuery hides the value of each password or sslpassword parameter in
-// a raw URL query, matching the names as decoded, and of any parameter
-// whose name can't be decoded.
-func redactQuery(raw string) string {
-	if raw == "" {
-		return raw
-	}
-	params := strings.Split(raw, "&")
-	for i, p := range params {
-		k, _, ok := strings.Cut(p, "=")
-		if !ok {
-			continue
-		}
-		name, err := url.QueryUnescape(k)
-		if err != nil || strings.EqualFold(name, "password") || strings.EqualFold(name, "sslpassword") {
-			params[i] = k + "=xxxxx"
+// dsnPassword is the password pgx reads from s itself, not from PGPASSWORD
+// or a password file.
+func dsnPassword(s string) string {
+	// A password file is read only when nothing else gives a password, so
+	// one that doesn't exist stands in for it. In either form, a later
+	// setting wins.
+	const nofile = "passfile=/nonexistent/galleon-redaction"
+	withNoFile := s + " " + nofile
+	if dsn.IsURL(s) {
+		withNoFile = s + "?" + nofile
+		if strings.Contains(s, "?") {
+			withNoFile = s + "&" + nofile
 		}
 	}
-	return strings.Join(params, "&")
+	c, err := pgconn.ParseConfig(withNoFile)
+	if err != nil || c.Password == "" || c.Password == os.Getenv("PGPASSWORD") {
+		return ""
+	}
+	return c.Password
+}
+
+// maskDSN applies the userinfo and parameter masks.
+func maskDSN(s string) string {
+	if !dsn.IsURL(s) {
+		return passwordKV.ReplaceAllString(s, "${1}xxxxx")
+	}
+	// Parameters first, so an '@' in a password parameter's value, which
+	// the userinfo mask may stop at, is already hidden.
+	s = queryParam.ReplaceAllStringFunc(s, func(p string) string {
+		m := queryParam.FindStringSubmatch(p)
+		name, err := url.QueryUnescape(m[2])
+		if err == nil && !strings.EqualFold(name, "password") && !strings.EqualFold(name, "sslpassword") {
+			return p
+		}
+		return m[1] + m[2] + "=xxxxx"
+	})
+	i := strings.Index(s, "://") + len("://")
+	rest := s[i:]
+	at := strings.LastIndex(rest, "@")
+	if at < 0 {
+		return s
+	}
+	c := strings.Index(rest[:at], ":")
+	if c < 0 {
+		return s
+	}
+	return s[:i] + rest[:c+1] + "xxxxx" + rest[at:]
 }
 
 // Default sets the defaults: no sources, the default retry policy, and
