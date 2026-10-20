@@ -90,6 +90,13 @@ func planFields(t reflect.Type, index []int) ([]field, error) {
 			fields = append(fields, inner...)
 			continue
 		}
+		if sf.Anonymous && sf.Type.Kind() == reflect.Pointer && sf.Type.Elem().Kind() == reflect.Struct {
+			// Filling one would mean allocating it on every call; embed it by value.
+			if inner, err := planFields(sf.Type.Elem(), nil); err != nil || len(inner) > 0 {
+				return nil, fmt.Errorf("bind: %v.%s is an embedded pointer with parameter fields; embed %v by value", t, sf.Name, sf.Type.Elem())
+			}
+			continue
+		}
 		var f field
 		n := 0
 		for _, k := range []kind{fromPath, fromQuery, fromHeader} {

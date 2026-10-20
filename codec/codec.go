@@ -5,6 +5,7 @@ package codec
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,13 +35,17 @@ func (jsonCodec) MediaType() string { return "application/json" }
 func (jsonCodec) Encode(w io.Writer, v any) error { return json.NewEncoder(w).Encode(v) }
 
 func (jsonCodec) Decode(r io.Reader, v any, unknown op.UnknownFields) error {
-	dec := json.NewDecoder(r)
+	rr := &readErr{r: r}
+	dec := json.NewDecoder(rr)
 	if unknown == op.RejectUnknown {
 		dec.DisallowUnknownFields()
 	}
 	if err := dec.Decode(v); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil // an empty body leaves the input at its zero value
+		}
+		if e := rr.failure(); e != nil {
+			return e
 		}
 		return jsonError(err, reflect.TypeOf(v))
 	}
@@ -49,9 +54,40 @@ func (jsonCodec) Decode(r io.Reader, v any, unknown op.UnknownFields) error {
 		if errors.As(err, &tooBig) {
 			return jsonError(err, nil)
 		}
+		if e := rr.failure(); e != nil {
+			return e
+		}
 		return invalid("", "trailing_data", nil, "the body has data after the JSON value")
 	}
 	return nil
+}
+
+// readErr remembers the error reading the body failed with, so a connection
+// that breaks or times out isn't reported as the client's malformed JSON.
+type readErr struct {
+	r   io.Reader
+	err error
+}
+
+func (r *readErr) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
+}
+
+// failure returns the read error as an Unavailable error, or nil when the body
+// was read without one or only went over the body limit.
+func (r *readErr) failure() error {
+	var tooBig *http.MaxBytesError
+	if r.err == nil || errors.As(r.err, &tooBig) {
+		return nil
+	}
+	if errors.Is(r.err, context.Canceled) {
+		return errs.Wrap(r.err, errs.Canceled, "galleon.body_read", "reading the request body was canceled")
+	}
+	return errs.Wrap(r.err, errs.Unavailable, "galleon.body_read", "the request body could not be read")
 }
 
 // jsonError turns an encoding/json error into an InvalidArgument error with a

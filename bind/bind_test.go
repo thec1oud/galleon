@@ -138,3 +138,13 @@ func TestEmptyValuesAreAbsentExceptForStrings(t *testing.T) {
 		t.Fatalf("got %+v", in)
 	}
 }
+
+type PtrListIn struct {
+	*Pagination
+}
+
+func TestPlanRejectsEmbeddedPointersWithParameters(t *testing.T) {
+	if _, err := bind.Plan(reflect.TypeFor[PtrListIn]()); err == nil || !strings.Contains(err.Error(), "embed") {
+		t.Fatalf("got %v", err)
+	}
+}

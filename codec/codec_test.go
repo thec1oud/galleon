@@ -2,6 +2,7 @@ package codec_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -227,5 +228,22 @@ func TestTrailingSpaceOverTheLimitIsTooLarge(t *testing.T) {
 	var o Order
 	if e := errs.From(codec.JSON.Decode(body, &o, op.RejectUnknown)); e.Code != "galleon.body_too_large" {
 		t.Fatalf("got %v", e)
+	}
+}
+
+type brokenReader struct{ err error }
+
+func (b brokenReader) Read([]byte) (int, error) { return 0, b.err }
+
+func TestReadFailuresAreNotTheClientsFault(t *testing.T) {
+	var v struct{ A int }
+	err := codec.JSON.Decode(io.MultiReader(strings.NewReader(`{"A":`), brokenReader{errors.New("connection reset")}), &v, op.IgnoreUnknown)
+	var e *errs.Error
+	if !errors.As(err, &e) || e.Kind != errs.Unavailable {
+		t.Fatalf("got %v", err)
+	}
+	err = codec.JSON.Decode(io.MultiReader(strings.NewReader(`{"A":1}`), brokenReader{context.Canceled}), &v, op.IgnoreUnknown)
+	if !errors.As(err, &e) || e.Kind != errs.Canceled {
+		t.Fatalf("after the value: got %v", err)
 	}
 }
