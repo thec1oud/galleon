@@ -42,6 +42,8 @@ func TestClassify(t *testing.T) {
 		{"closed pool", bg, puddle.ErrClosedPool, errs.Unavailable, data.CodeUnavailable},
 		{"lock not available", bg, &pgconn.PgError{Code: "55P03"}, errs.Conflict, data.CodeLockNotAvailable},
 		{"statement timeout", bg, &pgconn.PgError{Code: "57014", Message: "canceling statement due to statement timeout"}, errs.DeadlineExceeded, data.CodeStatementTimeout},
+		{"statement timeout in German", bg, &pgconn.PgError{Code: "57014", Message: "storniere Anfrage wegen Zeitüberschreitung der Anweisung"}, errs.DeadlineExceeded, data.CodeStatementTimeout},
+		{"statement timeout without a message", bg, &pgconn.PgError{Code: "57014"}, errs.DeadlineExceeded, data.CodeStatementTimeout},
 		{"admin cancel", bg, &pgconn.PgError{Code: "57014", Message: "canceling statement due to user request"}, errs.Unavailable, data.CodeUnavailable},
 		{"canceled", canceled, context.Canceled, errs.Canceled, "galleon.canceled"},
 		{"deadline", expired, context.DeadlineExceeded, errs.DeadlineExceeded, "galleon.deadline_exceeded"},

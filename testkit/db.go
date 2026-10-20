@@ -2,12 +2,14 @@ package testkit
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,10 +60,11 @@ type Database struct {
 // database, which is rolled back when the test ends: Manager runs every
 // transaction inside it, so one test never sees another's writes.
 //
-// The package's database is named after the process too, so two runs of one
-// package at once don't share or drop each other's. Nothing runs when a test
-// binary exits, so it is left in place then, and dropped by a later run of
-// the package once no one is connected to it. Templates of schemas no longer
+// Each run of a package gets a database of its own, named after its process
+// and a random suffix, and marks it live with an advisory lock held as long
+// as the process runs. Nothing runs when a test binary exits, so the
+// database is left in place then, and a later run of the package drops it
+// once its mark is gone. Templates of schemas no longer
 // in use stay, since nothing ties them to a package: drop the databases
 // named galleon_tpl_* to reclaim them; the next run rebuilds what it needs.
 func DB(t testing.TB, opts ...DBOption) *Database {
@@ -190,7 +193,14 @@ func (d *Database) DSN() string { return d.dsn }
 var packageDBs struct {
 	mu   sync.Mutex
 	dsns map[string]string // by schema hash
+	// live holds, for as long as the process runs, a session-level
+	// advisory lock on each package database it created: the mark that
+	// the database is in use, even while nothing is connected to it.
+	live *pgx.Conn
 }
+
+// liveLock is the advisory lock key, in SQL, that marks database $1 live.
+const liveLock = "hashtext('galleon.testkit.live'), hashtext($1)"
 
 // packageDB returns the DSN of this binary's database for schema, creating
 // the template and the clone the first time.
@@ -204,7 +214,13 @@ func packageDB(admin string, schema []string) (string, error) {
 	if dsn, ok := packageDBs.dsns[key]; ok {
 		return dsn, nil
 	}
-	name := fmt.Sprintf("%s_%d", base, os.Getpid())
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return "", err
+	}
+	// The pid helps tell runs apart; the random part keeps names apart
+	// across hosts sharing a server.
+	name := fmt.Sprintf("%s_%d_%s", base, os.Getpid(), hex.EncodeToString(rnd[:]))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -232,12 +248,22 @@ func packageDB(admin string, schema []string) (string, error) {
 	if err := dropStale(ctx, conn, base); err != nil {
 		return "", err
 	}
-	ident := pgx.Identifier{name}.Sanitize()
-	// A database of this name is from a process with this pid that is gone.
-	if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+ident+" WITH (FORCE)"); err != nil {
-		return "", err
+	if packageDBs.live == nil {
+		// Its own connection, which nothing else uses or closes: a
+		// session's advisory locks are reentrant, so one that tried the
+		// locks of others' databases would win its own too.
+		live, err := pgx.Connect(context.Background(), admin)
+		if err != nil {
+			return "", fmt.Errorf("connecting to %s: %w", PostgresEnv, err)
+		}
+		packageDBs.live = live
 	}
-	if _, err := conn.Exec(ctx, "CREATE DATABASE "+ident+" TEMPLATE "+pgx.Identifier{tpl}.Sanitize()); err != nil {
+	// Marked before it exists, and under the turn-taking lock, so no other
+	// run sees it unmarked.
+	if _, err := packageDBs.live.Exec(ctx, "SELECT pg_advisory_lock("+liveLock+")", name); err != nil {
+		return "", fmt.Errorf("marking the package database live: %w", err)
+	}
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{tpl}.Sanitize()); err != nil {
 		return "", fmt.Errorf("cloning the template: %w", err)
 	}
 	dsn, err := withDatabase(admin, name)
@@ -265,13 +291,11 @@ func dbNames(schema []string) (key, tpl, base string, err error) {
 }
 
 // dropStale drops this package's databases for the schema that earlier
-// runs left. One that a run still going is connected to can't be dropped,
-// and is kept.
+// runs left. A run still going holds the advisory lock that marks its
+// database live, connected to it or not, so only a database whose lock
+// conn wins is dropped.
 func dropStale(ctx context.Context, conn *pgx.Conn, base string) error {
-	// Asking first spares DROP's wait of several seconds for the users of
-	// one in use to leave; DROP still refuses one a run connects to since.
-	rows, err := conn.Query(ctx, `SELECT datname FROM pg_database d WHERE starts_with(datname, $1)
-		AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)`, base)
+	rows, err := conn.Query(ctx, "SELECT datname FROM pg_database WHERE starts_with(datname, $1)", base)
 	if err != nil {
 		return err
 	}
@@ -280,9 +304,16 @@ func dropStale(ctx context.Context, conn *pgx.Conn, base string) error {
 		return err
 	}
 	for _, name := range names {
-		_, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize())
-		var pe *pgconn.PgError
-		if err != nil && !(errors.As(err, &pe) && pe.Code == "55006") { // object_in_use
+		var won bool
+		if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock("+liveLock+")", name).Scan(&won); err != nil {
+			return err
+		}
+		if !won {
+			continue
+		}
+		_, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+		_, uerr := conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock("+liveLock+")", name)
+		if err := errors.Join(err, uerr); err != nil {
 			return err
 		}
 	}
@@ -343,15 +374,20 @@ func createTemplate(ctx context.Context, conn *pgx.Conn, admin, tpl string, sche
 	return fmt.Errorf("naming the template: %w", err)
 }
 
+// urlDSN is the start of a DSN in URL form, whatever its scheme, as package
+// pg tells the forms apart. A keyword/value DSN may hold "://" in a value.
+var urlDSN = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
+
 // withDatabase returns dsn with its database replaced, in either DSN form.
 func withDatabase(dsn, db string) (string, error) {
-	if u, err := url.Parse(dsn); err == nil && (u.Scheme == "postgres" || u.Scheme == "postgresql") {
+	if urlDSN.MatchString(dsn) {
+		u, err := url.Parse(dsn)
+		if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+			return "", fmt.Errorf("%s is not a postgres:// URL or a keyword/value string", PostgresEnv)
+		}
 		u.Path = "/" + db
 		u.RawPath = ""
 		return u.String(), nil
-	}
-	if strings.Contains(dsn, "://") {
-		return "", fmt.Errorf("%s is not a postgres:// URL or a keyword/value string", PostgresEnv)
 	}
 	// In the keyword/value form, a later keyword wins.
 	return dsn + " dbname='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(db) + "'", nil

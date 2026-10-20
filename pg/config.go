@@ -3,7 +3,6 @@ package pg
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -67,28 +66,30 @@ func (s Source) String() string {
 
 var (
 	passwordKV = regexp.MustCompile(`(?i)(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)`)
-	// userinfo is a URL's user:password@, for a URL url.Parse refuses. The
-	// password runs to the last '@' before the host's path, since a
-	// malformed one can hold '@' itself.
-	userinfo = regexp.MustCompile(`^([A-Za-z]+://[^:/@]*:)[^/]*@`)
+	// urlDSN is the start of a DSN in URL form, whatever its scheme, so a
+	// mistyped one is redacted as a URL too.
+	urlDSN = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
 	// passwordQuery is a password parameter in a URL's query.
 	passwordQuery = regexp.MustCompile(`(?i)([?&]password=)[^&]*`)
 )
 
-// redactDSN hides the password in either DSN form.
+// redactDSN hides the password in either DSN form, valid or not. In a URL,
+// everything from the first ':' after the scheme to the last '@' is the
+// password: one url.Parse refuses, or reads otherwise, can hold '@', '/' or
+// ':' itself. Where that hides more than the password, such as an '@' in the
+// query, too much is hidden rather than too little.
 func redactDSN(dsn string) string {
-	if u, err := url.Parse(dsn); err == nil && (u.Scheme == "postgres" || u.Scheme == "postgresql") {
-		if q := u.Query(); q.Has("password") {
-			q.Set("password", "xxxxx")
-			u.RawQuery = q.Encode()
+	loc := urlDSN.FindStringIndex(dsn)
+	if loc == nil {
+		return passwordKV.ReplaceAllString(dsn, "${1}xxxxx")
+	}
+	head, rest := dsn[:loc[1]], dsn[loc[1]:]
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		if c := strings.Index(rest[:at], ":"); c >= 0 {
+			rest = rest[:c+1] + "xxxxx" + rest[at:]
 		}
-		return u.Redacted()
 	}
-	if lower := strings.ToLower(dsn); strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
-		dsn = userinfo.ReplaceAllString(dsn, "${1}xxxxx@")
-		return passwordQuery.ReplaceAllString(dsn, "${1}xxxxx")
-	}
-	return passwordKV.ReplaceAllString(dsn, "${1}xxxxx")
+	return passwordQuery.ReplaceAllString(head+rest, "${1}xxxxx")
 }
 
 // Default sets the defaults: no sources, the default retry policy, and

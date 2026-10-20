@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -52,6 +53,7 @@ type Manager struct {
 	sources map[string]*source
 	names   []string // sorted, the primary first
 	tel     atomic.Pointer[telemetry]
+	apps    appStack
 	life    sync.Mutex // serializes Start and Stop
 	started bool
 	retry   data.RetryPolicy
@@ -69,7 +71,38 @@ type telemetry struct {
 }
 
 func (m *Manager) setTelemetry(tp trace.TracerProvider, log *slog.Logger) {
-	m.tel.Store(&telemetry{tracer: tp.Tracer(tracerName), log: log})
+	t := &telemetry{tracer: tp.Tracer(tracerName), log: log}
+	m.apps.mu.Lock()
+	defer m.apps.mu.Unlock()
+	m.apps.own = t
+	m.tel.Store(t)
+}
+
+// appStack is the telemetry of the apps running on a Use'd Manager, in the
+// order they started. The Manager uses the last one's, or its own when none
+// runs.
+type appStack struct {
+	mu   sync.Mutex
+	own  *telemetry
+	live []*telemetry
+}
+
+func (m *Manager) pushTelemetry(t *telemetry) {
+	m.apps.mu.Lock()
+	defer m.apps.mu.Unlock()
+	m.apps.live = append(m.apps.live, t)
+	m.tel.Store(t)
+}
+
+func (m *Manager) popTelemetry(t *telemetry) {
+	m.apps.mu.Lock()
+	defer m.apps.mu.Unlock()
+	m.apps.live = slices.DeleteFunc(m.apps.live, func(x *telemetry) bool { return x == t })
+	if n := len(m.apps.live); n > 0 {
+		m.tel.Store(m.apps.live[n-1])
+	} else {
+		m.tel.Store(m.apps.own)
+	}
 }
 
 func (m *Manager) tracer() trace.Tracer { return m.tel.Load().tracer }
@@ -305,20 +338,19 @@ func (w *within) ping(ctx context.Context) error {
 // appTelemetry points a Use'd Manager at one app's tracer provider and
 // logger while that app runs.
 type appTelemetry struct {
-	m    *Manager
-	tel  *telemetry
-	prev *telemetry
+	m   *Manager
+	tel *telemetry
 }
 
 func (a *appTelemetry) Start(context.Context) error {
-	a.prev = a.m.tel.Swap(a.tel)
+	a.m.pushTelemetry(a.tel)
 	return nil
 }
 
-// Stop restores what the Manager used before, unless another app has
-// pointed it elsewhere since.
+// Stop hands the Manager back to the latest app still running, or to its
+// own telemetry when none is.
 func (a *appTelemetry) Stop(context.Context) error {
-	a.m.tel.CompareAndSwap(a.tel, a.prev)
+	a.m.popTelemetry(a.tel)
 	return nil
 }
 
@@ -336,9 +368,11 @@ type moduleSettings struct {
 // Use makes the module provide m, as built, instead of one from the config
 // section. The app never starts or stops m: its caller does. While the app
 // runs, from its start to its stop, m sends spans and logs to the app's
-// tracer provider and logger; when the app stops, m goes back to what it
-// used before. With two apps on one Manager at once, the one started last
-// gets them. testkit.DB uses it.
+// tracer provider and logger. With several apps on one Manager at once,
+// the latest started of those still running gets them; with none, m uses
+// its own. data.Manager is built once the app's
+// telemetry is in place, so a provider that starts with it should depend on
+// it rather than on *Manager. testkit.DB uses it.
 func Use(m *Manager) ModuleOption { return func(s *moduleSettings) { s.use = m } }
 
 // Module returns the data module: it provides *pg.Manager and data.Manager
@@ -354,10 +388,13 @@ func Module(opts ...ModuleOption) galleon.Module {
 			m := s.use
 			// Supplied, so the kernel doesn't start or stop it.
 			galleon.Supply[*Manager](r, m)
-			galleon.Supply[data.Manager](r, managerView{m})
 			galleon.Provide[*appTelemetry](r, func(tp trace.TracerProvider, log *slog.Logger) *appTelemetry {
 				return &appTelemetry{m: m, tel: &telemetry{tracer: tp.Tracer(tracerName), log: log}}
 			})
+			// Built after the app's telemetry is in place, so what depends
+			// on data.Manager starts with it. A managerView has no Start or
+			// Stop for the kernel to call.
+			galleon.Provide[data.Manager](r, func(*appTelemetry) data.Manager { return managerView{m} })
 			r.Intercept(op.Before(op.StageRoute), func(next op.Invoker) op.Invoker {
 				return func(ctx context.Context, call *op.Call) (any, error) { return m.track(ctx, call, next) }
 			})

@@ -1109,8 +1109,16 @@ func errorKinds(t *testing.T, f Factory) {
 			return err
 		}
 		go func() {
-			time.Sleep(100 * time.Millisecond)
-			_, _ = e.pool.Exec(context.Background(), "SELECT pg_cancel_backend($1)", pid)
+			// Cancel once the backend is in pg_sleep, not before it starts.
+			for range 500 {
+				var canceled bool
+				err := e.pool.QueryRow(context.Background(), `SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+					WHERE pid = $1 AND state = 'active' AND query LIKE '%pg_sleep%'`, pid).Scan(&canceled)
+				if err == nil && canceled {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 		}()
 		var x string
 		return r.QueryRow(ctx, "SELECT pg_sleep(5)::text").Scan(&x)

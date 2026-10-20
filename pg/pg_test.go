@@ -56,6 +56,12 @@ func TestSourcesHideTheirPasswords(t *testing.T) {
 		"postgres://app:hun@ter2%zz@db",
 		"host=db user=app password=hunter2 application_name=http://x",
 		"postgres://app:hunter2@db/orders?sslmode=%zz&password=hunter2",
+		"postgres://app:hun/ter2@db/orders",
+		"postgres://app:5432/ter2@db/orders",
+		"postgress://app:hunter2@db",
+		"POSTGRES://app:hunter2@db/orders",
+		"postgres://app@db/orders?password=hunter2%zz",
+		"postgres://app@db/orders?sslmode=disable&password=hunter2&password=hunter2",
 	} {
 		// "ter2" is the end of every password here, '@' or not.
 		if s := fmt.Sprint(pg.Source{DSN: dsn}); strings.Contains(s, "ter2") || !strings.Contains(s, "db") {

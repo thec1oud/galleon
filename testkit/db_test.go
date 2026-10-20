@@ -313,3 +313,67 @@ func TestDBModuleScopesTelemetryToTheRunningApp(t *testing.T) {
 		t.Errorf("the second app got %d write spans, want 1", got)
 	}
 }
+
+// Apps on one DB that stop in another order than they started leave the
+// spans to the one still running, then to none.
+func TestDBModuleTelemetryFollowsTheAppsStillRunning(t *testing.T) {
+	db := testkit.DB(t, notes)
+	m := db.Manager()
+	write := func() {
+		t.Helper()
+		if err := m.Write(context.Background(), func(ctx context.Context, w data.WriteTx) error {
+			_, err := w.Exec(ctx, "SELECT 1")
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writes := func(tp *datatest.Recorder) int {
+		return len(tp.Find(func(s *datatest.Span) bool { return s.Attr("galleon.data.access") == "write" }))
+	}
+	stop := func(h *testkit.Harness) {
+		t.Helper()
+		if err := h.App.Shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, b := &datatest.Recorder{}, &datatest.Recorder{}
+	ha := testkit.New(t, galleon.Modules(db.Module()), galleon.TracerProvider(a))
+	hb := testkit.New(t, galleon.Modules(db.Module()), galleon.TracerProvider(b))
+	write() // to b, started last
+	stop(ha)
+	write() // to b, still running
+	stop(hb)
+	write() // to neither
+	if got := writes(a); got != 0 {
+		t.Errorf("a got %d write spans, want 0", got)
+	}
+	if got := writes(b); got != 2 {
+		t.Errorf("b got %d write spans, want 2", got)
+	}
+}
+
+// writesAtStart is a provider that uses the data plane as it starts.
+type writesAtStart struct{ m data.Manager }
+
+func (w *writesAtStart) Start(ctx context.Context) error {
+	return w.m.Write(ctx, func(ctx context.Context, tx data.WriteTx) error {
+		_, err := tx.Exec(ctx, "SELECT 1")
+		return err
+	})
+}
+
+// A provider that depends on data.Manager starts once the app's telemetry
+// is in place, whatever order the modules are listed in.
+func TestDBModuleTelemetryIsInPlaceForProvidersThatStartWithIt(t *testing.T) {
+	db := testkit.DB(t, notes)
+	mod := galleon.ModuleFunc("early", func(r *galleon.Registry) error {
+		galleon.Provide[*writesAtStart](r, func(m data.Manager) *writesAtStart { return &writesAtStart{m: m} })
+		return nil
+	})
+	tp := &datatest.Recorder{}
+	testkit.New(t, galleon.Modules(mod, db.Module()), galleon.TracerProvider(tp))
+	if len(tp.Find(func(s *datatest.Span) bool { return s.Attr("galleon.data.access") == "write" })) != 1 {
+		t.Fatalf("the write at start went unrecorded among %v", tp.Names())
+	}
+}

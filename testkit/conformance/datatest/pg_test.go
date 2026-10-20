@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -98,10 +99,7 @@ func TestStopUnderLoad(t *testing.T) {
 func TestUseLeavesTheManagerToItsOwner(t *testing.T) {
 	db := testkit.DB(t)
 	name := fmt.Sprintf("use_probe_%d", time.Now().UnixNano())
-	dsn := db.DSN() + "&application_name=" + name
-	if !strings.Contains(db.DSN(), "?") {
-		dsn = db.DSN() + "?application_name=" + name
-	}
+	dsn := withAppName(t, db.DSN(), name)
 	m, err := pg.New(pg.Config{Primary: pg.Source{DSN: dsn, MaxConns: 4}})
 	if err != nil {
 		t.Fatal(err)
@@ -154,4 +152,20 @@ func TestUseLeavesTheManagerToItsOwner(t *testing.T) {
 	if after := conns(); after == 0 {
 		t.Error("the app closed the caller's pools")
 	}
+}
+
+// withAppName sets application_name in dsn, in either DSN form.
+func withAppName(t *testing.T, dsn, name string) string {
+	t.Helper()
+	if !strings.Contains(strings.SplitN(dsn, " ", 2)[0], "://") {
+		return dsn + " application_name=" + name
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	q.Set("application_name", name)
+	u.RawQuery = q.Encode()
+	return u.String()
 }

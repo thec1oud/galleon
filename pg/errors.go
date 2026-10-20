@@ -59,12 +59,13 @@ func classify(ctx context.Context, err error) error {
 	if pe != nil && pe.Code == "57014" {
 		// Canceled with the caller's ctx still live: by statement_timeout,
 		// or by someone else, such as pg_cancel_backend. Only the message
-		// tells them apart, and only in English (lc_messages); any other
-		// is taken for the database's doing.
-		if strings.Contains(pe.Message, "statement timeout") {
-			return errs.Wrap(err, errs.DeadlineExceeded, data.CodeStatementTimeout, "the request took too long")
+		// tells them apart, and only in English (lc_messages), so a
+		// message that isn't the English one for a cancel from outside is
+		// taken for a timeout rather than for the database being down.
+		if strings.Contains(pe.Message, "user request") {
+			return errs.Wrap(err, errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
 		}
-		return errs.Wrap(err, errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
+		return errs.Wrap(err, errs.DeadlineExceeded, data.CodeStatementTimeout, "the request took too long")
 	}
 	if pe == nil && (unreachable(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return errs.Wrap(err, errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
