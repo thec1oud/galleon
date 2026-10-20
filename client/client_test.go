@@ -165,6 +165,14 @@ func TestRetryAfterAndItsLimit(t *testing.T) {
 	if !errors.As(err, &se) || se.Status != 429 || hits.Load() != 1 {
 		t.Fatalf("a Retry-After past max_retry_after returns the response: %v after %d", err, hits.Load())
 	}
+	for _, v := range []string{"9300000000", "99999999999999999999999"} {
+		hits.Store(0)
+		after = v
+		_, err = client.Send[Item](context.Background(), c, "GET", "/", nil)
+		if !errors.As(err, &se) || se.Status != 429 || hits.Load() != 1 {
+			t.Fatalf("Retry-After %s mustn't overflow into a short wait: %v after %d", v, err, hits.Load())
+		}
+	}
 }
 
 func TestRetriesStopAtTheCallersDeadline(t *testing.T) {
@@ -318,23 +326,29 @@ func TestEgressGuard(t *testing.T) {
 
 func TestEgressGuardRanges(t *testing.T) {
 	for addr, want := range map[string]bool{
-		"8.8.8.8":            true,
-		"2606:4700::1111":    true,
-		"127.0.0.1":          false,
-		"10.1.2.3":           false,
-		"172.16.0.1":         false,
-		"192.168.1.1":        false,
-		"169.254.169.254":    false,
-		"100.64.0.1":         false,
-		"0.0.0.0":            false,
-		"255.255.255.255":    false,
-		"224.0.0.1":          false,
-		"::1":                false,
-		"fe80::1":            false,
-		"fd00::1":            false,
-		"::ffff:127.0.0.1":   false,
-		"64:ff9b::a9fe:a9fe": false, // 169.254.169.254 through NAT64
-		"64:ff9b::808:808":   true,
+		"8.8.8.8":              true,
+		"2606:4700::1111":      true,
+		"127.0.0.1":            false,
+		"10.1.2.3":             false,
+		"172.16.0.1":           false,
+		"192.168.1.1":          false,
+		"169.254.169.254":      false,
+		"100.64.0.1":           false,
+		"0.0.0.0":              false,
+		"255.255.255.255":      false,
+		"224.0.0.1":            false,
+		"::1":                  false,
+		"fe80::1":              false,
+		"fd00::1":              false,
+		"::ffff:127.0.0.1":     false,
+		"64:ff9b::a9fe:a9fe":   false, // 169.254.169.254 through NAT64
+		"64:ff9b::808:808":     true,
+		"64:ff9b:1::a9fe:a9fe": false, // local-use NAT64
+		"2002:a9fe:a9fe::1":    false, // 169.254.169.254 through 6to4
+		"2002:808:808::1":      true,
+		"::a9fe:a9fe":          false, // IPv4-compatible
+		"::808:808":            false,
+		"fec0::1":              false, // site-local
 	} {
 		if got := client.Permits(netip.MustParseAddr(addr), nil); got != want {
 			t.Errorf("%s: permitted %v, want %v", addr, got, want)
@@ -342,6 +356,9 @@ func TestEgressGuardRanges(t *testing.T) {
 	}
 	if !client.Permits(netip.MustParseAddr("10.1.2.3"), []string{"10.1.0.0/16"}) {
 		t.Error("allow_networks opens a range")
+	}
+	if !client.Permits(netip.MustParseAddr("fec0::1"), []string{"fec0::/10"}) {
+		t.Error("allow_networks opens the newly blocked ranges too")
 	}
 }
 
@@ -434,6 +451,26 @@ func TestTracing(t *testing.T) {
 	if second.attr("http.request.resend_count") != "1" || second.attr("http.response.status_code") != "200" {
 		t.Fatalf("second attempt: %v", second.attrs)
 	}
+
+	// A refused address, a status error and a body read by the caller.
+	_, _ = client.Send[Item](context.Background(), c, "GET", "http://169.254.169.254/", nil)
+	hits.Store(0)
+	_, _ = client.Send[Item](context.Background(), c, "GET", "/", nil)
+	res, err := c.Do(must(http.NewRequest("GET", "/", nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(res.Body)
+	res.Body.Close()
+	spans = tp.all()
+	if len(spans) != 6 {
+		t.Fatalf("want 6 spans, got %d", len(spans))
+	}
+	for i, s := range spans {
+		if !s.isEnded() {
+			t.Errorf("span %d was started and never ended: %v", i, s.attrs)
+		}
+	}
 }
 
 func TestModule(t *testing.T) {
@@ -509,6 +546,19 @@ type recSpan struct {
 	mu    sync.Mutex
 	sc    trace.SpanContext
 	attrs map[attribute.Key]string
+	ended bool
+}
+
+func (s *recSpan) End(...trace.SpanEndOption) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ended = true
+}
+
+func (s *recSpan) isEnded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ended
 }
 
 func (s *recSpan) SpanContext() trace.SpanContext { return s.sc }
@@ -524,4 +574,196 @@ func (s *recSpan) attr(k attribute.Key) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.attrs[k]
+}
+
+func TestNonReplayableBodyIsNotRetried(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	c := newClient(t, srv)
+	// No GetBody: the body can only be sent once.
+	req := must(http.NewRequest("PUT", "/", io.NopCloser(strings.NewReader("{}"))))
+	res, err := c.Do(req)
+	if err != nil || res.StatusCode != 503 || hits.Load() != 1 {
+		t.Fatalf("a body that can't be replayed isn't retried: %v %v after %d", res, err, hits.Load())
+	}
+	res.Body.Close()
+}
+
+func TestRetriesAConnectionFailure(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"ok"}`)
+	}))
+	defer srv.Close()
+	out, err := client.Send[Item](context.Background(), newClient(t, srv), "GET", "/", nil)
+	if err != nil || out.ID != "ok" || hits.Load() != 2 {
+		t.Fatalf("a dropped connection is retried: %+v, %v after %d", out, err, hits.Load())
+	}
+}
+
+func TestHalfOpenLetsOneProbeThrough(t *testing.T) {
+	var hits atomic.Int32
+	arrived, release := make(chan struct{}), make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(500)
+			return
+		}
+		arrived <- struct{}{}
+		<-release
+	}))
+	defer srv.Close()
+	clk := clock.NewFake(time.Unix(0, 0))
+	c := newClient(t, srv, client.Clock(clk), client.Configure(func(c *client.Config) {
+		c.Retries, c.BreakerFailures, c.BreakerOpenFor = 0, 1, time.Minute
+	}))
+	_, _ = client.Send[Item](context.Background(), c, "GET", "/", nil)
+	clk.Advance(time.Minute)
+	probe := make(chan error, 1)
+	go func() {
+		_, err := client.Send[Item](context.Background(), c, "GET", "/", nil)
+		probe <- err
+	}()
+	<-arrived
+	if _, err := client.Send[Item](context.Background(), c, "GET", "/", nil); errs.From(err).Code != "galleon.circuit_open" {
+		t.Fatalf("while the probe is out, other requests fail fast: %v", err)
+	}
+	close(release)
+	if err := <-probe; err != nil || hits.Load() != 2 {
+		t.Fatalf("the probe goes through: %v after %d", err, hits.Load())
+	}
+}
+
+func TestEgressGuardAppliesToRedirects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	defer srv.Close()
+	_, err := client.Send[Item](context.Background(), newClient(t, srv), "GET", "/", nil)
+	if e := errs.From(err); e.Kind != errs.PermissionDenied || e.Code != "galleon.egress_denied" {
+		t.Fatalf("a redirect to a refused address is refused: %v", err)
+	}
+}
+
+func TestRedirectsResolveAgainstTheRequestURL(t *testing.T) {
+	var seen sync.Map
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/abs":
+			http.Redirect(w, r, "/login", http.StatusFound)
+		case "/api/a/rel":
+			http.Redirect(w, r, "../x", http.StatusFound)
+		case "/api/a/sib":
+			http.Redirect(w, r, "y", http.StatusFound)
+		default:
+			seen.Store(r.URL.Path, true)
+		}
+	}))
+	defer srv.Close()
+	c, err := client.New("test", client.BaseURL(srv.URL+"/api"), loopback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{"/abs": "/login", "/a/rel": "/api/x", "a/sib": "/api/a/y"} {
+		seen.Clear()
+		if _, err := client.Send[Item](context.Background(), c, "GET", path, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := seen.Load(want); !ok {
+			t.Errorf("Do: %s redirected, want %s; server saw %v", path, want, keys(&seen))
+		}
+		seen.Clear()
+		req := must(http.NewRequest("GET", path, nil))
+		res, err := c.HTTP().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if _, ok := seen.Load(want); !ok {
+			t.Errorf("HTTP(): %s redirected, want %s; server saw %v", path, want, keys(&seen))
+		}
+		if req.URL.String() != path {
+			t.Errorf("the caller's request was changed to %s", req.URL)
+		}
+	}
+}
+
+func keys(m *sync.Map) []any {
+	var ks []any
+	m.Range(func(k, _ any) bool { ks = append(ks, k); return true })
+	return ks
+}
+
+func TestCredentialsAreBoundToSchemeAndPort(t *testing.T) {
+	var mu sync.Mutex
+	got := map[string]string{}
+	fake := rtFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		got[r.URL.String()] = r.Header.Get("Authorization")
+		mu.Unlock()
+		res := &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody, Request: r}
+		if r.URL.Path == "/downgrade" {
+			res.StatusCode = http.StatusFound
+			res.Header.Set("Location", "http://api.example.com/landing")
+		}
+		return res, nil
+	})
+	c, err := client.New("test", client.BaseURL("https://api.example.com"), client.Transport(fake),
+		client.WithCredentials(client.Bearer("base")),
+		client.WithCredentials(client.Bearer("files"), "files.example.com"),
+		client.WithCredentials(client.Bearer("legacy"), "http://legacy.example.com:8080"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for u, want := range map[string]string{
+		"https://api.example.com/downgrade": "Bearer base",
+		"https://api.example.com:443/x":     "Bearer base",
+		"https://api.example.com:8443/x":    "",
+		"http://api.example.com/x":          "",
+		"https://files.example.com/x":       "Bearer files",
+		"https://files.example.com:8443/x":  "Bearer files",
+		"http://files.example.com/x":        "",
+		"http://legacy.example.com:8080/x":  "Bearer legacy",
+		"http://legacy.example.com:8081/x":  "",
+		"https://legacy.example.com:8080/x": "",
+	} {
+		res, err := c.Do(must(http.NewRequest("GET", u, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		mu.Lock()
+		if got[u] != want {
+			t.Errorf("%s: got %q, want %q", u, got[u], want)
+		}
+		mu.Unlock()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if v, ok := got["http://api.example.com/landing"]; !ok || v != "" {
+		t.Errorf("a redirect from https to http on the same host must not carry the credentials: %q (followed: %v)", v, ok)
+	}
+	for _, h := range []string{"ftp://x", "https://x/path", "https://u@x"} {
+		if _, err := client.New("test", client.Transport(fake), client.WithCredentials(client.Bearer("x"), h)); err == nil {
+			t.Errorf("credentials host %q must be refused", h)
+		}
+	}
+}
+
+func TestMaxResponseBytesMustBePositive(t *testing.T) {
+	_, err := client.New("test", client.Configure(func(c *client.Config) { c.MaxResponseBytes = 0 }))
+	if err == nil || !strings.Contains(err.Error(), "max_response_bytes") {
+		t.Fatalf("got %v", err)
+	}
 }

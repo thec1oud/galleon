@@ -3,8 +3,12 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
+	"strconv"
+	"strings"
 )
 
 // Credentials authenticate requests.
@@ -46,13 +50,24 @@ func HeaderValue(name, value string) Credentials {
 }
 
 type credentials struct {
-	c     Credentials
-	hosts []string
+	c       Credentials
+	hosts   []string
+	origins []origin
 }
 
-// WithCredentials authenticates requests to hosts, given as "host" (any
-// port) or "host:port"; with none, to the BaseURL's host. Requests to other
-// hosts, such as a redirect's target, go without them.
+// origin is where credentials may go: a scheme and host, and a port unless
+// it is zero, for any port.
+type origin struct {
+	scheme, host string
+	port         int
+}
+
+// WithCredentials authenticates requests to hosts. A host is "host" (any
+// port) or "host:port", and takes the credentials over https only; one given
+// as a URL, such as "http://host:8080", takes them over that scheme instead.
+// With no hosts, the credentials go to the BaseURL's scheme, host and port
+// (the scheme's default port when it names none). Requests anywhere else, such
+// as a redirect to another host or from https to http, go without them.
 func WithCredentials(c Credentials, hosts ...string) Option {
 	return func(s *settings) {
 		if c == nil {
@@ -63,6 +78,40 @@ func WithCredentials(c Credentials, hosts ...string) Option {
 	}
 }
 
+// baseOrigin is the BaseURL's origin, with its port made explicit.
+func baseOrigin(u *url.URL) origin {
+	return origin{scheme: u.Scheme, host: strings.ToLower(u.Hostname()), port: port(u)}
+}
+
+// parseOrigin parses a WithCredentials host.
+func parseOrigin(h string) (origin, error) {
+	o := origin{scheme: "https"}
+	if strings.Contains(h, "://") {
+		u, err := url.Parse(h)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || strings.Trim(u.Path, "/") != "" {
+			return origin{}, fmt.Errorf("client: credentials host %q must be a host, host:port or an http(s) URL with no path", h)
+		}
+		o.scheme, h = u.Scheme, u.Host
+	}
+	u := &url.URL{Host: h}
+	if u.Hostname() == "" || strings.ContainsAny(h, "/?#@") {
+		return origin{}, fmt.Errorf("client: credentials host %q must be a host, host:port or an http(s) URL with no path", h)
+	}
+	o.host = strings.ToLower(u.Hostname())
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n <= 0 || n > 65535 {
+			return origin{}, fmt.Errorf("client: credentials host %q has an invalid port", h)
+		}
+		o.port = n
+	}
+	return o, nil
+}
+
+func (o origin) matches(u *url.URL) bool {
+	return u.Scheme == o.scheme && strings.EqualFold(u.Hostname(), o.host) && (o.port == 0 || port(u) == o.port)
+}
+
 type credentialed struct {
 	next  http.RoundTripper
 	creds []credentials
@@ -71,7 +120,7 @@ type credentialed struct {
 func (c *credentialed) RoundTrip(req *http.Request) (*http.Response, error) {
 	cloned := false
 	for _, cr := range c.creds {
-		if !slices.Contains(cr.hosts, req.URL.Host) && !slices.Contains(cr.hosts, req.URL.Hostname()) {
+		if !slices.ContainsFunc(cr.origins, func(o origin) bool { return o.matches(req.URL) }) {
 			continue
 		}
 		if !cloned {

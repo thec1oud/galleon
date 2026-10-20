@@ -30,11 +30,18 @@ var blocked = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),     // reserved, and broadcast
 	netip.MustParsePrefix("2001:db8::/32"),   // documentation
 	netip.MustParsePrefix("100::/64"),        // discard
+	netip.MustParsePrefix("::/96"),           // IPv4-compatible, deprecated
+	netip.MustParsePrefix("64:ff9b:1::/48"),  // local-use NAT64, whose embedding varies
+	netip.MustParsePrefix("fec0::/10"),       // site-local, deprecated
 }
 
 // nat64 is the well-known NAT64 prefix, whose addresses reach the IPv4
-// address in their last four bytes.
-var nat64 = netip.MustParsePrefix("64:ff9b::/96")
+// address in their last four bytes; sixToFour is 6to4's, whose addresses
+// carry it in bytes 2 to 5.
+var (
+	nat64     = netip.MustParsePrefix("64:ff9b::/96")
+	sixToFour = netip.MustParsePrefix("2002::/16")
+)
 
 func newGuard(cfg Config) (*guard, error) {
 	g := &guard{off: cfg.AllowPrivate}
@@ -76,6 +83,10 @@ func (g *guard) permits(ip netip.Addr) bool {
 	if nat64.Contains(ip) {
 		b := ip.As16()
 		return g.permits(netip.AddrFrom4([4]byte(b[12:])))
+	}
+	if sixToFour.Contains(ip) {
+		b := ip.As16()
+		return g.permits(netip.AddrFrom4([4]byte(b[2:6])))
 	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {

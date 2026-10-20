@@ -111,12 +111,18 @@ func backoff(base, ceiling time.Duration, attempt int) time.Duration {
 	return rand.N(d) + 1
 }
 
+// longestRetryAfter is the most seconds parseRetryAfter returns: a year,
+// far past any sensible MaxRetryAfter.
+const longestRetryAfter = 365 * 24 * 60 * 60
+
 func parseRetryAfter(v string, now time.Time) (time.Duration, bool) {
 	if v == "" {
 		return 0, false
 	}
-	if s, err := strconv.Atoi(v); err == nil && s >= 0 {
-		return time.Duration(s) * time.Second, true
+	if s, err := strconv.ParseInt(v, 10, 64); (err == nil || errors.Is(err, strconv.ErrRange)) && s >= 0 {
+		// Capped before converting, so a huge value stays huge rather than
+		// overflowing into a short or negative wait.
+		return time.Duration(min(s, longestRetryAfter)) * time.Second, true
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		return max(t.Sub(now), 0), true

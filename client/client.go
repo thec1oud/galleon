@@ -12,6 +12,10 @@
 //	tracing           a client span per attempt, with the trace context injected
 //	egress guard      refuses private and internal addresses at dial time
 //
+// The attempt timeout runs until the response body is closed, so a body
+// streamed for longer than Timeout needs Timeout 0 or a longer one. The egress
+// guard checks the address it dials, which with Proxy set is the proxy's.
+//
 //	c, err := clients.New("billing", client.BaseURL("https://billing.example.com"),
 //		client.WithCredentials(client.Bearer(token)))
 //	out, err := client.Send[Invoice](ctx, c, "GET", "/invoices/42", nil)
@@ -42,7 +46,8 @@ import (
 // Config is the "client" config section: the defaults for every client.
 type Config struct {
 	// Timeout bounds each attempt, from sending the request until the
-	// response body is closed.
+	// response body is closed, so it covers reading the whole body: a
+	// streamed response needs zero, which turns it off, or a longer one.
 	Timeout time.Duration `json:"timeout"`
 	// Retries is how many times a failed idempotent request is retried.
 	Retries int `json:"retries"`
@@ -95,8 +100,11 @@ func (c *Config) Validate() error {
 	if c.Timeout < 0 || c.RetryBackoff < 0 || c.RetryBackoffMax < c.RetryBackoff || c.MaxRetryAfter < 0 || c.BreakerOpenFor < 0 {
 		errs = append(errs, errors.New("durations must not be negative, and retry_backoff_max must be at least retry_backoff"))
 	}
-	if c.Retries < 0 || c.BreakerFailures < 0 || c.MaxConcurrent < 0 || c.MaxResponseBytes < 0 {
-		errs = append(errs, errors.New("retries, breaker_failures, max_concurrent and max_response_bytes must not be negative"))
+	if c.Retries < 0 || c.BreakerFailures < 0 || c.MaxConcurrent < 0 {
+		errs = append(errs, errors.New("retries, breaker_failures and max_concurrent must not be negative"))
+	}
+	if c.MaxResponseBytes <= 0 {
+		errs = append(errs, errors.New("max_response_bytes must be positive"))
 	}
 	if c.RetryBudget < 0 || c.RetryBudgetBurst < 0 {
 		errs = append(errs, errors.New("retry_budget and retry_budget_burst must not be negative"))
@@ -156,7 +164,8 @@ func Use(mw ...Middleware) Option {
 
 // Proxy sends requests through a proxy. Clients ignore HTTP_PROXY and its
 // relatives, since the egress guard can only check the address it dials: with
-// a proxy that is the proxy's, so the proxy must do its own checks.
+// a proxy that is the proxy's, not the target's, so the proxy must do its own
+// checks.
 func Proxy(fn func(*http.Request) (*url.URL, error)) Option {
 	return func(s *settings) { s.proxy = fn }
 }
@@ -201,11 +210,19 @@ func New(name string, opts ...Option) (*Client, error) {
 		s.clock = clock.System()
 	}
 	for i := range s.creds {
-		if len(s.creds[i].hosts) == 0 {
+		cr := &s.creds[i]
+		if len(cr.hosts) == 0 {
 			if s.base == nil {
 				return nil, fmt.Errorf("client %q: credentials need a BaseURL or the hosts they're for", name)
 			}
-			s.creds[i].hosts = []string{s.base.Host}
+			cr.origins = []origin{baseOrigin(s.base)}
+		}
+		for _, h := range cr.hosts {
+			o, err := parseOrigin(h)
+			if err != nil {
+				return nil, fmt.Errorf("client %q: %w", name, err)
+			}
+			cr.origins = append(cr.origins, o)
 		}
 	}
 
@@ -235,7 +252,9 @@ func New(name string, opts ...Option) (*Client, error) {
 		rt = s.middleware[i](rt)
 	}
 	rt = &resolving{next: rt, base: s.base}
-	return &Client{name: name, cfg: s.cfg, base: s.base, hc: &http.Client{Transport: rt}}, nil
+	c := &Client{name: name, cfg: s.cfg, base: s.base}
+	c.hc = &http.Client{Transport: rt, CheckRedirect: c.checkRedirect}
+	return c, nil
 }
 
 // HTTP returns the client as an *http.Client, for connect-go clients and
@@ -243,13 +262,51 @@ func New(name string, opts ...Option) (*Client, error) {
 // caller's context bounds the whole call.
 func (c *Client) HTTP() *http.Client { return c.hc }
 
-// Do sends req through the client's layers.
-func (c *Client) Do(req *http.Request) (*http.Response, error) { return c.hc.Do(req) }
+// Do sends req through the client's layers. A relative URL is resolved
+// before the request is sent, so redirects resolve against where it went.
+func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	if req.URL != nil && !req.URL.IsAbs() && c.base != nil {
+		req = req.Clone(req.Context())
+		req.URL = resolve(c.base, req.URL)
+		req.Host = ""
+	}
+	return c.hc.Do(req)
+}
 
 // Name is the name the client was built with.
 func (c *Client) Name() string { return c.name }
 
-// resolving resolves relative URLs against the base URL.
+// sensitiveHeaders are the headers http.Client drops on a redirect to
+// another host.
+var sensitiveHeaders = []string{"Authorization", "Www-Authenticate", "Cookie", "Cookie2", "Proxy-Authorization", "Proxy-Authenticate"}
+
+// checkRedirect is http.Client's default policy, plus a fix for a request
+// sent through HTTP() with a relative URL: http.Client resolves the first
+// redirect's Location against that relative URL, which resolving would then
+// put under the base path, so it is resolved against the absolute URL instead.
+// Later hops resolve against an absolute URL already.
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if len(via) != 1 || via[0].URL.IsAbs() || c.base == nil {
+		return nil
+	}
+	u, err := resolve(c.base, via[0].URL).Parse(req.Response.Header.Get("Location"))
+	if err != nil {
+		return err
+	}
+	req.URL = u
+	if u.Host != c.base.Host {
+		for _, h := range sensitiveHeaders {
+			req.Header.Del(h)
+		}
+	}
+	return nil
+}
+
+// resolving resolves relative URLs against the base URL, for requests sent
+// through HTTP() rather than Do.
 type resolving struct {
 	next http.RoundTripper
 	base *url.URL
@@ -264,19 +321,25 @@ func (r *resolving) RoundTrip(req *http.Request) (*http.Response, error) {
 		return r.next.RoundTrip(req)
 	}
 	req = req.Clone(req.Context())
-	ref := *req.URL
-	ref.Path = strings.TrimPrefix(ref.Path, "/")
-	ref.RawPath = strings.TrimPrefix(ref.RawPath, "/")
-	base := *r.base
-	if !strings.HasSuffix(base.Path, "/") {
-		base.Path += "/"
-		if base.RawPath != "" {
-			base.RawPath += "/"
-		}
-	}
-	req.URL = base.ResolveReference(&ref)
+	req.URL = resolve(r.base, req.URL)
 	req.Host = ""
 	return r.next.RoundTrip(req)
+}
+
+// resolve resolves a relative URL under the base URL's path: with base
+// https://h/api, both "/items" and "items" are https://h/api/items.
+func resolve(base, u *url.URL) *url.URL {
+	ref := *u
+	ref.Path = strings.TrimPrefix(ref.Path, "/")
+	ref.RawPath = strings.TrimPrefix(ref.RawPath, "/")
+	b := *base
+	if !strings.HasSuffix(b.Path, "/") {
+		b.Path += "/"
+		if b.RawPath != "" {
+			b.RawPath += "/"
+		}
+	}
+	return b.ResolveReference(&ref)
 }
 
 // limit bounds requests in flight.
