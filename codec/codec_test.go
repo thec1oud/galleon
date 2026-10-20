@@ -175,3 +175,17 @@ func TestMarshalBuffersAndReportsErrors(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestWithPrefersTypeCodecsWithoutChangingTheSet(t *testing.T) {
+	app := codec.NewSet(fakeCodec{"application/xml"})
+	own := app.With(fakeCodec{"application/json"})
+	if _, ok := own.ForContentType("").(fakeCodec); !ok {
+		t.Fatal("the operation's own JSON codec must win")
+	}
+	if app.ForContentType("") != codec.JSON {
+		t.Fatal("With must not change the app's set")
+	}
+	if app.With() != app {
+		t.Fatal("With nothing returns the same set")
+	}
+}

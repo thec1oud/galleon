@@ -19,16 +19,9 @@ import (
 	"github.com/thec1oud/galleon/op"
 )
 
-// Codec reads and writes one media type.
-type Codec interface {
-	// MediaType is the type the codec handles, such as "application/json".
-	MediaType() string
-	// Decode reads one value from r into v, a pointer. Bad input is reported
-	// as errs.InvalidArgument with field violations where possible.
-	Decode(r io.Reader, v any, unknown op.UnknownFields) error
-	// Encode writes v.
-	Encode(w io.Writer, v any) error
-}
+// Codec reads and writes one media type. It is defined in op so descriptors
+// can carry codecs made for their types.
+type Codec = op.Codec
 
 // JSON is the built-in JSON codec, on encoding/json.
 var JSON Codec = jsonCodec{}
@@ -129,6 +122,20 @@ func (s *Set) Add(c Codec) {
 		return
 	}
 	s.codecs = append(s.codecs, c)
+}
+
+// With returns a copy of the set with cs added, each replacing any codec for
+// the same media type. Transports use it at boot to prefer an operation's own
+// codecs (op.TypeInfo.Codecs) over the app's.
+func (s *Set) With(cs ...Codec) *Set {
+	if len(cs) == 0 {
+		return s
+	}
+	out := &Set{codecs: append([]Codec(nil), s.codecs...)}
+	for _, c := range cs {
+		out.Add(c)
+	}
+	return out
 }
 
 // MediaTypes lists the media types in the set, most preferred first.

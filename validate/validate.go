@@ -99,6 +99,7 @@ type structPlan struct {
 
 type fieldPlan struct {
 	index  int
+	inline bool   // an embedded struct whose fields are promoted
 	name   string // JSON name, for paths
 	checks []check
 	elem   *elemPlan // nested validation of the field's value
@@ -150,6 +151,9 @@ func (sp *structPlan) run(v reflect.Value, path string, ve **op.ValidationError)
 		f := &sp.fields[i]
 		fv := v.Field(f.index)
 		fpath := path + "/" + escape(f.name)
+		if f.inline {
+			fpath = path
+		}
 		isNil := fv.Kind() == reflect.Pointer && fv.IsNil()
 		for _, c := range f.checks {
 			if isNil && !c.onNil {
@@ -194,6 +198,23 @@ func (p *planner) structPlan(t reflect.Type) (*structPlan, error) {
 	p.done[t] = sp
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
+		if inlined(sf) {
+			// encoding/json promotes an untagged embedded struct's fields,
+			// so they share this struct's paths.
+			elem, err := p.elemPlan(sf.Type)
+			if err != nil {
+				return nil, err
+			}
+			checks, err := parseChecks(sf)
+			if err != nil {
+				return nil, fmt.Errorf("validate: %v.%s: %w", t, sf.Name, err)
+			}
+			if len(checks) > 0 {
+				return nil, fmt.Errorf("validate: %v.%s: rules on an embedded struct have no field to apply to", t, sf.Name)
+			}
+			sp.fields = append(sp.fields, fieldPlan{index: i, inline: true, elem: elem})
+			continue
+		}
 		if !sf.IsExported() {
 			continue
 		}
@@ -239,6 +260,22 @@ func (p *planner) elemPlan(t reflect.Type) (*elemPlan, error) {
 		return &elemPlan{each: each}, nil
 	}
 	return nil, nil
+}
+
+// inlined reports whether encoding/json promotes the fields of sf, an
+// embedded struct (or pointer to one) without a JSON name.
+func inlined(sf reflect.StructField) bool {
+	if !sf.Anonymous {
+		return false
+	}
+	if n, _, _ := strings.Cut(sf.Tag.Get("json"), ","); n != "" {
+		return false // tagged with a name, or skipped with "-"
+	}
+	t := sf.Type
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Struct
 }
 
 // jsonName returns the field's JSON name, and whether encoding/json skips it.

@@ -238,3 +238,30 @@ func TestForOperationCombinesTagsAndSelf(t *testing.T) {
 		t.Fatal("no tags and no Validate method means no validator")
 	}
 }
+
+type Audit struct {
+	By string `json:"by" validate:"required"`
+}
+
+type audit struct {
+	At string `json:"at" validate:"required"`
+}
+
+type WithEmbedded struct {
+	Audit
+	*audit
+	Named Audit  `json:"named"`
+	Title string `json:",omitempty" validate:"required"`
+}
+
+func TestEmbeddedStructsShareTheirParentsPaths(t *testing.T) {
+	check, err := validate.Plan(reflect.TypeFor[WithEmbedded]())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := violations(t, check(&WithEmbedded{audit: &audit{}}))
+	want := map[string]string{"/by": "required", "/at": "required", "/named/by": "required", "/Title": "required"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v", got)
+	}
+}
