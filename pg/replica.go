@@ -119,8 +119,11 @@ func (h *history) latest() (sample, bool) {
 // lag is how far a replica that has replayed replay, read at at, is behind
 // the primary: in bytes against the latest sample, and in time since the
 // newest sample it has passed, or nothing when it has passed the latest.
-// Both are unknown without samples, and the time is when it has passed none.
-func (h *history) lag(replay uint64, at time.Time) (bytes int64, lag time.Duration) {
+// Both are unknown without samples, and the time is when it has passed none
+// or when the latest is older than fresh: the tracker has stopped hearing
+// from the primary, which may have moved on since, so the history tells
+// nothing of the replica.
+func (h *history) lag(replay uint64, at time.Time, fresh time.Duration) (bytes int64, lag time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	n := len(h.samples)
@@ -128,6 +131,9 @@ func (h *history) lag(replay uint64, at time.Time) (bytes int64, lag time.Durati
 		return 0, unknownLag
 	}
 	latest := h.samples[n-1]
+	if at.Sub(latest.at) > fresh {
+		return 0, unknownLag
+	}
 	if replay >= latest.lsn {
 		return 0, 0
 	}
@@ -156,13 +162,20 @@ func (t *topology) rotating(rd *reading, now time.Time) (bool, string) {
 	return true, ""
 }
 
+// candidate is a replica and the reading it was chosen by: each is loaded
+// once, since Stop and the tracker replace readings at any time.
+type candidate struct {
+	r  *replica
+	rd *reading
+}
+
 // candidates are the replicas that may serve a read at level l with causal
 // floor floor, from their latest readings alone.
-func (t *topology) candidates(l data.Level, floor uint64, now time.Time) []*replica {
+func (t *topology) candidates(l data.Level, floor uint64, now time.Time) []candidate {
 	if l.Kind() == data.PrimaryKind {
 		return nil
 	}
-	var out []*replica
+	var out []candidate
 	for _, r := range t.replicas {
 		rd := r.reading.Load()
 		if ok, _ := t.rotating(rd, now); !ok {
@@ -170,7 +183,8 @@ func (t *topology) candidates(l data.Level, floor uint64, now time.Time) []*repl
 		}
 		switch l.Kind() {
 		case data.BoundedStalenessKind:
-			if rd.lag > l.Staleness() {
+			// The replica may have fallen further behind since.
+			if age := max(now.Sub(rd.at), 0); rd.lag > l.Staleness() || age > l.Staleness()-rd.lag {
 				continue
 			}
 		case data.ReadYourWritesKind:
@@ -178,23 +192,24 @@ func (t *topology) candidates(l data.Level, floor uint64, now time.Time) []*repl
 				continue
 			}
 		}
-		out = append(out, r)
+		out = append(out, candidate{r, rd})
 	}
 	return out
 }
 
-// pick chooses one of cands, which isn't empty, by the strategy.
-func (t *topology) pick(cands []*replica) *replica {
+// pick chooses one of cands, which isn't empty, by the strategy, from the
+// readings they were chosen by.
+func (t *topology) pick(cands []candidate) *replica {
 	switch t.sel {
 	case Random:
-		return cands[rand.N(len(cands))]
+		return cands[rand.N(len(cands))].r
 	case RoundRobin:
-		return cands[(t.rr.Add(1)-1)%uint64(len(cands))]
+		return cands[(t.rr.Add(1)-1)%uint64(len(cands))].r
 	case Nearest:
-		var near []*replica
-		for _, r := range cands {
-			if r.zone != "" && r.zone == t.zone {
-				near = append(near, r)
+		var near []candidate
+		for _, c := range cands {
+			if c.r.zone != "" && c.r.zone == t.zone {
+				near = append(near, c)
 			}
 		}
 		if len(near) > 0 {
@@ -204,15 +219,14 @@ func (t *topology) pick(cands []*replica) *replica {
 	return leastLagging(cands)
 }
 
-func leastLagging(cands []*replica) *replica {
-	best, bestRd := cands[0], cands[0].reading.Load()
-	for _, r := range cands[1:] {
-		rd := r.reading.Load()
-		if rd.lag < bestRd.lag || (rd.lag == bestRd.lag && rd.lagBytes < bestRd.lagBytes) {
-			best, bestRd = r, rd
+func leastLagging(cands []candidate) *replica {
+	best := cands[0]
+	for _, c := range cands[1:] {
+		if c.rd.lag < best.rd.lag || (c.rd.lag == best.rd.lag && c.rd.lagBytes < best.rd.lagBytes) {
+			best = c
 		}
 	}
-	return best
+	return best.r
 }
 
 // closest is the replica in rotation that has replayed the most, the one
@@ -280,19 +294,28 @@ func (t *topology) stop() {
 type poller struct {
 	cfg  *pgconn.Config
 	conn *pgconn.PgConn
+	// wait bounds each query; connecting has the source's connect timeout.
+	wait time.Duration
 }
+
+// defaultPollerConnectTimeout bounds a poller's connecting when its source
+// sets no connect timeout.
+const defaultPollerConnectTimeout = 10 * time.Second
 
 // query runs sql, connecting first if need be, and returns its one row.
 // On an error the connection is closed, and the next query connects anew.
 func (p *poller) query(ctx context.Context, sql string) ([][]byte, error) {
 	if p.conn == nil || p.conn.IsClosed() {
+		// pgconn bounds the connecting with the config's ConnectTimeout.
 		c, err := pgconn.ConnectConfig(ctx, p.cfg)
 		if err != nil {
 			return nil, err
 		}
 		p.conn = c
 	}
-	res, err := p.conn.Exec(ctx, sql).ReadAll()
+	qctx, cancel := context.WithTimeout(ctx, p.wait)
+	defer cancel()
+	res, err := p.conn.Exec(qctx, sql).ReadAll()
 	if err == nil && (len(res) != 1 || len(res[0].Rows) != 1) {
 		err = errors.New("the tracker's query returned no row")
 	}
@@ -312,19 +335,20 @@ func (p *poller) close() {
 	}
 }
 
-func newPoller(src *source) *poller {
-	return &poller{cfg: src.config.ConnConfig.Config.Copy()}
+func (t *topology) newPoller(src *source) *poller {
+	p := &poller{cfg: src.config.ConnConfig.Config.Copy(), wait: t.staleAfter()}
+	if p.cfg.ConnectTimeout <= 0 {
+		p.cfg.ConnectTimeout = defaultPollerConnectTimeout
+	}
+	return p
 }
 
-// every runs fn now and then every t.poll until ctx ends, each with a
-// deadline of staleAfter.
+// every runs fn now and then every t.poll until ctx ends.
 func (t *topology) every(ctx context.Context, fn func(ctx context.Context)) {
 	tick := time.NewTicker(t.poll)
 	defer tick.Stop()
 	for {
-		qctx, cancel := context.WithTimeout(ctx, t.staleAfter())
-		fn(qctx)
-		cancel()
+		fn(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -336,7 +360,7 @@ func (t *topology) every(ctx context.Context, fn func(ctx context.Context)) {
 const primarySQL = "SELECT pg_current_wal_lsn()::text"
 
 func (t *topology) pollPrimary(ctx context.Context, m *Manager, src *source) {
-	p := newPoller(src)
+	p := t.newPoller(src)
 	defer p.close()
 	t.every(ctx, func(qctx context.Context) {
 		row, err := p.query(qctx, primarySQL)
@@ -357,7 +381,7 @@ const replicaSQL = "SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn()::text, 
 	"extract(epoch FROM now() - pg_last_xact_replay_timestamp())::float8"
 
 func (t *topology) pollReplica(ctx context.Context, m *Manager, r *replica) {
-	p := newPoller(r.src)
+	p := t.newPoller(r.src)
 	defer p.close()
 	t.every(ctx, func(qctx context.Context) {
 		rd := t.read(qctx, p)
@@ -397,13 +421,27 @@ func (t *topology) read(ctx context.Context, p *poller) *reading {
 		return &reading{at: at, reason: reasonUnreachable, lag: unknownLag}
 	}
 	rd := &reading{at: at, healthy: true, replay: replay}
-	rd.lagBytes, rd.lag = t.primary.lag(replay, at)
-	if row[2] != nil && rd.lag > 0 {
+	xact := unknownLag
+	if row[2] != nil {
 		if secs, err := strconv.ParseFloat(string(row[2]), 64); err == nil {
-			rd.lag = min(rd.lag, time.Duration(max(secs, 0)*float64(time.Second)))
+			xact = time.Duration(min(max(secs, 0), float64(unknownLag/time.Second)) * float64(time.Second))
 		}
 	}
+	rd.lagBytes, rd.lag = t.lagOf(replay, at, xact)
 	return rd
+}
+
+// lagOf is the lag of a replica that has replayed replay, read at at, whose
+// last replayed commit was committed xact ago (unknownLag if it has
+// replayed none). Both the primary's history and xact bound the lag from
+// above, so it is the smaller of the two. Neither alone will do: xact
+// grows on a replica of an idle primary however caught up it is, which
+// the history sees, and the history knows nothing once the tracker stops
+// hearing from the primary, when only xact bounds it. When neither tells,
+// the lag is unknown, never zero.
+func (t *topology) lagOf(replay uint64, at time.Time, xact time.Duration) (int64, time.Duration) {
+	bytes, hist := t.primary.lag(replay, at, t.staleAfter())
+	return bytes, min(hist, xact)
 }
 
 // parseLSN reads an LSN as Postgres writes it, such as "16/B374D848".
@@ -441,7 +479,11 @@ func (m *Manager) route(ctx context.Context, l data.Level) (routing, error) {
 	t := m.topo
 	var floor uint64
 	if l.Kind() == data.ReadYourWritesKind {
-		floor = m.floor(ctx)
+		if floor = m.floor(ctx); floor == unknownFloor {
+			// No replica can be known to have the request's write, and
+			// failing would have it retried: the primary has it.
+			return routing{fallback: fallbackNoReplica}, nil
+		}
 	}
 	now := t.now()
 	if cands := t.candidates(l, floor, now); len(cands) > 0 {

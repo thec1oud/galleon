@@ -52,9 +52,9 @@ var (
 	ReadYourWrites = Level{kind: ReadYourWritesKind}
 )
 
-// BoundedStaleness reads a replica whose tracked lag is at most d, or the
-// primary when none is. BoundedStaleness(0) only takes a replica that was
-// caught up when last tracked.
+// BoundedStaleness reads a replica whose tracked lag, plus the age of the
+// reading it was tracked by, is at most d, or the primary when none is. A
+// replica whose lag can't be told never qualifies.
 func BoundedStaleness(d time.Duration) Level {
 	return Level{kind: BoundedStalenessKind, bound: d}
 }

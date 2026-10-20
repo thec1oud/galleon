@@ -104,7 +104,10 @@ type Call struct {
 type Response struct {
 	// Header is sent as HTTP response headers or RPC response metadata,
 	// whether the call succeeds or fails. Transports keep the headers they
-	// set themselves, such as Content-Type, over these.
+	// set themselves over these, and drop the ones that are theirs alone,
+	// over HTTP and RPC alike: Content-Type, Content-Length,
+	// Content-Encoding, Transfer-Encoding, Connection, Keep-Alive, Upgrade,
+	// Trailer, TE, and Proxy-*, Grpc-* and Connect-* headers.
 	Header http.Header
 }
 

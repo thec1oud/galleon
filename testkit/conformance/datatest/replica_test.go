@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -723,5 +724,120 @@ func TestTokensCarryReadYourWritesAcrossRequestsAndApps(t *testing.T) {
 	}
 	if out, _ := rpc(t, sb, "Get", 2, http.Header{pg.ConsistencyHeader: {rtok}}); !out.Found {
 		t.Fatalf("over RPC, with the token: %+v", out)
+	}
+}
+
+// asRole creates a login role without superuser for the test, and returns
+// dsn for it.
+func asRole(t *testing.T, pool *pgxpool.Pool, dsn string) string {
+	t.Helper()
+	role := fmt.Sprintf("galleon_role_%d", time.Now().UnixNano())
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, "CREATE ROLE "+role+" LOGIN"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP OWNED BY "+role)
+		_, _ = pool.Exec(context.Background(), "DROP ROLE "+role)
+	})
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.User(role)
+	return u.String()
+}
+
+// revoke takes fn, a function of the package's database, from everyone but
+// superusers until the test ends.
+func revoke(t *testing.T, pool *pgxpool.Pool, fn string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), "REVOKE EXECUTE ON FUNCTION "+fn+" FROM PUBLIC"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), "GRANT EXECUTE ON FUNCTION "+fn+" TO PUBLIC"); err != nil {
+			t.Errorf("restoring %s: %v", fn, err)
+		}
+	})
+}
+
+// A write whose COMMIT succeeded is committed, even when reading its
+// position after fails: failing it would have a committed write retried.
+func TestAWriteThatCommittedSucceedsWhenItsPositionCantBeRead(t *testing.T) {
+	db := testkit.DB(t)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, db.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	dsn := asRole(t, pool, db.DSN())
+	role := strings.SplitN(strings.TrimPrefix(dsn, "postgres://"), "@", 2)[0]
+	table := fmt.Sprintf("committed_%d", time.Now().UnixNano())
+	for _, sql := range []string{"CREATE TABLE " + table + " (id int PRIMARY KEY)", "GRANT ALL ON TABLE " + table + " TO " + role} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+table) })
+	revoke(t, pool, "pg_current_wal_insert_lsn()")
+
+	m, err := pg.New(pg.Config{Primary: pg.Source{DSN: dsn}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(context.Background()) })
+	cctx := pg.CausalContext(ctx)
+	runs := 0
+	err = m.Write(cctx, func(ctx context.Context, w data.WriteTx) error {
+		runs++
+		_, err := w.Exec(ctx, "INSERT INTO "+table+" VALUES (1)")
+		return err
+	})
+	if err != nil || runs != 1 {
+		t.Fatalf("a committed write: %v, after %d runs", err, runs)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("%d rows, %v", n, err)
+	}
+	// The connection is still good for the next transaction.
+	if err := m.Read(cctx, func(ctx context.Context, r data.ReadTx) error {
+		return r.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// When the tracker can't read the primary's position, though the pools
+// work, a replica that lags isn't taken for caught up.
+func TestAReplicaLagsWhenTheTrackerLosesThePrimary(t *testing.T) {
+	e := newReplicaEnv(t)
+	dsn := asRole(t, e.pool, e.db.DSN())
+	role := strings.SplitN(strings.TrimPrefix(dsn, "postgres://"), "@", 2)[0]
+	e.exec("GRANT ALL ON TABLE " + e.table + " TO " + role)
+	e.exec("INSERT INTO " + e.table + " (id) VALUES (100)")
+	e.rep.CatchUp()
+	repDSN, err := url.Parse(e.rep.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repDSN.User = url.User(role)
+	m := e.manager(pg.Config{Primary: pg.Source{DSN: dsn}, Replicas: []pg.Source{{DSN: repDSN.String()}}, MaxLag: time.Second})
+	e.untilOnReplica(m, true)
+
+	// From now on the primary's poller fails, and the replica falls
+	// behind.
+	revoke(t, e.pool, "pg_current_wal_lsn()")
+	e.rep.CatchUp()
+	e.rep.Pause()
+	e.exec("INSERT INTO " + e.table + " (id) VALUES (1)")
+	e.untilOnReplica(m, false)
+	if found, _, err := e.where(context.Background(), m, 1, data.BoundedStaleness(time.Hour)); err != nil || !found {
+		t.Fatalf("a bounded read found %v, %v", found, err)
 	}
 }

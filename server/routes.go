@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -163,13 +164,29 @@ func (h *opHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // addHeaders adds the headers interceptors set for the response to dst,
-// leaving alone any dst already has.
+// leaving alone any dst already has, and never ones that frame the message
+// or belong to the connection or the protocol (see reservedHeader): the
+// transport owns those.
 func addHeaders(dst, src http.Header) {
 	for k, v := range src {
-		if _, ok := dst[k]; !ok && len(v) > 0 {
-			dst[k] = v
+		k = http.CanonicalHeaderKey(k)
+		if _, ok := dst[k]; ok || len(v) == 0 || reservedHeader(k) {
+			continue
 		}
+		dst[k] = v
 	}
+}
+
+// reservedHeader reports whether an interceptor's response header k, in
+// canonical form, is the transport's: framing and hop-by-hop headers, and
+// gRPC's and Connect's own. HTTP and RPC refuse the same ones.
+func reservedHeader(k string) bool {
+	switch k {
+	case "Content-Length", "Content-Encoding", "Content-Type", "Transfer-Encoding", "Connection", "Keep-Alive",
+		"Upgrade", "Trailer", "Te":
+		return true
+	}
+	return strings.HasPrefix(k, "Proxy-") || strings.HasPrefix(k, "Grpc-") || strings.HasPrefix(k, "Connect-")
 }
 
 var errUnsupportedMediaType = errs.New(errs.InvalidArgument, "galleon.unsupported_media_type", "the request body's media type is not supported")

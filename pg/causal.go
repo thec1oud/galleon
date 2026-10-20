@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -41,6 +42,11 @@ func (c *causal) raise(lsn uint64) {
 	}
 }
 
+// unknownFloor is the floor of a request that committed a write whose
+// position couldn't be read: no replica qualifies for its ReadYourWrites
+// reads, which read the primary.
+const unknownFloor = math.MaxUint64
+
 type causalKey struct{}
 
 func causalFrom(ctx context.Context) *causal {
@@ -69,7 +75,11 @@ func (m *Manager) floor(ctx context.Context) uint64 {
 	}
 	if tok := c.pending.Load(); tok != 0 {
 		clamped := tok
-		latest, ok := m.topo.primary.latest()
+		var latest sample
+		ok := false
+		if m.topo != nil {
+			latest, ok = m.topo.primary.latest()
+		}
 		if !ok || tok > latest.lsn {
 			// Past what the tracker last saw: a token a moment old, or a
 			// forged one, which would otherwise hold reads off the
@@ -219,9 +229,20 @@ func (m *Manager) takeToken(ctx context.Context, call *op.Call, c *causal) {
 }
 
 // giveToken sets the response's token once the call has committed a write.
+// A response with a token is the answer for one client, so it is marked
+// "Cache-Control: private, no-store", unless the call set its own: a cache
+// that kept it would hand one client's token to others, or replay a stale
+// one.
 func (m *Manager) giveToken(call *op.Call, c *causal) {
 	if m.keys == nil || call.Response == nil || call.Response.Header == nil || !c.wrote.Load() {
 		return
 	}
-	call.Response.Header.Set(ConsistencyHeader, m.keys.sign(c.lsn.Load(), m.clock.Now()))
+	lsn := c.lsn.Load()
+	if lsn == unknownFloor {
+		return // see commitWrite: there is no position to sign
+	}
+	call.Response.Header.Set(ConsistencyHeader, m.keys.sign(lsn, m.clock.Now()))
+	if call.Response.Header.Get("Cache-Control") == "" {
+		call.Response.Header.Set("Cache-Control", "private, no-store")
+	}
 }

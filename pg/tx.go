@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -586,6 +587,13 @@ const commitSQL = "SELECT pg_current_xact_id_if_assigned() IS NOT NULL; COMMIT; 
 
 // commitWrite commits a pooled write transaction, raising the causal floor
 // of the request that began it to the commit's position when it wrote.
+//
+// The COMMIT's own result decides the outcome. If the statement after it
+// fails, as it does where pg_current_wal_insert_lsn isn't granted, or the
+// connection breaks once COMMIT has answered, the write is committed all
+// the same and Commit succeeds: failing would have the caller retry a
+// committed write. The floor is then raised as far as it goes, so the
+// request's ReadYourWrites reads go to the primary, and no token is sent.
 func (r *root) commitWrite(ctx context.Context, tx pgx.Tx) error {
 	conn := tx.Conn()
 	if conn.PgConn().TxStatus() != 'T' {
@@ -595,23 +603,35 @@ func (r *root) commitWrite(ctx context.Context, tx pgx.Tx) error {
 	}
 	sctx, span := r.m.commitSpan(ctx, conn, commitSQL)
 	res, err := conn.PgConn().Exec(sctx, commitSQL).ReadAll()
-	end(span, err)
-	if err != nil {
-		// A COMMIT that failed rolled back; a broken connection is
-		// destroyed when it is released.
-		return err
-	}
-	if len(res) != 3 || res[1].CommandTag.String() != "COMMIT" {
+	committed := len(res) >= 2 && res[1].Err == nil && res[1].CommandTag.String() == "COMMIT"
+	if !committed {
+		end(span, err)
+		if err != nil {
+			// A COMMIT that failed rolled back; a broken connection is
+			// destroyed when it is released.
+			return err
+		}
 		return pgx.ErrTxCommitRollback
 	}
-	if len(res[0].Rows) != 1 || string(res[0].Rows[0][0]) != "t" || len(res[2].Rows) != 1 {
-		return nil // it wrote nothing: no floor to raise
+	end(span, nil)
+	wrote := res[0].Err == nil && len(res[0].Rows) == 1 && string(res[0].Rows[0][0]) == "t"
+	if !wrote || r.causal == nil || r.src.name != data.PrimarySource {
+		return nil
 	}
-	lsn, err := parseLSN(string(res[2].Rows[0][0]))
-	if err == nil && r.causal != nil && r.src.name == data.PrimarySource {
-		r.causal.raise(lsn)
-		r.causal.wrote.Store(true)
+	lsn, perr := uint64(0), err
+	if perr == nil {
+		if len(res) == 3 && len(res[2].Rows) == 1 {
+			lsn, perr = parseLSN(string(res[2].Rows[0][0]))
+		} else {
+			perr = errors.New("no position after the commit")
+		}
 	}
+	if perr != nil {
+		r.m.logger().DebugContext(ctx, "a write committed, but its WAL position couldn't be read; this request's ReadYourWrites reads go to the primary", "error", perr)
+		lsn = unknownFloor
+	}
+	r.causal.raise(lsn)
+	r.causal.wrote.Store(true)
 	return nil
 }
 

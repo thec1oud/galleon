@@ -218,7 +218,7 @@ func TestTheCallsLevelWinsOverTheOperationsAndTheConfigs(t *testing.T) {
 func TestLagIsZeroForACaughtUpReplicaOfAnIdlePrimary(t *testing.T) {
 	var h history
 	t0 := time.Unix(0, 0)
-	if _, lag := h.lag(10, t0); lag != unknownLag {
+	if _, lag := h.lag(10, t0, time.Minute); lag != unknownLag {
 		t.Fatal("without samples the lag is known")
 	}
 	// The primary sat at 100 for a minute: the replica at 100 is caught
@@ -226,17 +226,17 @@ func TestLagIsZeroForACaughtUpReplicaOfAnIdlePrimary(t *testing.T) {
 	for i := range 60 {
 		h.add(sample{at: t0.Add(time.Duration(i) * time.Second), lsn: 100})
 	}
-	if b, lag := h.lag(100, t0.Add(time.Minute)); b != 0 || lag != 0 {
+	if b, lag := h.lag(100, t0.Add(time.Minute), time.Minute); b != 0 || lag != 0 {
 		t.Errorf("caught up: %d bytes, %v", b, lag)
 	}
 	// The primary moved to 200 at 60s and 300 at 61s; a replica at 250
 	// was last where the primary was at 60s.
 	h.add(sample{at: t0.Add(60 * time.Second), lsn: 200})
 	h.add(sample{at: t0.Add(61 * time.Second), lsn: 300})
-	if b, lag := h.lag(250, t0.Add(62*time.Second)); b != 50 || lag != 2*time.Second {
+	if b, lag := h.lag(250, t0.Add(62*time.Second), time.Minute); b != 50 || lag != 2*time.Second {
 		t.Errorf("behind: %d bytes, %v", b, lag)
 	}
-	if _, lag := h.lag(50, t0.Add(62*time.Second)); lag != unknownLag {
+	if _, lag := h.lag(50, t0.Add(62*time.Second), time.Minute); lag != unknownLag {
 		t.Errorf("behind every sample: %v", lag)
 	}
 }
@@ -397,6 +397,9 @@ func TestTokensTravelThroughTheInterceptor(t *testing.T) {
 	if tok == "" {
 		t.Fatal("a call that committed, then failed, sent no token")
 	}
+	if cc := c.Response.Header.Get("Cache-Control"); cc != "private, no-store" {
+		t.Fatalf("a response with a token may be cached: Cache-Control %q", cc)
+	}
 	_, seen, _ := call(tok, false)
 	if seen.pending.Load() != 777 {
 		t.Fatalf("the token brought floor %d", seen.pending.Load())
@@ -462,5 +465,131 @@ func TestReplicasPrintWithoutTheirDSN(t *testing.T) {
 	s := c.Replicas[0].String()
 	if strings.Contains(s, "hunter2") || !strings.Contains(s, "name:replica_1 zone:a") || !strings.Contains(s, "@replica:5432/orders") {
 		t.Fatalf("%s", s)
+	}
+}
+
+// When the tracker stops hearing from the primary, its history no longer
+// says a replica is caught up: only the time since the replica's last
+// replayed commit bounds the lag, and without it the lag is unknown.
+func TestAStalePrimaryHistoryNeverReadsAsNoLag(t *testing.T) {
+	f := newFakeTracker(t, Config{MaxLag: 2 * time.Second}, "")
+	topo := f.m.topo
+	topo.primary.add(sample{at: f.now.Add(-10 * time.Minute), lsn: 500})
+	if _, lag := topo.lagOf(500, f.now, unknownLag); lag != unknownLag {
+		t.Errorf("a replica at a 10-minute-old primary position, with no commit replayed: lag %v", lag)
+	}
+	if _, lag := topo.lagOf(500, f.now, 3*time.Second); lag != 3*time.Second {
+		t.Errorf("with a commit replayed 3s ago: lag %v", lag)
+	}
+	topo.replicas[0].reading.Store(&reading{at: f.now, healthy: true, replay: 500, lag: unknownLag})
+	for _, l := range []data.Level{data.Any, data.BoundedStaleness(time.Hour)} {
+		if got, _ := f.where(context.Background(), l); got != "primary" {
+			t.Errorf("%v read a replica of unknown lag", l)
+		}
+	}
+
+	// A fresh history of an idle primary: caught up, however long ago the
+	// last commit was.
+	topo.primary.add(sample{at: f.now.Add(-10 * time.Millisecond), lsn: 500})
+	if _, lag := topo.lagOf(500, f.now, time.Hour); lag != 0 {
+		t.Errorf("caught up with an idle primary: lag %v", lag)
+	}
+	// Behind it, the smaller bound wins.
+	topo.primary.add(sample{at: f.now, lsn: 900})
+	if _, lag := topo.lagOf(500, f.now, time.Second); lag != 10*time.Millisecond {
+		t.Errorf("behind: lag %v", lag)
+	}
+}
+
+func TestBoundedStalenessCountsTheReadingsAge(t *testing.T) {
+	f := newFakeTracker(t, Config{}, "")
+	f.set(0, 100, 50*time.Millisecond)
+	f.now = f.now.Add(60 * time.Millisecond)
+	if got, _ := f.where(context.Background(), data.BoundedStaleness(100*time.Millisecond)); got != "primary" {
+		t.Errorf("50ms of lag 60ms ago is within 100ms: read %s", got)
+	}
+	if got, _ := f.where(context.Background(), data.BoundedStaleness(200*time.Millisecond)); got != "replica_1" {
+		t.Errorf("but within 200ms: read %s", got)
+	}
+}
+
+// Stop clears the readings while reads choose by them; a read never
+// trips over a reading that went away after it was chosen.
+func TestReadsRouteSafelyWhileTheTrackerStops(t *testing.T) {
+	for _, sel := range []Selection{LeastLag, Random, RoundRobin, Nearest} {
+		f := newFakeTracker(t, Config{Select: sel, Zone: "a"}, "a", "a", "b")
+		topo := f.m.topo
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for range 200 {
+				for i := range topo.replicas {
+					f.set(i, 100, time.Duration(i)*time.Millisecond)
+				}
+				topo.life.Lock()
+				topo.cancel = func() {} // as if started
+				topo.life.Unlock()
+				topo.stop()
+			}
+		}()
+		for {
+			select {
+			case <-done:
+			default:
+				for _, l := range []data.Level{data.Any, data.ReadYourWrites, data.BoundedStaleness(time.Second)} {
+					if _, err := f.m.route(context.Background(), l); err != nil {
+						t.Fatal(err)
+					}
+				}
+				continue
+			}
+			break
+		}
+	}
+}
+
+func TestAWriteWhosePositionIsUnknownSendsTheRequestsReadsToThePrimary(t *testing.T) {
+	f := newFakeTracker(t, Config{TokenKey: key}, "")
+	f.set(0, 1<<40, 0)
+	c := &causal{}
+	c.raise(unknownFloor)
+	c.wrote.Store(true)
+	ctx := context.WithValue(context.Background(), causalKey{}, c)
+	rt, err := f.m.route(ctx, data.ReadYourWrites.Wait(time.Minute).OrFail())
+	if err != nil || rt.rep != nil {
+		t.Fatalf("routed to %v, %v; want the primary, without failing or waiting", rt.rep, err)
+	}
+	call := &op.Call{Response: &op.Response{Header: http.Header{}}}
+	f.m.giveToken(call, c)
+	if call.Response.Header.Get(ConsistencyHeader) != "" {
+		t.Fatal("a token was signed for an unknown position")
+	}
+}
+
+func TestTheFloorNeedsNoTopology(t *testing.T) {
+	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &causal{}
+	c.pending.Store(42)
+	// Not started: the primary can't be asked, and the token stands.
+	if got := m.floor(context.WithValue(context.Background(), causalKey{}, c)); got != 42 {
+		t.Fatalf("floor %d", got)
+	}
+}
+
+func TestATokensResponseKeepsTheCallsOwnCacheControl(t *testing.T) {
+	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}, TokenKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &causal{}
+	c.raise(7)
+	c.wrote.Store(true)
+	call := &op.Call{Response: &op.Response{Header: http.Header{"Cache-Control": {"no-cache"}}}}
+	m.giveToken(call, c)
+	if call.Response.Header.Get(ConsistencyHeader) == "" || call.Response.Header.Get("Cache-Control") != "no-cache" {
+		t.Fatalf("%v", call.Response.Header)
 	}
 }

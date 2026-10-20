@@ -12,7 +12,24 @@ PRIMARY_PORT=${PRIMARY_PORT:-5432}
 STANDBY_PORT=${STANDBY_PORT:-5433}
 IMAGE=${IMAGE:-postgres:16}
 
-# wait_for runs "$@" until it succeeds, for up to two minutes.
+dump_logs() {
+  for c in galleon-pg-primary galleon-pg-standby; do
+    echo "--- docker logs $c" >&2
+    docker logs "$c" >&2 2>&1 || true
+  done
+}
+# Any failure from here on shows both servers' logs.
+trap 'dump_logs' ERR
+
+# running reports whether container $1 is still running.
+running() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]
+}
+
+# wait_for runs "$@" until it succeeds, for up to two minutes, giving up at
+# once if one of the containers named in WATCH has exited, as the standby
+# does when its base backup fails.
+WATCH=""
 wait_for() {
   local what=$1
   shift
@@ -20,11 +37,15 @@ wait_for() {
     if "$@" >/dev/null 2>&1; then
       return 0
     fi
+    for c in $WATCH; do
+      if ! running "$c"; then
+        echo "$c exited while waiting for $what" >&2
+        return 1
+      fi
+    done
     sleep 0.5
   done
   echo "timed out waiting for $what" >&2
-  docker logs galleon-pg-primary >&2 || true
-  docker logs galleon-pg-standby >&2 || true
   return 1
 }
 
@@ -37,6 +58,7 @@ docker run -d --name galleon-pg-primary --network host \
   "$IMAGE" -c port="$PRIMARY_PORT" -c listen_addresses=127.0.0.1 \
   -c wal_level=replica -c max_wal_senders=10 -c max_connections=200 >/dev/null
 
+WATCH=galleon-pg-primary
 # The entrypoint starts a temporary server to initialize the database, so
 # wait for the final one: it answers a query over TCP.
 wait_for "the primary" docker exec galleon-pg-primary \
@@ -52,12 +74,13 @@ docker run -d --name galleon-pg-standby --network host --user postgres \
     exec postgres -D /tmp/standby -c port=$STANDBY_PORT -c listen_addresses=127.0.0.1 -c hot_standby=on -c max_connections=200
   " >/dev/null
 
+WATCH="galleon-pg-primary galleon-pg-standby"
 wait_for "the standby to stream" docker exec galleon-pg-primary \
   psql "postgres://postgres:postgres@127.0.0.1:$PRIMARY_PORT/postgres" -v ON_ERROR_STOP=1 -c \
   "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_stat_replication WHERE state = 'streaming') THEN RAISE 'not streaming yet'; END IF; END \$\$"
-recovery=$(docker exec galleon-pg-standby psql "postgres://postgres:postgres@127.0.0.1:$STANDBY_PORT/postgres" -Atc "SELECT pg_is_in_recovery()")
-if [ "$recovery" != t ]; then
-  echo "the standby is not in recovery" >&2
-  exit 1
-fi
+# The standby accepts connections a moment after it starts streaming.
+wait_for "the standby to answer, in recovery" docker exec galleon-pg-standby \
+  psql "postgres://postgres:postgres@127.0.0.1:$STANDBY_PORT/postgres" -v ON_ERROR_STOP=1 -c \
+  "DO \$\$ BEGIN IF NOT pg_is_in_recovery() THEN RAISE 'not in recovery'; END IF; END \$\$"
+trap - ERR
 echo "primary on $PRIMARY_PORT, streaming standby on $STANDBY_PORT"
