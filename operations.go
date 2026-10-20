@@ -241,8 +241,10 @@ func (a *App) compileOperations() {
 			bindings[key] = claim{o.desc.ID, o.site}
 			if rb, ok := b.(op.RPC); ok {
 				// The RPC transport serves procedures on the same ServeMux as
-				// HTTP routes, so they can't overlap, whichever roles run.
-				// Unary calls are POSTs, so a GET catch-all doesn't clash.
+				// HTTP routes, as POSTs, so a binding can't be ambiguous with
+				// one. A POST wildcard over a procedure's path is allowed: the
+				// procedure wins where the rpc role runs, and the wildcard
+				// serves that path on nodes that run only web.
 				path := rb.String()
 				if id, ok := httpPaths[path]; ok {
 					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, whose path operation %q binds over HTTP", o.module, o.site, o.desc.ID, b, id))
