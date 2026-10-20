@@ -24,7 +24,7 @@ func TestBuilderDescribesWhatWasDeclared(t *testing.T) {
 		Authorize("greet:hello", op.Resource("org", "org_id")).
 		Contexts("org").
 		Timeout(time.Second).
-		BodyLimit(1 << 10).
+		BodyLimit(1<<10).
 		RateLimit(5, time.Minute).
 		Idempotent().
 		AllowUnknownFields().
@@ -59,8 +59,11 @@ func TestBuilderDescribesWhatWasDeclared(t *testing.T) {
 	// change the other.
 	d.Bindings[0] = op.HTTP{Method: "GET", Path: "/x"}
 	d.Meta["k"] = "changed"
-	if b.Describe().Bindings[0] != want[0] || b.Describe().Meta["k"] != "v" {
-		t.Fatal("Describe must not share slices or maps with the builder")
+	d.Security.Resource.Kind = "changed"
+	d.Policies.RateLimit.Limit = 99
+	again := b.Describe()
+	if again.Bindings[0] != want[0] || again.Meta["k"] != "v" || again.Security.Resource.Kind != "org" || again.Policies.RateLimit.Limit != 5 {
+		t.Fatal("Describe must not share slices, maps or pointers with the builder")
 	}
 }
 
@@ -97,6 +100,7 @@ func TestAdapterRejectsMismatchedHandler(t *testing.T) {
 		func(context.Context, In) (*Out, error) { return nil, nil },
 		"not a func",
 		nil,
+		(func(context.Context, *In) (*Out, error))(nil),
 	} {
 		if _, err := adapt(h); err == nil {
 			t.Errorf("handler %T must be rejected", h)
@@ -117,7 +121,7 @@ func TestCheckReportsProblems(t *testing.T) {
 		"dotted lower snake case": op.Unary[In, Out]("Orders").Public().Describe(),
 		"declares no security":    op.Unary[In, Out]("orders.create").Describe(),
 		"is Public but also":      op.Unary[In, Out]("orders.create").Public().Authorize("a").Describe(),
-		"needs a method and":      op.Unary[In, Out]("orders.create").Public().HTTP("POST", "orders").Describe(),
+		"upper-case method and":   op.Unary[In, Out]("orders.create").Public().HTTP("POST", "orders").Describe(),
 		"needs a service":         op.Unary[In, Out]("orders.create").Public().RPC("", "Create").Describe(),
 		"positive limit":          op.Unary[In, Out]("orders.create").Public().RateLimit(0, time.Second).Describe(),
 		"no handler adapter":      {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}},
