@@ -3,6 +3,7 @@ package data
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"time"
 
@@ -13,7 +14,8 @@ import (
 
 // RetryPolicy bounds how often code is rerun after a serialization failure
 // or a deadlock. Zero fields take the defaults: 3 attempts, and waits of up
-// to 10ms doubling to at most 250ms.
+// to 10ms doubling to at most 250ms. A Backoff above MaxBackoff is lowered
+// to it.
 type RetryPolicy struct {
 	// Attempts is how many times the code runs at most, the first run
 	// included. 1 turns retries off.
@@ -35,15 +37,17 @@ func (p RetryPolicy) withDefaults() RetryPolicy {
 	if p.Backoff <= 0 {
 		p.Backoff = 10 * time.Millisecond
 	}
-	if p.MaxBackoff < p.Backoff {
+	if p.MaxBackoff <= 0 {
 		p.MaxBackoff = max(p.Backoff, 250*time.Millisecond)
 	}
+	p.Backoff = min(p.Backoff, p.MaxBackoff)
 	return p
 }
 
 // Run runs fn, and runs it again while it fails with a retryable error
 // (see Retryable) and attempts remain, waiting between attempts. It
-// returns fn's last error, or ctx's error if ctx ends while waiting. It
+// returns fn's last error, or, if ctx ends while waiting, ctx's error as
+// Canceled or DeadlineExceeded with fn's last error in its cause. It
 // doesn't look at ctx's transaction; implementations of Manager use it for
 // closures that own their root transaction.
 func (p RetryPolicy) Run(ctx context.Context, fn func(ctx context.Context) error) error {
@@ -59,10 +63,20 @@ func (p RetryPolicy) Run(ctx context.Context, fn func(ctx context.Context) error
 		case <-t.C:
 		case <-ctx.Done():
 			t.Stop()
-			return err
+			return ctxError(ctx, err)
 		}
 		ceiling = min(2*ceiling, p.MaxBackoff)
 	}
+}
+
+// ctxError is ctx's error, classified as errs.From classifies it, after
+// last failed.
+func ctxError(ctx context.Context, last error) error {
+	cause := fmt.Errorf("%w while waiting to retry after: %v", ctx.Err(), last)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return errs.Wrap(cause, errs.DeadlineExceeded, "galleon.deadline_exceeded", "the request took too long")
+	}
+	return errs.Wrap(cause, errs.Canceled, "galleon.canceled", "the request was canceled")
 }
 
 // Retrier is a retry policy as an option, and as a way to rerun code.
@@ -105,6 +119,10 @@ const (
 	CodeCheckViolation      = "data.check_violation"       // 23514
 	CodeForeignKeyViolation = "data.foreign_key_violation" // 23503
 	CodeNotNullViolation    = "data.not_null_violation"    // 23502
+	// Conflict: a lock wasn't granted within lock_timeout, or NOWAIT.
+	CodeLockNotAvailable = "data.lock_not_available" // 55P03
+	// DeadlineExceeded: statement_timeout canceled the statement.
+	CodeStatementTimeout = "data.statement_timeout" // 57014
 	// Unavailable: the database can't be reached, or refused the session.
 	CodeUnavailable = "data.unavailable"
 	// Internal: the handle was used wrongly.

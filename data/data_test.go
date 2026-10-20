@@ -3,10 +3,12 @@ package data_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/thec1oud/galleon/data"
+	"github.com/thec1oud/galleon/errs"
 )
 
 func TestOptionsFold(t *testing.T) {
@@ -48,5 +50,37 @@ func TestRetryDoLeavesRetriesToTheOwner(t *testing.T) {
 	_ = data.Retry(data.RetryPolicy{Attempts: 3, Backoff: 1}).Do(context.Background(), fail)
 	if runs != 3 {
 		t.Fatalf("ran %d times outside one", runs)
+	}
+}
+
+func TestRetryStopsWithTheContextsError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := data.RetryPolicy{Attempts: 5, Backoff: 10 * time.Second, MaxBackoff: 10 * time.Second}.Run(ctx, func(context.Context) error {
+		return &pgconn.PgError{Code: "40001"}
+	})
+	if errs.KindOf(err) != errs.DeadlineExceeded || data.Retryable(err) || time.Since(start) > 5*time.Second {
+		t.Fatalf("got %v after %v", err, time.Since(start))
+	}
+	ctx, cancel = context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	err = data.RetryPolicy{Attempts: 5, Backoff: 10 * time.Second, MaxBackoff: 10 * time.Second}.Run(ctx, func(context.Context) error {
+		return &pgconn.PgError{Code: "40P01"}
+	})
+	if errs.KindOf(err) != errs.Canceled {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestRetryKeepsAnExplicitMaxBackoff(t *testing.T) {
+	start := time.Now()
+	runs := 0
+	_ = data.RetryPolicy{Attempts: 6, Backoff: time.Second, MaxBackoff: time.Millisecond}.Run(context.Background(), func(context.Context) error {
+		runs++
+		return &pgconn.PgError{Code: "40001"}
+	})
+	if runs != 6 || time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("%d runs took %v; the waits must stay under MaxBackoff", runs, time.Since(start))
 	}
 }

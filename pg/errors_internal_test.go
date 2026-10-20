@@ -37,6 +37,8 @@ func TestClassify(t *testing.T) {
 		{"too many connections", bg, &pgconn.PgError{Code: "53300"}, errs.Unavailable, data.CodeUnavailable},
 		{"refused", bg, &net.OpError{Op: "dial", Err: errors.New("connection refused")}, errs.Unavailable, data.CodeUnavailable},
 		{"closed pool", bg, puddle.ErrClosedPool, errs.Unavailable, data.CodeUnavailable},
+		{"lock not available", bg, &pgconn.PgError{Code: "55P03"}, errs.Conflict, data.CodeLockNotAvailable},
+		{"statement timeout", bg, &pgconn.PgError{Code: "57014"}, errs.DeadlineExceeded, data.CodeStatementTimeout},
 		{"canceled", bg, context.Canceled, errs.Canceled, "galleon.canceled"},
 		{"deadline", bg, context.DeadlineExceeded, errs.DeadlineExceeded, "galleon.deadline_exceeded"},
 		{"query canceled by ctx", canceled, &pgconn.PgError{Code: "57014"}, errs.Canceled, "galleon.canceled"},
@@ -77,5 +79,22 @@ func TestOperationName(t *testing.T) {
 		if got := operation(sql); got != want {
 			t.Errorf("operation(%q) = %q, want %q", sql, got, want)
 		}
+	}
+}
+
+func TestAClosedScopeTracksNothing(t *testing.T) {
+	s := &scope{}
+	h := &handle{}
+	if !s.add(h) {
+		t.Fatal("an open scope refused a transaction")
+	}
+	if got := s.take(); len(got) != 1 {
+		t.Fatalf("took %d", len(got))
+	}
+	if s.add(&handle{}) {
+		t.Fatal("a scope took a transaction after its operation ended")
+	}
+	if got := s.take(); len(got) != 0 {
+		t.Fatalf("a closed scope kept %d transactions", len(got))
 	}
 }

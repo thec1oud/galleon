@@ -847,6 +847,64 @@ func readOnlyAndIsolation(t *testing.T, f Factory) {
 	if err != nil || !e.committed(2) {
 		t.Fatalf("got %v", err)
 	}
+	// A read nested in a read view of a write transaction is read only too.
+	writeThrough := func(ctx context.Context, r data.Reader, id int) error {
+		rows, err := r.Query(ctx, "INSERT INTO "+e.table+" (id, v) VALUES ($1, 'x')", id)
+		if err == nil {
+			rows.Close()
+			err = rows.Err()
+		}
+		return err
+	}
+	err = e.m.Write(c, func(ctx context.Context, w data.WriteTx) error {
+		return e.m.Read(ctx, func(ctx context.Context, view data.ReadTx) error {
+			n, err := view.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			if show(n, "transaction_read_only") != "on" {
+				t.Error("a read nested in a read view isn't READ ONLY")
+			}
+			if err := writeThrough(ctx, n, 3); !errors.As(err, &pe) || pe.Code != "25006" {
+				t.Errorf("a write through a read nested in a read view: %v", err)
+			}
+			if err := n.Commit(ctx); err != nil {
+				return err
+			}
+			return e.m.Read(ctx, func(ctx context.Context, n data.ReadTx) error {
+				if err := writeThrough(ctx, n, 4); !errors.As(err, &pe) || pe.Code != "25006" {
+					t.Errorf("a write through a Nested read in a read view: %v", err)
+				}
+				return nil
+			}, data.Nested)
+		})
+	})
+	if err != nil || e.committed(3) || e.committed(4) {
+		t.Fatalf("a read nested in a read view wrote: %v", err)
+	}
+
+	// Joining with an explicit isolation compares it with the level the
+	// transaction actually has, even when it was begun at the default.
+	var def string
+	if err := e.pool.QueryRow(c, "SHOW default_transaction_isolation").Scan(&def); err != nil {
+		t.Fatal(err)
+	}
+	other := data.Serializable
+	if def == string(data.Serializable) {
+		other = data.ReadCommitted
+	}
+	err = e.m.Write(c, func(ctx context.Context, w data.WriteTx) error {
+		if err := e.m.Read(ctx, func(context.Context, data.ReadTx) error { return nil }, data.Isolation(data.IsolationLevel(def))); err != nil {
+			t.Errorf("joining a default (%s) transaction as %s: %v", def, def, err)
+		}
+		err := e.m.Read(ctx, func(context.Context, data.ReadTx) error { return nil }, data.Isolation(other))
+		wantCode(t, err, errs.Internal, data.CodePropagation)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if err := e.m.Read(c, func(ctx context.Context, r data.ReadTx) error {
 		_, err := e.m.BeginWrite(ctx)
 		wantCode(t, err, errs.Internal, data.CodePropagation)
@@ -1003,6 +1061,36 @@ func errorKinds(t *testing.T, f Factory) {
 	}); errs.KindOf(err) != errs.DeadlineExceeded {
 		t.Errorf("an expired context: %v", err)
 	}
+
+	// statement_timeout, with the caller's ctx still live.
+	err := e.m.Read(c, func(ctx context.Context, r data.ReadTx) error {
+		rows, err := r.Query(ctx, "SET LOCAL statement_timeout = '50ms'")
+		if err != nil {
+			return err
+		}
+		rows.Close()
+		var x string
+		return r.QueryRow(ctx, "SELECT pg_sleep(5)::text").Scan(&x)
+	})
+	wantCode(t, err, errs.DeadlineExceeded, data.CodeStatementTimeout)
+
+	// A lock not granted within lock_timeout.
+	holder, err := e.pool.Begin(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(c)
+	if _, err := holder.Exec(c, "SELECT * FROM "+p+" WHERE id = 1 FOR UPDATE"); err != nil {
+		t.Fatal(err)
+	}
+	err = e.m.Write(c, func(ctx context.Context, w data.WriteTx) error {
+		if _, err := w.Exec(ctx, "SET LOCAL lock_timeout = '50ms'"); err != nil {
+			return err
+		}
+		_, err := w.Exec(ctx, "SELECT * FROM "+p+" WHERE id = 1 FOR UPDATE")
+		return err
+	})
+	wantCode(t, err, errs.Conflict, data.CodeLockNotAvailable)
 }
 
 func unreachable(t *testing.T, f Factory) {

@@ -15,6 +15,9 @@
 //
 // Every root transaction an operation begins is tracked until the operation
 // ends; one still open then is rolled back and reported (see Config.Leaks).
+// A transaction begun after its operation ended, by a goroutine that kept
+// the operation's ctx, isn't tracked: like any transaction begun outside an
+// operation, its owner must end it.
 //
 // Transactions get a span each, and statements, batches and copies a client
 // span each, with the database semantic conventions. Statement spans carry
@@ -30,6 +33,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -47,8 +51,7 @@ import (
 type Manager struct {
 	sources map[string]*source
 	names   []string // sorted, the primary first
-	tracer  trace.Tracer
-	log     *slog.Logger
+	tel     atomic.Pointer[telemetry]
 	retry   data.RetryPolicy
 	leaks   string
 	within  *within
@@ -56,11 +59,27 @@ type Manager struct {
 
 var _ data.Manager = (*Manager)(nil)
 
+// telemetry is where a Manager sends spans and logs. A Within manager gets
+// the app's when the module is installed, after it was built.
+type telemetry struct {
+	tracer trace.Tracer
+	log    *slog.Logger
+}
+
+func (m *Manager) setTelemetry(tp trace.TracerProvider, log *slog.Logger) {
+	m.tel.Store(&telemetry{tracer: tp.Tracer(tracerName), log: log})
+}
+
+func (m *Manager) tracer() trace.Tracer { return m.tel.Load().tracer }
+func (m *Manager) logger() *slog.Logger { return m.tel.Load().log }
+
 // source is one database and its pool.
 type source struct {
 	name   string
 	config *pgxpool.Config
-	pool   *pgxpool.Pool
+	// pool is nil before Start and after Stop. Read it once per use: Stop
+	// can clear it at any time.
+	pool atomic.Pointer[pgxpool.Pool]
 	// db, host and port label spans.
 	db, host string
 	port     int
@@ -103,15 +122,13 @@ func New(cfg Config, opts ...Option) (*Manager, error) {
 	s.defaults()
 	m := &Manager{
 		sources: map[string]*source{},
-		tracer:  s.tp.Tracer(tracerName),
-		log:     s.log,
 		retry:   cfg.retryPolicy(),
 		leaks:   cfg.Leaks,
 	}
+	m.setTelemetry(s.tp, s.log)
 	add := func(name string, src Source) {
 		pc, _ := src.poolConfig() // Validate has parsed it
-		qt := &queryTracer{tracer: m.tracer, source: name}
-		pc.ConnConfig.Tracer = qt
+		pc.ConnConfig.Tracer = &queryTracer{m: m, source: name}
 		m.sources[name] = &source{name: name, config: pc, db: pc.ConnConfig.Database, host: pc.ConnConfig.Host, port: int(pc.ConnConfig.Port)}
 	}
 	add(data.Primary, cfg.Primary)
@@ -140,7 +157,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		src := m.sources[name]
 		pool, err := pgxpool.NewWithConfig(ctx, src.config)
 		if err == nil {
-			src.pool = pool
+			src.pool.Store(pool)
 			err = pool.Ping(ctx)
 		}
 		if err != nil {
@@ -158,12 +175,10 @@ func (m *Manager) Stop(ctx context.Context) error { return m.closePools(ctx) }
 func (m *Manager) closePools(ctx context.Context) error {
 	var errs []error
 	for _, name := range m.names {
-		src := m.sources[name]
-		if src.pool == nil {
+		pool := m.sources[name].pool.Swap(nil)
+		if pool == nil {
 			continue
 		}
-		pool := src.pool
-		src.pool = nil
 		done := make(chan struct{})
 		go func() { pool.Close(); close(done) }()
 		select {
@@ -182,13 +197,16 @@ func (m *Manager) Ping(ctx context.Context, name string) error {
 		return err
 	}
 	if m.within != nil {
-		return classify(ctx, m.within.tx.Conn().Ping(ctx))
+		return m.within.ping(ctx)
 	}
-	if src.pool == nil {
-		return errs.New(errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
+	pool := src.pool.Load()
+	if pool == nil {
+		return errUnavailable
 	}
-	return classify(ctx, src.pool.Ping(ctx))
+	return classify(ctx, pool.Ping(ctx))
 }
+
+var errUnavailable = errs.New(errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
 
 // Pool returns the named source's pool ("" is the primary), for code that
 // needs pgx itself, such as a migration tool. It is nil before Start, and
@@ -198,7 +216,7 @@ func (m *Manager) Pool(name string) *pgxpool.Pool {
 		name = data.Primary
 	}
 	if src := m.sources[name]; src != nil {
-		return src.pool
+		return src.pool.Load()
 	}
 	return nil
 }
@@ -243,12 +261,30 @@ func Within(tx pgx.Tx, opts ...Option) *Manager {
 	m := &Manager{
 		sources: map[string]*source{data.Primary: {name: data.Primary, db: cfg.Database, host: cfg.Host, port: int(cfg.Port)}},
 		names:   []string{data.Primary},
-		tracer:  s.tp.Tracer(tracerName),
-		log:     s.log,
 		leaks:   leaksError,
 		within:  &within{tx: tx, turn: make(chan struct{}, 1), wait: 10 * time.Second},
 	}
+	m.setTelemetry(s.tp, s.log)
 	return m
+}
+
+// QueryTracer returns the pgx tracer that makes the Manager's statement
+// spans, for a connection the Manager didn't open itself, such as the one
+// a Within manager runs on. It uses whatever tracer provider the Manager has
+// when a statement runs.
+func (m *Manager) QueryTracer() pgx.QueryTracer { return &queryTracer{m: m, source: data.Primary} }
+
+// ping checks the test's connection when no transaction holds it; an open
+// one is using the connection, which shows it works, and a ping then would
+// race it.
+func (w *within) ping(ctx context.Context) error {
+	select {
+	case w.turn <- struct{}{}:
+	default:
+		return nil
+	}
+	defer func() { <-w.turn }()
+	return classify(ctx, w.tx.Conn().Ping(ctx))
 }
 
 // managerView is the Manager as a data.Manager alone, so the kernel doesn't
@@ -277,8 +313,14 @@ func Module(opts ...ModuleOption) galleon.Module {
 	return galleon.ModuleFunc("pg", func(r *galleon.Registry) error {
 		if s.use != nil {
 			m := s.use
-			galleon.Supply[*Manager](r, m)
-			galleon.Supply[data.Manager](r, managerView{m})
+			// Provided rather than supplied, so it takes the app's tracer
+			// provider and logger. Its Start and Stop leave a Within
+			// manager's connection alone.
+			galleon.Provide[*Manager](r, func(tp trace.TracerProvider, log *slog.Logger) *Manager {
+				m.setTelemetry(tp, log)
+				return m
+			})
+			galleon.Provide[data.Manager](r, func(m *Manager) data.Manager { return managerView{m} })
 			r.Intercept(op.Before(op.StageRoute), func(next op.Invoker) op.Invoker {
 				return func(ctx context.Context, call *op.Call) (any, error) { return m.track(ctx, call, next) }
 			})

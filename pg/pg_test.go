@@ -51,6 +51,8 @@ func TestSourcesHideTheirPasswords(t *testing.T) {
 		"postgres://app@db/orders?password=hunter2",
 		"host=db user=app password=hunter2 dbname=orders",
 		"host=db password='hunter2 x' dbname=orders",
+		"postgres://app:hunter2%zz@db/orders",
+		"postgres://app:hunter2@db/orders?sslmode=%zz&password=hunter2",
 	} {
 		if s := fmt.Sprint(pg.Source{DSN: dsn}); strings.Contains(s, "hunter2") || !strings.Contains(s, "db") {
 			t.Errorf("%q prints as %s", dsn, s)

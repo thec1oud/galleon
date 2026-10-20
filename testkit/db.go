@@ -4,15 +4,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/thec1oud/galleon"
 	"github.com/thec1oud/galleon/pg"
@@ -76,7 +79,15 @@ func DB(t testing.TB, opts ...DBOption) *Database {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, dsn)
+	cc, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("testkit.DB: %v", err)
+	}
+	// The Manager is built on the connection, so its statement tracer is
+	// plugged in once both exist.
+	fwd := &forwardTracer{}
+	cc.Tracer = fwd
+	conn, err := pgx.ConnectConfig(ctx, cc)
 	if err != nil {
 		t.Fatalf("testkit.DB: connecting: %v", err)
 	}
@@ -93,14 +104,78 @@ func DB(t testing.TB, opts ...DBOption) *Database {
 		}
 		conn.Close(ctx)
 	})
-	return &Database{dsn: dsn, manager: pg.Within(tx)}
+	m := pg.Within(tx)
+	fwd.set(m.QueryTracer())
+	return &Database{dsn: dsn, manager: m}
+}
+
+// forwardTracer passes pgx's tracing calls to a tracer set after the
+// connection was opened.
+type forwardTracer struct {
+	t atomic.Pointer[pgx.QueryTracer]
+}
+
+func (f *forwardTracer) set(t pgx.QueryTracer) { f.t.Store(&t) }
+
+func (f *forwardTracer) get() pgx.QueryTracer {
+	if t := f.t.Load(); t != nil {
+		return *t
+	}
+	return nil
+}
+
+func (f *forwardTracer) TraceQueryStart(ctx context.Context, c *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	if t := f.get(); t != nil {
+		return t.TraceQueryStart(ctx, c, d)
+	}
+	return ctx
+}
+
+func (f *forwardTracer) TraceQueryEnd(ctx context.Context, c *pgx.Conn, d pgx.TraceQueryEndData) {
+	if t := f.get(); t != nil {
+		t.TraceQueryEnd(ctx, c, d)
+	}
+}
+
+func (f *forwardTracer) TraceBatchStart(ctx context.Context, c *pgx.Conn, d pgx.TraceBatchStartData) context.Context {
+	if t, ok := f.get().(pgx.BatchTracer); ok {
+		return t.TraceBatchStart(ctx, c, d)
+	}
+	return ctx
+}
+
+func (f *forwardTracer) TraceBatchQuery(ctx context.Context, c *pgx.Conn, d pgx.TraceBatchQueryData) {
+	if t, ok := f.get().(pgx.BatchTracer); ok {
+		t.TraceBatchQuery(ctx, c, d)
+	}
+}
+
+func (f *forwardTracer) TraceBatchEnd(ctx context.Context, c *pgx.Conn, d pgx.TraceBatchEndData) {
+	if t, ok := f.get().(pgx.BatchTracer); ok {
+		t.TraceBatchEnd(ctx, c, d)
+	}
+}
+
+func (f *forwardTracer) TraceCopyFromStart(ctx context.Context, c *pgx.Conn, d pgx.TraceCopyFromStartData) context.Context {
+	if t, ok := f.get().(pgx.CopyFromTracer); ok {
+		return t.TraceCopyFromStart(ctx, c, d)
+	}
+	return ctx
+}
+
+func (f *forwardTracer) TraceCopyFromEnd(ctx context.Context, c *pgx.Conn, d pgx.TraceCopyFromEndData) {
+	if t, ok := f.get().(pgx.CopyFromTracer); ok {
+		t.TraceCopyFromEnd(ctx, c, d)
+	}
 }
 
 // Manager runs every transaction inside the test's transaction; see
 // pg.Within for what that changes.
 func (d *Database) Manager() *pg.Manager { return d.manager }
 
-// Module is the pg module, providing Manager, for an app built with New.
+// Module is the pg module, providing Manager, for an app built with New. The
+// Manager then sends its spans and logs to the app's tracer provider and
+// logger.
 func (d *Database) Module() galleon.Module { return pg.Module(pg.Use(d.manager)) }
 
 // DSN is the package's database itself, outside the test's transaction.
@@ -172,13 +247,24 @@ func packageDB(admin string, schema []string) (string, error) {
 	return dsn, nil
 }
 
+// createTemplate builds the template under a temporary name and renames
+// it once the schema is in, so a run killed halfway never leaves a template
+// that later runs would clone. A leftover from such a run is dropped first.
 func createTemplate(ctx context.Context, conn *pgx.Conn, admin, tpl string, schema []string) error {
-	ident := pgx.Identifier{tpl}.Sanitize()
+	building := tpl + "_building"
+	ident := pgx.Identifier{building}.Sanitize()
+	drop := func() {
+		// ctx may be what ran out.
+		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(dctx, "DROP DATABASE IF EXISTS "+ident+" WITH (FORCE)")
+	}
+	drop()
 	if _, err := conn.Exec(ctx, "CREATE DATABASE "+ident); err != nil {
 		return fmt.Errorf("creating the template: %w", err)
 	}
 	apply := func() error {
-		dsn, err := withDatabase(admin, tpl)
+		dsn, err := withDatabase(admin, building)
 		if err != nil {
 			return err
 		}
@@ -186,7 +272,7 @@ func createTemplate(ctx context.Context, conn *pgx.Conn, admin, tpl string, sche
 		if err != nil {
 			return err
 		}
-		defer c.Close(ctx)
+		defer c.Close(context.WithoutCancel(ctx))
 		for _, sql := range schema {
 			if _, err := c.Exec(ctx, sql); err != nil {
 				return fmt.Errorf("applying the schema: %w", err)
@@ -195,10 +281,24 @@ func createTemplate(ctx context.Context, conn *pgx.Conn, admin, tpl string, sche
 		return nil
 	}
 	if err := apply(); err != nil {
-		_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+ident+" WITH (FORCE)")
+		drop()
 		return err
 	}
-	return nil
+	// The schema's backend can outlive its connection by a moment, and a
+	// database can't be renamed while anyone is connected.
+	var err error
+	for range 50 {
+		if _, err = conn.Exec(ctx, "ALTER DATABASE "+ident+" RENAME TO "+pgx.Identifier{tpl}.Sanitize()); err == nil {
+			return nil
+		}
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || pe.Code != "55006" { // object_in_use
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	drop()
+	return fmt.Errorf("naming the template: %w", err)
 }
 
 // withDatabase returns dsn with its database replaced, in either DSN form.

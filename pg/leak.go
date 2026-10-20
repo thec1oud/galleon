@@ -16,15 +16,25 @@ import (
 type scopeKey struct{}
 
 // scope is the root transactions one operation call began and hasn't ended.
+// Once the call has ended it is closed: a transaction begun later through a
+// ctx that still carries it, such as one a goroutine kept with
+// context.WithoutCancel, is background work, and is no more tracked than
+// one begun outside any operation.
 type scope struct {
-	mu   sync.Mutex
-	open []*handle
+	mu     sync.Mutex
+	open   []*handle
+	closed bool
 }
 
-func (s *scope) add(h *handle) {
+// add tracks h, and reports whether it did.
+func (s *scope) add(h *handle) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	s.open = append(s.open, h)
-	s.mu.Unlock()
+	return true
 }
 
 func (s *scope) remove(h *handle) {
@@ -42,7 +52,7 @@ func (s *scope) take() []*handle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	open := s.open
-	s.open = nil
+	s.open, s.closed = nil, true
 	return open
 }
 
@@ -61,7 +71,7 @@ func (m *Manager) track(ctx context.Context, call *op.Call, next op.Invoker) (an
 	for i, h := range leaked {
 		rerr := h.rollback(ctx)
 		stack := formatStack(h.root.began)
-		m.log.ErrorContext(ctx, "transaction still open when its operation ended; rolled back",
+		m.logger().ErrorContext(ctx, "transaction still open when its operation ended; rolled back",
 			"operation", call.Desc.ID, "source", h.root.src.name, "began", stack, slog.Any("rollback_error", rerr))
 		if i > 0 {
 			report.WriteString("\n")

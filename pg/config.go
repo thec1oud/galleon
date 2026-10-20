@@ -65,7 +65,13 @@ func (s Source) String() string {
 		redactDSN(s.DSN), s.MaxConns, s.MinConns, s.ConnectTimeout, s.MaxConnLifetime, s.MaxConnIdleTime)
 }
 
-var passwordKV = regexp.MustCompile(`(?i)(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)`)
+var (
+	passwordKV = regexp.MustCompile(`(?i)(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)`)
+	// userinfo is a URL's user:password@, for a URL url.Parse refuses.
+	userinfo = regexp.MustCompile(`(://[^:/@]*:)[^@]*@`)
+	// passwordQuery is a password parameter in a URL's query.
+	passwordQuery = regexp.MustCompile(`(?i)([?&]password=)[^&]*`)
+)
 
 // redactDSN hides the password in either DSN form.
 func redactDSN(dsn string) string {
@@ -75,6 +81,10 @@ func redactDSN(dsn string) string {
 			u.RawQuery = q.Encode()
 		}
 		return u.Redacted()
+	}
+	if strings.Contains(dsn, "://") {
+		dsn = userinfo.ReplaceAllString(dsn, "${1}xxxxx@")
+		return passwordQuery.ReplaceAllString(dsn, "${1}xxxxx")
 	}
 	return passwordKV.ReplaceAllString(dsn, "${1}xxxxx")
 }

@@ -27,7 +27,7 @@ const (
 // the database semantic conventions. It records the SQL text, which carries
 // placeholders, and never the arguments.
 type queryTracer struct {
-	tracer trace.Tracer
+	m      *Manager
 	source string
 }
 
@@ -51,7 +51,7 @@ func (t *queryTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, d pgx
 		attrs = append(attrs, semconv.DBOperationName(op))
 		name = op
 	}
-	ctx, _ = t.tracer.Start(ctx, name, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+	ctx, _ = t.m.tracer().Start(ctx, name, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 	return ctx
 }
 
@@ -64,7 +64,7 @@ func (t *queryTracer) TraceBatchStart(ctx context.Context, conn *pgx.Conn, d pgx
 	if d.Batch != nil {
 		attrs = append(attrs, semconv.DBOperationBatchSize(d.Batch.Len()))
 	}
-	ctx, _ = t.tracer.Start(ctx, "BATCH", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+	ctx, _ = t.m.tracer().Start(ctx, "BATCH", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 	return ctx
 }
 
@@ -82,7 +82,7 @@ func (t *queryTracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, d pgx.Trac
 
 func (t *queryTracer) TraceCopyFromStart(ctx context.Context, conn *pgx.Conn, d pgx.TraceCopyFromStartData) context.Context {
 	attrs := append(t.attrs(conn), semconv.DBOperationName("COPY"), semconv.DBCollectionName(d.TableName.Sanitize()))
-	ctx, _ = t.tracer.Start(ctx, "COPY "+d.TableName.Sanitize(), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+	ctx, _ = t.m.tracer().Start(ctx, "COPY "+d.TableName.Sanitize(), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 	return ctx
 }
 

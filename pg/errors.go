@@ -56,6 +56,10 @@ func classify(ctx context.Context, err error) error {
 		}
 		return errs.Wrap(err, errs.Canceled, "galleon.canceled", "the request was canceled")
 	}
+	if pe != nil && pe.Code == "57014" {
+		// Canceled with the caller's ctx still live: statement_timeout.
+		return errs.Wrap(err, errs.DeadlineExceeded, data.CodeStatementTimeout, "the request took too long")
+	}
 	if pe == nil && unreachable(err) {
 		return errs.Wrap(err, errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
 	}
@@ -69,6 +73,8 @@ func sqlstate(code string) (k errs.Kind, c, msg string, ok bool) {
 		return errs.Conflict, data.CodeSerializationFailure, "the change conflicted with another one; retry it", true
 	case "40P01":
 		return errs.Conflict, data.CodeDeadlock, "the change conflicted with another one; retry it", true
+	case "55P03":
+		return errs.Conflict, data.CodeLockNotAvailable, "the data is locked by another change; retry it", true
 	case "23505":
 		return errs.Conflict, data.CodeUniqueViolation, "the data already exists", true
 	case "23P01":

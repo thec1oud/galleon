@@ -64,11 +64,12 @@ type handle struct {
 	afterCommit, afterRollback []func(context.Context)
 }
 
-// readTx and writeTx are the two faces of a handle. A readTx has no write
-// methods, and can't be asserted to a data.WriteTx.
+// readTx and writeTx are the two faces of a handle. A writeTx is a readTx
+// with the write methods; a readTx has none, and can't be asserted to a
+// data.WriteTx.
 type (
 	readTx  struct{ h *handle }
-	writeTx struct{ h *handle }
+	writeTx struct{ readTx }
 )
 
 var (
@@ -95,7 +96,7 @@ func (m *Manager) BeginWrite(ctx context.Context, opts ...data.WriteOption) (dat
 	if err != nil {
 		return nil, err
 	}
-	return &writeTx{h}, nil
+	return &writeTx{readTx{h}}, nil
 }
 
 // Read runs fn in a read transaction; see data.Manager.
@@ -106,7 +107,7 @@ func (m *Manager) Read(ctx context.Context, fn func(context.Context, data.ReadTx
 
 // Write runs fn in a write transaction; see data.Manager.
 func (m *Manager) Write(ctx context.Context, fn func(context.Context, data.WriteTx) error, opts ...data.WriteOption) error {
-	return m.closure(ctx, true, data.WriteOptions(opts...), func(h *handle) data.ReadTx { return &writeTx{h} },
+	return m.closure(ctx, true, data.WriteOptions(opts...), func(h *handle) data.ReadTx { return &writeTx{readTx{h}} },
 		func(ctx context.Context, tx data.ReadTx) error { return fn(ctx, tx.(*writeTx)) })
 }
 
@@ -197,7 +198,7 @@ func (m *Manager) begin(ctx context.Context, write bool, o data.Options, closure
 		if foreign {
 			return nil, misuse(data.CodeCrossSource, "the transaction in ctx belongs to another data.Manager, and joining it would need two-phase commit")
 		}
-		if err := enc.joinable(src, write, o); err != nil {
+		if err := enc.joinable(ctx, src, write, o); err != nil {
 			return nil, err
 		}
 		if o.Propagation == data.Nested {
@@ -233,22 +234,25 @@ func (m *Manager) beginRoot(ctx context.Context, src *source, write bool, o data
 	if o.Isolation != "" {
 		attrs = append(attrs, attrIsolation.String(string(o.Isolation)))
 	}
-	sctx, span := m.tracer.Start(ctx, "transaction", trace.WithAttributes(attrs...))
+	sctx, span := m.tracer().Start(ctx, "transaction", trace.WithAttributes(attrs...))
 	r := &root{m: m, src: src, write: write, iso: o.Isolation, span: span, outer: trace.SpanContextFromContext(ctx)}
 	var tx pgx.Tx
 	var err error
 	switch {
 	case m.within != nil:
 		tx, err = m.within.begin(sctx, write, r)
-	case src.pool == nil:
-		err = errs.New(errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
 	default:
+		pool := src.pool.Load()
+		if pool == nil {
+			err = errUnavailable
+			break
+		}
 		opts := pgx.TxOptions{IsoLevel: pgx.TxIsoLevel(o.Isolation)}
 		if !write {
 			// The backstop for reads: the database refuses writes.
 			opts.AccessMode = pgx.ReadOnly
 		}
-		tx, err = src.pool.BeginTx(sctx, opts)
+		tx, err = pool.BeginTx(sctx, opts)
 	}
 	if err != nil {
 		end(span, err)
@@ -257,7 +261,9 @@ func (m *Manager) beginRoot(ctx context.Context, src *source, write bool, o data
 	h := &handle{root: r, kind: rootKind, write: write, tx: tx}
 	if s, ok := ctx.Value(scopeKey{}).(*scope); ok {
 		r.began, r.scope = callers(), s
-		s.add(h)
+		if !s.add(h) {
+			r.began, r.scope = nil, nil
+		}
 	}
 	return h, nil
 }
@@ -307,7 +313,15 @@ type readOnlySavepoint struct{ pgx.Tx }
 func (s readOnlySavepoint) Commit(ctx context.Context) error { return s.Tx.Rollback(ctx) }
 
 // joinable checks that a transaction with o may join or nest in h.
-func (h *handle) joinable(src *source, write bool, o data.Options) error {
+func (h *handle) joinable(ctx context.Context, src *source, write bool, o data.Options) error {
+	if h.state == open && o.Isolation != "" && h.root.iso == "" {
+		// Begun at the database's default: learn which level that is.
+		var level string
+		if err := h.tx.QueryRow(h.root.stmtCtx(ctx), "SHOW transaction_isolation").Scan(&level); err != nil {
+			return classify(ctx, err)
+		}
+		h.root.iso = data.IsolationLevel(level)
+	}
 	switch {
 	case h.state != open:
 		return misuse(data.CodeTxEnded, "the transaction in ctx has ended")
@@ -332,7 +346,9 @@ func (h *handle) nest(ctx context.Context, write bool) (*handle, error) {
 		return nil, errEnded
 	}
 	sp, err := h.tx.Begin(h.root.stmtCtx(ctx))
-	if err == nil && h.write && !write {
+	// Any read nested in a write transaction, a read view's included, is
+	// made read only; one in a read transaction already is.
+	if err == nil && h.root.write && !write {
 		sp, err = readOnly(h.root.stmtCtx(ctx), sp)
 	}
 	if err != nil {
@@ -561,37 +577,19 @@ func (t *readTx) Begin(ctx context.Context) (data.ReadTx, error) {
 func (t *readTx) Commit(ctx context.Context) error   { return t.h.commit(ctx) }
 func (t *readTx) Rollback(ctx context.Context) error { return t.h.rollback(ctx) }
 
-func (t *writeTx) Query(ctx context.Context, sql string, args ...any) (data.Rows, error) {
-	return t.h.query(ctx, sql, args)
-}
-func (t *writeTx) QueryRow(ctx context.Context, sql string, args ...any) data.Row {
-	return t.h.queryRow(ctx, sql, args)
-}
-func (t *writeTx) SendBatch(ctx context.Context, b *data.Batch) data.BatchResults {
-	return t.h.sendBatch(ctx, b)
-}
 func (t *writeTx) Exec(ctx context.Context, sql string, args ...any) (data.CommandTag, error) {
 	return t.h.exec(ctx, sql, args)
 }
 func (t *writeTx) CopyFrom(ctx context.Context, table data.Identifier, cols []string, src data.CopyFromSource) (int64, error) {
 	return t.h.copyFrom(ctx, table, cols, src)
 }
-func (t *writeTx) Begin(ctx context.Context) (data.ReadTx, error) {
-	c, err := t.h.nest(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-	return &readTx{c}, nil
-}
 func (t *writeTx) BeginWrite(ctx context.Context) (data.WriteTx, error) {
 	c, err := t.h.nest(ctx, true)
 	if err != nil {
 		return nil, err
 	}
-	return &writeTx{c}, nil
+	return &writeTx{readTx{c}}, nil
 }
-func (t *writeTx) Commit(ctx context.Context) error   { return t.h.commit(ctx) }
-func (t *writeTx) Rollback(ctx context.Context) error { return t.h.rollback(ctx) }
 func (t *writeTx) AfterCommit(fn func(context.Context)) {
 	o := t.h.owner()
 	t.h.addCallback(&o.afterCommit, fn)

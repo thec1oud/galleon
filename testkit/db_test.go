@@ -3,6 +3,9 @@ package testkit_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +18,7 @@ import (
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/op"
 	"github.com/thec1oud/galleon/testkit"
+	"github.com/thec1oud/galleon/testkit/conformance/datatest"
 )
 
 var notes = testkit.Schema(`CREATE TABLE notes (id int PRIMARY KEY, body text NOT NULL)`)
@@ -169,5 +173,108 @@ func TestDBModuleTracksLeaks(t *testing.T) {
 	// The leaked root gave its turn back.
 	if err := m.Write(context.Background(), func(context.Context, data.WriteTx) error { return nil }); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDBPingDoesNotRaceTransactions(t *testing.T) {
+	m := testkit.DB(t, notes).Manager()
+	ctx := context.Background()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 50 {
+			if err := m.Write(ctx, func(ctx context.Context, w data.WriteTx) error {
+				_, err := w.Exec(ctx, "INSERT INTO notes VALUES ($1, 'x')", i)
+				return err
+			}); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			if err := m.Ping(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			return
+		default:
+		}
+		if err := m.Ping(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestDBBuildsTheTemplateUnderATemporaryName(t *testing.T) {
+	// The schema fails if it runs in a database that already has the
+	// template's final name, which a later run would clone even if this one
+	// died halfway. The comment makes the schema, and so its template, new.
+	schema := fmt.Sprintf(`-- %d
+CREATE TABLE marker (id int);
+DO $$ BEGIN
+	IF current_database() ~ '^galleon_tpl_[0-9a-f]+$' THEN
+		RAISE EXCEPTION 'the template is built under its final name';
+	END IF;
+END $$`, time.Now().UnixNano())
+	var name string
+	// Registered first, so it runs after DB's own cleanup.
+	t.Cleanup(func() {
+		if name == "" {
+			return
+		}
+		admin, err := pgx.Connect(context.Background(), os.Getenv(testkit.PostgresEnv))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admin.Close(context.Background())
+		key := name[strings.LastIndex(name, "_")+1:]
+		for _, db := range []string{name, "galleon_tpl_" + key} {
+			if _, err := admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+pgx.Identifier{db}.Sanitize()+" WITH (FORCE)"); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	db := testkit.DB(t, testkit.Schema(schema))
+	conn, err := pgx.Connect(context.Background(), db.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var exists bool
+	if err := conn.QueryRow(context.Background(), "SELECT to_regclass('marker') IS NOT NULL, current_database()").Scan(&exists, &name); err != nil || !exists {
+		t.Fatalf("the clone lacks the schema: %v", err)
+	}
+}
+
+func TestDBModuleUsesTheAppsTelemetry(t *testing.T) {
+	db := testkit.DB(t, notes)
+	var m data.Manager
+	mod := galleon.ModuleFunc("notes", func(r *galleon.Registry) error {
+		r.Operation(op.Unary[None, None]("notes.leak").Public(), func(ctx context.Context, _ *None) (*None, error) {
+			_, err := m.BeginRead(ctx)
+			return &None{}, err
+		})
+		return nil
+	})
+	tp := &datatest.Recorder{}
+	h := testkit.New(t, galleon.Modules(db.Module(), mod), galleon.TracerProvider(tp))
+	m = testkit.Get[data.Manager](h)
+	if err := m.Write(context.Background(), func(ctx context.Context, w data.WriteTx) error {
+		_, err := w.Exec(ctx, "INSERT INTO notes VALUES (1, 'x')")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(tp.Find(func(s *datatest.Span) bool { return s.Attr("galleon.data.access") == "write" })) != 1 {
+		t.Fatalf("no transaction span among %v", tp.Names())
+	}
+	if len(tp.Find(func(s *datatest.Span) bool { return strings.HasPrefix(s.Attr("db.query.text"), "INSERT") })) != 1 {
+		t.Fatalf("no statement span among %v", tp.Names())
+	}
+	_, _ = testkit.Get[*galleon.Operations](h).Call(context.Background(), "notes.leak", &None{})
+	if !h.Logs.Contains("transaction still open") {
+		t.Fatalf("the leak wasn't logged to the app's logger:\n%s", h.Logs)
 	}
 }
