@@ -224,7 +224,7 @@ END $$`, time.Now().UnixNano())
 		if name == "" {
 			return
 		}
-		admin, err := pgx.Connect(context.Background(), os.Getenv(testkit.PostgresEnv))
+		admin, err := pgx.Connect(context.Background(), strings.TrimSpace(os.Getenv(testkit.PostgresEnv)))
 		if err != nil {
 			t.Fatal(err)
 		}

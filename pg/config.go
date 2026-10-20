@@ -1,20 +1,22 @@
 package pg
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
-	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
-	"github.com/thec1oud/galleon/internal/dsn"
 )
 
 // Config is the "pg" config section.
@@ -61,101 +63,97 @@ type Source struct {
 	MaxConnIdleTime time.Duration `json:"max_conn_idle_time"`
 }
 
-// String describes the source with the DSN's password hidden, so a config
-// report can show it.
+// String describes the source for a config report. It never shows the
+// DSN's text, only a summary of what pgx reads from it: user, first host,
+// port and database, how many more hosts there are, and a few settings
+// that hold no secret (see summarize).
 func (s Source) String() string {
 	return fmt.Sprintf("{dsn:%s max_conns:%d min_conns:%d connect_timeout:%v max_conn_lifetime:%v max_conn_idle_time:%v}",
-		redactDSN(s.DSN), s.MaxConns, s.MinConns, s.ConnectTimeout, s.MaxConnLifetime, s.MaxConnIdleTime)
+		summary(s.DSN), s.MaxConns, s.MinConns, s.ConnectTimeout, s.MaxConnLifetime, s.MaxConnIdleTime)
 }
 
-var (
-	passwordKV = regexp.MustCompile(`(?i)(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)`)
-	// queryParam is a query parameter anywhere in a URL DSN, its value
-	// running to the next '&'.
-	queryParam = regexp.MustCompile(`([?&])([^=&?]*)=([^&]*)`)
+// invalidDSN stands in for a DSN pgx can't parse, and ambiguousDSN for one
+// that may hold a password where pgx reads something else.
+const (
+	invalidDSN   = "<invalid DSN>"
+	ambiguousDSN = "<ambiguous DSN>"
 )
 
-// redactDSN hides the passwords in either DSN form, valid or not. Since
-// parsers disagree on malformed DSNs, it masks in three ways and leans
-// towards hiding too much:
-//
-//   - The userinfo: in a URL, everything after the first ':' that follows
-//     "scheme://" and comes before the last '@', whatever lies between, so a
-//     password holding '@', '/', '?', '#' or ':' is hidden however a parser
-//     splits it. When the last '@' is in the query or the ':' is a port's,
-//     more than the password goes.
-//   - Parameters: the value of every URL query parameter whose decoded name
-//     is password or sslpassword, or can't be decoded, and of every
-//     keyword/value password or sslpassword.
-//   - What pgx reads: when the DSN carries a password by the above and
-//     pgconn.ParseConfig reads one from the DSN itself, every occurrence of
-//     that password, raw or escaped, is hidden first. One equal to
-//     PGPASSWORD is taken for the environment's and left to the other two
-//     masks. (pgx doesn't expose the sslpassword it reads.)
-//
-// A DSN that carries no password is returned as is.
-func redactDSN(s string) string {
-	masked := maskDSN(s)
-	if masked == s {
-		return s
+// summaries caches summarize's result by a hash of the DSN, so parsing,
+// which may read files such as a password file, happens once per DSN.
+var summaries sync.Map // [sha256.Size]byte -> string
+
+func summary(s string) string {
+	key := sha256.Sum256([]byte(s))
+	if v, ok := summaries.Load(key); ok {
+		return v.(string)
 	}
-	if pw := dsnPassword(s); pw != "" {
-		userinfo := strings.TrimPrefix(url.UserPassword("", pw).String(), ":")
-		for _, form := range []string{pw, url.QueryEscape(pw), url.PathEscape(pw), userinfo} {
-			s = strings.ReplaceAll(s, form, "xxxxx")
-		}
-		masked = maskDSN(s)
-	}
-	return masked
+	v, _ := summaries.LoadOrStore(key, summarize(s))
+	return v.(string)
 }
 
-// dsnPassword is the password pgx reads from s itself, not from PGPASSWORD
-// or a password file.
-func dsnPassword(s string) string {
-	// A password file is read only when nothing else gives a password, so
-	// one that doesn't exist stands in for it. In either form, a later
-	// setting wins.
-	const nofile = "passfile=/nonexistent/galleon-redaction"
-	withNoFile := s + " " + nofile
-	if dsn.IsURL(s) {
-		withNoFile = s + "?" + nofile
-		if strings.Contains(s, "?") {
-			withNoFile = s + "&" + nofile
+// summarize describes s from what pgconn.ParseConfig reads from it, as
+// postgres://user@host:port/database?settings +N hosts. The settings are an
+// allowlist: application_name, connect_timeout, and tls, which says how TLS is used (off, allowed,
+// preferred, required or verified) since pgx keeps sslmode itself only as
+// its effect. A setting whose value holds the password is left out. The
+// hosts are the others pgx would try.
+func summarize(s string) string {
+	c, err := pgconn.ParseConfig(s)
+	if err != nil {
+		return invalidDSN
+	}
+	// An '@' in what pgx reads as the user, host or database is most
+	// likely a password with an unescaped '/' or '@' that the URL split
+	// elsewhere, as in postgres://app:5432/secret@db/orders.
+	if strings.Contains(c.User+c.Host+c.Database, "@") {
+		return ambiguousDSN
+	}
+	hostPort := func(host string, port uint16) string {
+		if strings.HasPrefix(host, "/") { // a Unix socket's directory
+			return host + ":" + strconv.Itoa(int(port))
+		}
+		return net.JoinHostPort(host, strconv.Itoa(int(port)))
+	}
+	var b strings.Builder
+	b.WriteString("postgres://" + url.PathEscape(c.User) + "@" + hostPort(c.Host, c.Port) + "/" + url.PathEscape(c.Database))
+	// pgx lists a host twice when it may try it with TLS and without.
+	hosts := map[string]bool{hostPort(c.Host, c.Port): true}
+	tlsFirst, plainLater, tlsLater := c.TLSConfig != nil, false, false
+	for _, f := range c.Fallbacks {
+		hosts[hostPort(f.Host, f.Port)] = true
+		if f.Host == c.Host && f.Port == c.Port {
+			plainLater = plainLater || f.TLSConfig == nil
+			tlsLater = tlsLater || f.TLSConfig != nil
 		}
 	}
-	c, err := pgconn.ParseConfig(withNoFile)
-	if err != nil || c.Password == "" || c.Password == os.Getenv("PGPASSWORD") {
-		return ""
+	params := url.Values{}
+	if v := c.RuntimeParams["application_name"]; v != "" && (c.Password == "" || !strings.Contains(v, c.Password)) {
+		params.Set("application_name", v)
 	}
-	return c.Password
-}
-
-// maskDSN applies the userinfo and parameter masks.
-func maskDSN(s string) string {
-	if !dsn.IsURL(s) {
-		return passwordKV.ReplaceAllString(s, "${1}xxxxx")
+	if c.ConnectTimeout > 0 {
+		params.Set("connect_timeout", c.ConnectTimeout.String())
 	}
-	// Parameters first, so an '@' in a password parameter's value, which
-	// the userinfo mask may stop at, is already hidden.
-	s = queryParam.ReplaceAllStringFunc(s, func(p string) string {
-		m := queryParam.FindStringSubmatch(p)
-		name, err := url.QueryUnescape(m[2])
-		if err == nil && !strings.EqualFold(name, "password") && !strings.EqualFold(name, "sslpassword") {
-			return p
-		}
-		return m[1] + m[2] + "=xxxxx"
-	})
-	i := strings.Index(s, "://") + len("://")
-	rest := s[i:]
-	at := strings.LastIndex(rest, "@")
-	if at < 0 {
-		return s
+	switch {
+	case !tlsFirst && !tlsLater:
+		params.Set("tls", "off")
+	case !tlsFirst:
+		params.Set("tls", "allowed")
+	case plainLater:
+		params.Set("tls", "preferred")
+	case c.TLSConfig.InsecureSkipVerify:
+		params.Set("tls", "required")
+	default:
+		params.Set("tls", "verified")
 	}
-	c := strings.Index(rest[:at], ":")
-	if c < 0 {
-		return s
+	b.WriteString("?" + params.Encode())
+	switch n := len(hosts) - 1; {
+	case n == 1:
+		b.WriteString(" +1 host")
+	case n > 1:
+		fmt.Fprintf(&b, " +%d hosts", n)
 	}
-	return s[:i] + rest[:c+1] + "xxxxx" + rest[at:]
+	return b.String()
 }
 
 // Default sets the defaults: no sources, the default retry policy, and
@@ -216,6 +214,7 @@ func (s Source) validate() error {
 	if _, err := s.poolConfig(); err != nil {
 		return err
 	}
+	summary(s.DSN) // parsed now, not when the config is first reported
 	return nil
 }
 

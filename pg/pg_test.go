@@ -45,7 +45,9 @@ func TestConfigIsValidated(t *testing.T) {
 	}
 }
 
-func TestSourcesHideTheirPasswords(t *testing.T) {
+// Every DSN that leaked through masking its text: none of what pgx reads as
+// the password shows, and nothing needed masking.
+func TestSourcesNeverShowTheirPasswords(t *testing.T) {
 	for _, dsn := range []string{
 		"postgres://app:hunter2@db/orders",
 		"postgres://app@db/orders?password=hunter2",
@@ -74,34 +76,53 @@ func TestSourcesHideTheirPasswords(t *testing.T) {
 		"postgres://app@db/orders?SSLPassword=hunter2",
 		"postgres://app:hun%2Fter2@db/orders",
 		"postgres://app:hun/ter2@db/orders?pass%77ord=hunter2",
+		`host=db password=hun\ ter2`,
+		"host=db password\v=hunter2",
+		"host=db password=hunter2 sslpassword=hunter2 sslmode=disable",
 	} {
-		// "ter2" is the end of every password here, '@' or not.
-		if s := fmt.Sprint(pg.Source{DSN: dsn}); strings.Contains(s, "ter2") || !strings.Contains(s, "db") {
-			t.Errorf("%q prints as %s", dsn, s)
-		}
-		if s := fmt.Sprint(map[string]pg.Source{"x": {DSN: dsn}}); strings.Contains(s, "ter2") {
-			t.Errorf("in a map, %q prints as %s", dsn, s)
+		s := fmt.Sprint(pg.Source{DSN: dsn})
+		m := fmt.Sprint(map[string]pg.Source{"x": {DSN: dsn}})
+		for _, out := range []string{s, m} {
+			// "ter2" ends every password here, '@' or not.
+			if strings.Contains(out, "ter2") || strings.Contains(out, "xxxxx") {
+				t.Errorf("%q prints as %s", dsn, out)
+			}
+			if c, err := pgconn.ParseConfig(dsn); err == nil && c.Password != "" && strings.Contains(out, c.Password) {
+				t.Errorf("%q prints as %s, with the password pgx reads", dsn, out)
+			}
 		}
 	}
 }
 
-// A DSN without a password prints as it is, even with a password in the
-// environment for pgx to find.
-func TestSourcesWithoutPasswordsPrintAsTheyAre(t *testing.T) {
-	t.Setenv("PGPASSWORD", "postgres")
-	for _, dsn := range []string{
-		"postgres://",
-		"postgres://?sslmode=disable",
-		"postgres://postgres@db/postgres",
-		"host=db user=postgres dbname=postgres",
+// A source prints as a summary of what pgx reads from its DSN, never the
+// DSN's text.
+func TestSourcesPrintASummaryOfTheirDSN(t *testing.T) {
+	for dsn, want := range map[string]string{
+		"postgres://app:hunter2@db/orders": "postgres://app@db:5432/orders?tls=preferred",
+		"host=db port=5433 user=app dbname=orders sslmode=disable application_name=api connect_timeout=5": "postgres://app@db:5433/orders?application_name=api&connect_timeout=5s&tls=off",
+		// The password is also the user's and the database's name, which
+		// show as they would with any other password.
+		"postgres://postgres:postgres@localhost/postgres?sslmode=disable":            "postgres://postgres@localhost:5432/postgres?tls=off",
+		"postgres://app:hunter2@db,db2:5433,db3/orders?sslmode=require":              "postgres://app@db:5432/orders?tls=required +2 hosts",
+		"postgres://app@db,db2/orders?sslmode=prefer":                                "postgres://app@db:5432/orders?tls=preferred +1 host",
+		"postgres://app@db/orders?sslmode=allow":                                     "postgres://app@db:5432/orders?tls=allowed",
+		"postgres://app@db/orders?sslmode=verify-full":                               "postgres://app@db:5432/orders?tls=verified",
+		"postgres://app@[::1]:6432/orders?sslmode=disable":                           "postgres://app@[::1]:6432/orders?tls=off",
+		"host=/run/postgresql user=app dbname=orders":                                "postgres://app@/run/postgresql:5432/orders?tls=off",
+		"postgres://app:hunter2@db/orders?sslmode=disable&application_name=hunter2x": "postgres://app@db:5432/orders?tls=off",
+		"postgres://app:hun@ter2%zz@db":                                              "<invalid DSN>",
+		"postgres://app:5432/ter2@db/orders":                                         "<ambiguous DSN>",
+		"host=db port=notaport":                                                      "<invalid DSN>",
+		"postgres://app@db/orders?sslmode=%zz":                                       "<invalid DSN>",
+		"postgres://app@db/orders?sslmode=sometimes":                                 "<invalid DSN>",
 	} {
-		if s := fmt.Sprint(pg.Source{DSN: dsn}); !strings.HasPrefix(s, "{dsn:"+dsn+" max_conns") {
-			t.Errorf("%q prints as %s", dsn, s)
+		if s := fmt.Sprint(pg.Source{DSN: dsn}); !strings.HasPrefix(s, "{dsn:"+want+" max_conns") {
+			t.Errorf("%q prints as %s, want %s", dsn, s, want)
 		}
 	}
 }
 
-func TestConfigReportRedactsDSNs(t *testing.T) {
+func TestConfigReportHidesPasswords(t *testing.T) {
 	app, err := galleon.New(galleon.Coordination(local.New()), galleon.Deploy(galleon.SingleNode),
 		galleon.Modules(pg.Module()),
 		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "postgres://app:hunter2@db/orders"}, "named": {"other": {"dsn": "postgres://app:hunter2@db/other"}}}}`)))

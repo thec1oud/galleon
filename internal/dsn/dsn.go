@@ -1,5 +1,5 @@
-// Package dsn holds what package pg and testkit share about connection
-// strings.
+// Package dsn tells the forms of a Postgres connection string apart, for
+// the modules of this repository.
 package dsn
 
 import (

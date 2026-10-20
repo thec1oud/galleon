@@ -73,7 +73,7 @@ type Database struct {
 // named galleon_tpl_* to reclaim them; the next run rebuilds what it needs.
 func DB(t testing.TB, opts ...DBOption) *Database {
 	t.Helper()
-	admin := os.Getenv(PostgresEnv)
+	admin := adminDSN()
 	if admin == "" {
 		if os.Getenv("CI") != "" {
 			t.Fatalf("%s must be set in CI, so the tests that need Postgres run", PostgresEnv)
@@ -201,9 +201,20 @@ var packageDBs struct {
 	// advisory lock on each package database in dbs: the mark that the
 	// database is in use, even while nothing is connected to it.
 	live *pgx.Conn
+	// checked is when live was last found working.
+	checked time.Time
 }
 
 type packageDatabase struct{ name, dsn string }
+
+// adminDSN is the value of PostgresEnv, without the whitespace around it,
+// so that everything reading it reads the same DSN.
+func adminDSN() string { return strings.TrimSpace(os.Getenv(PostgresEnv)) }
+
+// liveCheckEvery is how often, at most, a package database handed out
+// again checks that the connection holding the live marks still works.
+// Tests set it to zero.
+var liveCheckEvery = time.Second
 
 // liveLock is the advisory lock key, in SQL, that marks database $1 live.
 const liveLock = "hashtext('galleon.testkit.live'), hashtext($1)"
@@ -220,8 +231,10 @@ func packageDB(admin string, schema []string) (string, error) {
 	defer packageDBs.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if d, ok := packageDBs.dbs[key]; ok && liveAlive(ctx) {
-		return d.dsn, nil
+	if d, ok := packageDBs.dbs[key]; ok {
+		if time.Since(packageDBs.checked) < liveCheckEvery || liveAlive(ctx) {
+			return d.dsn, nil
+		}
 	}
 
 	conn, err := pgx.Connect(ctx, admin)
@@ -332,7 +345,11 @@ func liveAlive(ctx context.Context) bool {
 	}
 	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return l.Ping(pctx) == nil
+	if l.Ping(pctx) != nil {
+		return false
+	}
+	packageDBs.checked = time.Now()
+	return true
 }
 
 // liveConn returns the connection that holds the live marks, opening it
@@ -374,6 +391,7 @@ func liveConn(ctx context.Context, conn *pgx.Conn, admin string) (*pgx.Conn, err
 		}
 	}
 	packageDBs.live = l
+	packageDBs.checked = time.Now()
 	return l, nil
 }
 
