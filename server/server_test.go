@@ -686,3 +686,23 @@ func TestClientLeavingMidBodyIsNotABadRequest(t *testing.T) {
 }
 
 const accessLog = `{"http":{"addr":"127.0.0.1:0","access_log":true}}`
+
+func TestOurReadTimeoutIsNotTheClientLeaving(t *testing.T) {
+	e := boot(t, `{"http":{"addr":"127.0.0.1:0","access_log":true,"read_timeout":300000000}}`)
+	c, err := net.Dial("tcp", listening(t, e))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, _ = io.WriteString(c, "POST /orgs/a/orders HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"customer\":")
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(e.logs.String(), "http request") {
+		if time.Now().After(deadline) {
+			t.Fatal("the request was never logged")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if l := e.logs.String(); !strings.Contains(l, "status=503") {
+		t.Fatalf("a server read timeout is Unavailable: %s", l)
+	}
+}
