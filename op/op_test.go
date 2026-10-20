@@ -293,3 +293,17 @@ func TestNilValidatorsOfAnyFormPanicAtDeclaration(t *testing.T) {
 		}()
 	}
 }
+
+type level string
+
+func (l level) ConsistencyLevel() string { return string(l) }
+
+func TestBuildersCarryAReadConsistency(t *testing.T) {
+	d := op.Unary[struct{}, struct{}]("orders.get").Public().Consistency(level("any")).Describe()
+	if d.Consistency == nil || d.Consistency.ConsistencyLevel() != "any" {
+		t.Fatalf("got %v", d.Consistency)
+	}
+	if op.Unary[struct{}, struct{}]("orders.get").Describe().Consistency != nil {
+		t.Fatal("an operation that declares none has a consistency")
+	}
+}

@@ -148,6 +148,13 @@ func (b *Builder[In, Out]) AllowUnknownFields() *Builder[In, Out] {
 
 func (b *Builder[In, Out]) Docs(d Docs) *Builder[In, Out] { b.d.Docs = d; return b }
 
+// Consistency sets the default read consistency of the operation's reads,
+// such as data.ReadYourWrites.
+func (b *Builder[In, Out]) Consistency(c ReadConsistency) *Builder[In, Out] {
+	b.d.Consistency = c
+	return b
+}
+
 // Meta sets an adapter-specific value.
 func (b *Builder[In, Out]) Meta(key string, v any) *Builder[In, Out] {
 	if b.d.Meta == nil {

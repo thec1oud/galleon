@@ -136,8 +136,9 @@ func (h *opHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Header:    r.Header,
 		Peer:      peerFrom(ctx),
 		Decode:    func(into any) error { return h.decode(w, r, into) },
-	}}
+	}, Response: &op.Response{Header: http.Header{}}}
 	out, err := h.x.Invoke(ctx, call)
+	addHeaders(w.Header(), call.Response.Header)
 	if err != nil {
 		status := 0
 		if errors.Is(err, errUnsupportedMediaType) {
@@ -159,6 +160,16 @@ func (h *opHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", enc.MediaType())
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// addHeaders adds the headers interceptors set for the response to dst,
+// leaving alone any dst already has.
+func addHeaders(dst, src http.Header) {
+	for k, v := range src {
+		if _, ok := dst[k]; !ok && len(v) > 0 {
+			dst[k] = v
+		}
+	}
 }
 
 var errUnsupportedMediaType = errs.New(errs.InvalidArgument, "galleon.unsupported_media_type", "the request body's media type is not supported")

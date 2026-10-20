@@ -294,10 +294,11 @@ func (s *Server) rpcHandler(x *galleon.Operation, b op.RPC, in, out *codec.Set) 
 				}
 				return req.Msg.decode(into)
 			},
-		}}
+		}, Response: &op.Response{Header: http.Header{}}}
 		res, err := s.invokeRPC(ctx, x, call, method)
 		if err != nil {
 			ce := s.rpcError(ctx, method, err)
+			addHeaders(ce.Meta(), call.Response.Header)
 			code := strings.ToUpper(ce.Code().String())
 			span.SetAttributes(semconv.RPCResponseStatusCode(code))
 			if serverFault(ce.Code()) {
@@ -309,14 +310,16 @@ func (s *Server) rpcHandler(x *galleon.Operation, b op.RPC, in, out *codec.Set) 
 			return nil, ce
 		}
 		span.SetAttributes(semconv.RPCResponseStatusCode("OK"))
-		return connect.NewResponse(&message{out: res, encodeFailed: func(err error) error {
+		resp := connect.NewResponse(&message{out: res, encodeFailed: func(err error) error {
 			// connect-go sends this error's text as Internal, so keep the
 			// cause out of it, as rpcError would.
 			s.log.ErrorContext(ctx, "rpc response could not be encoded", "method", method, "error", err)
 			span.SetAttributes(semconv.RPCResponseStatusCode("INTERNAL"), semconv.ErrorTypeKey.String("INTERNAL"))
 			span.SetStatus(codes.Error, "INTERNAL")
 			return errors.New("the response could not be encoded")
-		}}), nil
+		}})
+		addHeaders(resp.Header(), call.Response.Header)
+		return resp, nil
 	}, opts...)
 }
 
