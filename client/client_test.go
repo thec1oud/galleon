@@ -675,6 +675,9 @@ func TestRedirectsResolveAgainstTheRequestURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := c.Do(must(http.NewRequest("GET", "//evil.example/x", nil))); err == nil {
+		t.Error("a URL with a host but no scheme must be refused")
+	}
 	for path, want := range map[string]string{"/abs": "/login", "/a/rel": "/api/x", "a/sib": "/api/a/y"} {
 		seen.Clear()
 		if _, err := client.Send[Item](context.Background(), c, "GET", path, nil); err != nil {
@@ -687,10 +690,14 @@ func TestRedirectsResolveAgainstTheRequestURL(t *testing.T) {
 		if _, err := c.HTTP().Do(req); err == nil || !strings.Contains(err.Error(), "Client.Do") {
 			t.Errorf("HTTP() must refuse relative URLs: %v", err)
 		}
+		seen.Clear()
 		if res, err := c.Do(req); err != nil {
 			t.Fatal(err)
 		} else {
 			res.Body.Close()
+		}
+		if _, ok := seen.Load(want); !ok {
+			t.Errorf("Do: %s redirected, want %s; server saw %v", path, want, keys(&seen))
 		}
 		if req.URL.String() != path {
 			t.Errorf("the caller's request was changed to %s", req.URL)
