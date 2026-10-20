@@ -165,6 +165,11 @@ func (h *opHandler) decode(w http.ResponseWriter, r *http.Request, into any) err
 		}
 		body := http.MaxBytesReader(w, r.Body, limit)
 		if err := dec.Decode(body, into, h.x.Desc.Policies.UnknownFields); err != nil {
+			if r.Context().Err() != nil {
+				// The client went away mid-body. Over HTTP/1 that is the
+				// only way a body ends short, so don't blame its syntax.
+				return errs.Wrap(err, errs.Canceled, "galleon.canceled", "the request was canceled")
+			}
 			return err
 		}
 	}

@@ -25,7 +25,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -277,7 +276,7 @@ func removeStaleSocket(path string) error {
 		c.Close()
 		return fmt.Errorf("%s is in use by another process", path)
 	}
-	if !errors.Is(err, syscall.ECONNREFUSED) {
+	if !refused(err) {
 		// A full backlog, a permission problem or a timeout doesn't mean
 		// nobody owns the socket, so leave it and let the bind report it.
 		return nil
