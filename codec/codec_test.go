@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -237,13 +238,30 @@ func (b brokenReader) Read([]byte) (int, error) { return 0, b.err }
 
 func TestReadFailuresAreNotTheClientsFault(t *testing.T) {
 	var v struct{ A int }
-	err := codec.JSON.Decode(io.MultiReader(strings.NewReader(`{"A":`), brokenReader{errors.New("connection reset")}), &v, op.IgnoreUnknown)
+	reset := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	err := codec.JSON.Decode(io.MultiReader(strings.NewReader(`{"A":`), brokenReader{reset}), &v, op.IgnoreUnknown)
 	var e *errs.Error
 	if !errors.As(err, &e) || e.Kind != errs.Unavailable {
 		t.Fatalf("got %v", err)
 	}
+	err = codec.JSON.Decode(io.MultiReader(strings.NewReader(`{"A":`), brokenReader{io.ErrUnexpectedEOF}), &v, op.IgnoreUnknown)
+	if !errors.As(err, &e) || e.Kind != errs.InvalidArgument || e.Code != "galleon.body_read" {
+		t.Fatalf("a body shorter than its length is the client's fault: got %v", err)
+	}
 	err = codec.JSON.Decode(io.MultiReader(strings.NewReader(`{"A":1}`), brokenReader{context.Canceled}), &v, op.IgnoreUnknown)
 	if !errors.As(err, &e) || e.Kind != errs.Canceled {
 		t.Fatalf("after the value: got %v", err)
+	}
+}
+
+func TestBodyLimitThroughMaxBytesReader(t *testing.T) {
+	for name, body := range map[string]string{"in the value": `{"A":"` + strings.Repeat("x", 64) + `"}`, "after the value": `{"A":"x"}` + strings.Repeat(" ", 64)} {
+		r := http.MaxBytesReader(httptest.NewRecorder(), io.NopCloser(strings.NewReader(body)), 16)
+		var v struct{ A string }
+		err := codec.JSON.Decode(r, &v, op.IgnoreUnknown)
+		var e *errs.Error
+		if !errors.As(err, &e) || e.Code != "galleon.body_too_large" {
+			t.Errorf("%s: got %v", name, err)
+		}
 	}
 }
