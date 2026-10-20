@@ -11,7 +11,7 @@ This repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each mod
 | Module | Path | Contents |
 |---|---|---|
 | `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness, node identity, OpenTelemetry and slog), the clock seam, roles and the process supervisor, the error model, coordination interfaces and the in-process `local` backend, the operation model and HTTP/RPC transport, the outbound client, and the data plane (`data` interfaces, `pg` on pgx) |
-| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`), and `testkit.DB`, a Postgres database per package with a transaction per test |
+| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`), `testkit.DB`, a Postgres database per package with a transaction per test, `testkit.Replica`, its view on a streaming replica, and `testkit.Proxy` |
 
 Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `coord-pg`, `jobs`, `web`, `realtime`, `http3`, `adapters/*`, `cmd/galleon`.
 
@@ -63,4 +63,8 @@ The design was worked out in [docs/design](docs/design):
 for dir in $(go list -m -f '{{.Dir}}'); do (cd "$dir" && go vet ./... && go test -race ./...); done
 ```
 
-Tests that need Postgres skip unless `GALLEON_TEST_POSTGRES` holds the DSN of a server they may create databases on, such as `postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable`. CI runs a Postgres service and sets it.
+Tests that need Postgres skip unless `GALLEON_TEST_POSTGRES` holds the DSN of a server they may create databases on, such as `postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable`. Tests that need a streaming replica also skip unless `GALLEON_TEST_POSTGRES_REPLICA` holds the DSN of a standby of that server, whose user may pause and resume replay (a superuser will do). [.github/scripts/postgres-replica.sh](.github/scripts/postgres-replica.sh) starts both in Docker, on ports 5432 and 5433; CI runs it and sets both. With `CI` set, the tests fail instead of skipping.
+
+## Data plane status
+
+Package `pg` routes reads to streaming replicas by read consistency (`Primary`, `Any`, `BoundedStaleness(d)`, `ReadYourWrites` with wait and fail policies), tracks each replica's lag in the background, and carries read-your-writes across requests and nodes with signed causal tokens in the `Galleon-Consistency` header (see [§7.1, §7.4 and §7.5](docs/design/05-architecture.md#71-sources-and-topology)). Not built yet: `Snapshot` reads, sharing lag readings through coordination, replicas of named sources, the token cookie, and `WAIT FOR LSN` on PostgreSQL 19.

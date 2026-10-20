@@ -357,16 +357,24 @@ The interfaces live in core (package `data`), and use pgx's own shapes for rows,
 ### 7.1 Sources and topology
 
 ```go
-pg.Module(pg.Config{
+pg.Module() // with the "pg" config section, or in Go:
+pg.New(pg.Config{
     Primary:  pg.Source{DSN: …},
-    Replicas: []pg.Source{{DSN: …, Zone: "a"}, {DSN: …, Zone: "b"}},
-    Named:    map[string]pg.Source{"analytics": {…}},  // per-module or special-purpose
-    Select:   pg.LeastLag,                             // or Random, RoundRobin, Nearest
-    MaxLag:   2 * time.Second,                         // excluded from rotation beyond this
+    Replicas: []pg.Source{{DSN: …, Zone: "a"}, {DSN: …, Name: "eu", Zone: "b"}}, // named replica_1, replica_2… by default
+    Named:    map[string]pg.Source{"analytics": {…}},  // per-module or special-purpose; no replicas
+    Select:   pg.LeastLag,                             // or Random, RoundRobin, Nearest (with Zone, this node's)
+    MaxLag:   2 * time.Second,                         // the default; out of rotation beyond this (MaxLagBytes too, optionally)
+    LagPoll:  50 * time.Millisecond,                   // the default
+    Consistency: "read_your_writes",                   // the default level of reads that set none
+    TokenKey: …,                                       // signs causal tokens (§7.5); TokenPreviousKey for rotation
 })
 ```
 
-A background tracker polls each replica's replay position (`pg_last_wal_replay_lsn()`) and health, and shares the readings through coordination. Per request, choosing a replica is an in-memory comparison.
+A background tracker runs one poller per replica, and one for the primary, each on a connection of its own outside the pools, so tracking never waits for or takes an application connection and makes no spans. Every `LagPoll` the primary's poller reads `pg_current_wal_lsn()` into a short history; each replica's reads `pg_is_in_recovery()`, `pg_last_wal_replay_lsn()` and `now() - pg_last_xact_replay_timestamp()`. A replica's lag is kept in bytes (behind the primary's latest reading) and in time: how long ago, at most, the primary was where the replica is, from that history, or the time since the last replayed commit where that is smaller. The history is what makes the time right while the primary is idle, when the last replayed commit can be hours old though the replica is caught up. A replica is out of rotation while it is unreachable, not in recovery (promoted, or not a standby at all), lagging past `MaxLag` (or `MaxLagBytes`), or its latest reading is stale (older than five polls, at least 500ms); it returns with the first reading that puts it back, and both moves are logged. A read that fails to begin on a replica takes it out until its poller next hears from it, and reads the primary. The pollers start and stop with the Manager, and `Stop` waits for them. A replica that can't be reached doesn't stop `Start`, and replicas aren't readiness gates: the primary serves their reads.
+
+Per request, choosing a replica is an in-memory comparison of the latest readings, with no query. Replicas aren't sources: `data.Source` can't name one, so a write can't reach one, and their transactions are `READ ONLY` besides.
+
+**As built, and deferred:** the readings are per node, not yet shared through coordination (O2): each node tracks every replica itself, which costs each replica one small query per node per `LagPoll`. Named sources have no replicas: the causal floor and its token are the primary's WAL position, and a named source's replicas would need a floor of their own in the token; it can come with a source that needs it.
 
 ### 7.2 Typed handles
 
@@ -426,19 +434,25 @@ The rules:
 | Read consistency | Mechanism |
 |---|---|
 | `Primary` | Read from the primary |
-| `ReadYourWrites` | Causal token: wait for, or route to, a replica past the token's LSN, or fall back to the primary |
-| `BoundedStaleness(d)` | A replica whose tracked lag is under `d` |
-| `Any` | The `Select` strategy |
-| `Snapshot(token)` | `pg_export_snapshot()` + `SET TRANSACTION SNAPSHOT` for parallel, consistent reads |
+| `ReadYourWrites` | Causal token: route to a replica past the causal floor; when none is, read the primary at once (the default), or `.Wait(d)` for one to catch up first, and `.OrFail()` to fail with `data.consistency_timeout` (`Unavailable`, retryable) instead of reading the primary |
+| `BoundedStaleness(d)` | A replica in rotation whose tracked lag is at most `d`, else the primary |
+| `Any` | A replica in rotation, by the `Select` strategy, else the primary |
+| `Snapshot(token)` | `pg_export_snapshot()` + `SET TRANSACTION SNAPSHOT` for parallel, consistent reads. **Deferred** to its own PR. |
 
-Operations declare a default (`Descriptor.Consistency`), which can be overridden per call.
+A read chooses with `data.Consistency(level)`; an operation declares its reads' default with `Descriptor.Consistency` (`op.Unary(…).Consistency(data.ReadYourWrites)`); the module's config has the last default. The call's wins over the operation's, which wins over the config's. The op plane only carries the value, as an `op.ReadConsistency`; the pg interceptor puts it in the call's ctx (`data.WithConsistency`). With no replicas every level reads the primary, and nothing fails. Consistency only routes a read that begins a transaction on the primary source: `Join`, `Nested` and `Mandatory` reads run on the enclosing transaction's connection whatever they ask for, so a read inside a write transaction never leaves the primary. `Independent` reads may go to a replica; with `leaks: "error"` (development and tests) one begun while a write transaction is open logs a warning, with where it began.
+
+The wait polls the most caught-up replica in rotation on one of its connections (every 1ms, doubling to 20ms), and begins the read on that connection once it has passed the floor. `WAIT FOR LSN` (PostgreSQL 19) will replace the polling where the server has it; that is deferred until CI runs a 19.
+
+Spans of reads on the primary source carry `galleon.data.consistency` (the level), `galleon.data.replica` (the replica's name, never its DSN), `server.address` and `server.port` of where it ran, `galleon.data.fallback` (`no_replica`, `wait_timeout` or `replica_error`) when it read the primary although a replica might have served, and `galleon.data.wait.duration` when it waited. Statements on a replica carry its name too. Metrics: `galleon.data.replica.lag` (s), `galleon.data.replica.lag_bytes` and `galleon.data.replica.in_rotation` per replica; `galleon.data.reads` by where they ran and level; `galleon.data.read.fallbacks` by level and reason; `galleon.data.read.wait`; `galleon.data.consistency.tokens` by result.
 
 ### 7.5 Causal tokens (question 9 in part 4)
 
-- **After commit,** the LSN is captured by pipelining `pg_current_wal_lsn()` with `COMMIT` in one round trip.
-- **Carried** in the request context, and sent out as a signed, versioned opaque token in the `Galleon-Consistency` response header, gRPC metadata, or an optional cookie for browsers. It's only sent after writes.
-- **On the next request,** the token is verified (an HMAC, about a microsecond) and clamped to the primary's current LSN. It becomes the floor for any `ReadYourWrites` read.
-- **The fallback policy** for when no replica has caught up is per operation: wait, with a timeout (`WAIT FOR LSN` on PostgreSQL 19 and later, polling before that), or go to the primary.
+- **After commit,** the LSN is read in the commit's own round trip: a root write transaction commits with one simple query, `SELECT pg_current_xact_id_if_assigned() IS NOT NULL; COMMIT; SELECT pg_current_wal_insert_lsn()`. The first statement tells whether it wrote anything; the insert position is past the commit record, even with `synchronous_commit` off. A test counts what the client sends through a proxy: one message. Read transactions, rolled-back writes and writes that wrote nothing produce no floor and no token.
+- **Carried** in the request context as the causal floor, which each commit raises and nothing lowers. The pg module's interceptor (the leak tracker's, at the outermost position) gives every operation call one; code outside operations uses `pg.CausalContext(ctx)`. Once the call ends it sends a signed, versioned opaque token in the `Galleon-Consistency` response header, which is gRPC metadata over RPC, through the transport-neutral `op.Call.Response.Header`. It's only sent when the call committed a write, even if it failed afterwards. The op plane and the transports know nothing of Postgres.
+- **The token** is 44 characters of base64url: version 1, the LSN, the issue time, and an HMAC-SHA256 truncated to 16 bytes, over a domain string and the rest, with `TokenKey` (at least 32 bytes, a config secret). `TokenPreviousKey` is still accepted, for rotating keys. A token older than `TokenTTL` (10 minutes by default) or issued more than a minute in the future is ignored. Without `TokenKey`, no token is sent or read, and read-your-writes holds within a request.
+- **On the next request,** the token is verified (constant-time compare, every key tried) and becomes the floor for its `ReadYourWrites` reads. A malformed, forged, expired, wrong-version or oversized one (more than 128 bytes, refused unread) is ignored: it never fails or panics the call, it is counted by result and logged at debug without its content. The floor is clamped to the primary's current position the first time a read needs it: if the token is past the tracker's latest reading of the primary, one `pg_current_wal_insert_lsn()` on the primary clamps it, so a forged token can't hold reads off the replicas.
+- **The fallback policy** for when no replica has caught up is per operation, or per call (§7.4).
+- **Deferred:** the optional cookie for browsers (it will be `Secure`, `HttpOnly`, `SameSite=Lax`); a browser client can echo the header meanwhile.
 
 ### 7.6 The ORM seam
 
