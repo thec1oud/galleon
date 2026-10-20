@@ -3,8 +3,9 @@ package galleon
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"reflect"
-	"regexp"
+	"strings"
 
 	"github.com/thec1oud/galleon/coord"
 	"github.com/thec1oud/galleon/errs"
@@ -68,7 +69,7 @@ type stageImpl struct {
 // Operation registers an operation and its handler, which must be a
 // func(context.Context, *In) (*Out, error) matching the descriptor's types.
 func (r *Registry) Operation(def op.Definition, handler any) {
-	if def == nil {
+	if def == nil || (reflect.ValueOf(def).Kind() == reflect.Pointer && reflect.ValueOf(def).IsNil()) {
 		r.errorf("Operation: the definition is nil")
 		return
 	}
@@ -98,6 +99,11 @@ func (r *Registry) Operation(def op.Definition, handler any) {
 // hand-written descriptor whose adapter disagrees with its TypeInfo fails boot
 // instead of the first call.
 func checkHandler(d *op.Descriptor, handler any) error {
+	for _, ti := range []op.TypeInfo{d.Input, d.Output} {
+		if got, want := reflect.TypeOf(ti.New()), reflect.PointerTo(ti.Type); got != want {
+			return fmt.Errorf("TypeInfo for %v has a New that returns %v, want %v (use op.TypeOf)", ti.Type, got, want)
+		}
+	}
 	ht := reflect.TypeOf(handler)
 	want := reflect.FuncOf(
 		[]reflect.Type{contextType, reflect.PointerTo(d.Input.Type)},
@@ -174,6 +180,8 @@ func (a *App) compileOperations() {
 	type claim struct{ id, site string }
 	ids := map[string]claim{}
 	bindings := map[string]claim{}
+	mux := http.NewServeMux()
+	httpOwners := map[string]string{} // pattern -> operation ID
 	needStage := func(o registeredOp, s op.Stage, why string) {
 		if _, ok := a.stageImpls[s]; !ok {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q %s, but no module implements the %v stage", o.module, o.site, o.desc.ID, why, s))
@@ -186,6 +194,16 @@ func (a *App) compileOperations() {
 		}
 		ids[o.desc.ID] = claim{o.desc.ID, o.site}
 		for _, b := range o.desc.Bindings {
+			if hb, ok := b.(op.HTTP); ok {
+				// ServeMux knows which patterns conflict, so ask it now
+				// rather than when the transport mounts them.
+				if err := probeHTTP(mux, hb); err != nil {
+					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, which conflicts with %s", o.module, o.site, o.desc.ID, b, httpOwner(err, httpOwners)))
+					continue
+				}
+				httpOwners[hb.String()] = o.desc.ID
+				continue
+			}
 			key := bindingKey(b)
 			if prev, ok := bindings[key]; ok {
 				a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, which operation %q already binds", o.module, o.site, o.desc.ID, b, prev.id))
@@ -239,14 +257,32 @@ func (a *App) compileOperations() {
 	}
 }
 
-// wildcardName matches a ServeMux wildcard, so "{id}" and "{oid}" compare
-// equal while "{rest...}" stays distinct from "{id}".
-var wildcardName = regexp.MustCompile(`\{([^}.]*)(\.\.\.)?\}`)
+// probeHTTP registers b on a scratch ServeMux, turning its panic on a
+// conflicting pattern into an error.
+func probeHTTP(mux *http.ServeMux, b op.HTTP) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	mux.Handle(b.String(), http.NotFoundHandler())
+	return nil
+}
+
+// httpOwner names the operation that owns the pattern ServeMux's error
+// mentions, or repeats the error when it can't tell.
+func httpOwner(err error, owners map[string]string) string {
+	msg := err.Error()
+	for pattern, id := range owners {
+		if strings.Contains(msg, `"`+pattern+`"`) {
+			return fmt.Sprintf("%s of operation %q", pattern, id)
+		}
+	}
+	return msg
+}
 
 func bindingKey(b op.Binding) string {
 	switch b := b.(type) {
-	case op.HTTP:
-		return "http " + b.Method + " " + wildcardName.ReplaceAllString(b.Path, "{$2}")
 	case op.RPC:
 		return "rpc " + b.Service + "/" + b.Method
 	case op.Topic:
