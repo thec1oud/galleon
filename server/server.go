@@ -1,7 +1,9 @@
-// Package server is Galleon's HTTP transport. It serves every operation with
-// an HTTP binding through the operation pipeline, on a net/http server whose
-// timeouts and limits are set by default, and it renders errors as RFC 9457
-// problem+json.
+// Package server is Galleon's HTTP and RPC transport. It serves every
+// operation with an HTTP binding, and every operation with an RPC binding over
+// the Connect protocol, gRPC and gRPC-Web (through connect-go), through the
+// operation pipeline, on one net/http server whose timeouts and limits are set
+// by default. HTTP errors are RFC 9457 problem+json; RPC errors carry the gRPC
+// code of their kind.
 //
 //	galleon.New(..., galleon.Modules(server.Module()))
 //
@@ -20,6 +22,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -100,33 +103,45 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// RoleWeb is the role that runs the HTTP server.
-const RoleWeb galleon.Role = "web"
+// RoleWeb is the role that serves HTTP bindings, and RoleRPC the role that
+// serves RPC bindings. A process with both serves both on one listener.
+const (
+	RoleWeb galleon.Role = "web"
+	RoleRPC galleon.Role = "rpc"
+)
 
-// Option configures the module.
+// Option configures the module, or a server built with New.
 type Option func(*options)
 
-type options struct{ codecs []codec.Codec }
+type options struct {
+	codecs    []codec.Codec
+	http, rpc bool
+}
 
 // Codecs adds payload formats beyond the built-in JSON. A codec for a media
 // type already present replaces it.
 func Codecs(c ...codec.Codec) Option { return func(o *options) { o.codecs = append(o.codecs, c...) } }
 
-// Module returns the HTTP transport module. It runs in processes with the
-// "web" role.
+// Serve chooses which bindings New serves; it serves both by default. The
+// module sets it from the process's roles.
+func Serve(http, rpc bool) Option {
+	return func(o *options) { o.http, o.rpc = http, rpc }
+}
+
+// Module returns the transport module. It serves HTTP bindings in processes
+// with the "web" role and RPC bindings (Connect, gRPC and gRPC-Web) in
+// processes with the "rpc" role.
 func Module(opts ...Option) galleon.Module {
-	var o options
-	for _, opt := range opts {
-		opt(&o)
-	}
 	return galleon.ModuleFunc("http", func(r *galleon.Registry) error {
 		cfg := galleon.Config[Config](r, "http")
-		if !r.Active(RoleWeb) {
+		web, rpc := r.Active(RoleWeb), r.Active(RoleRPC)
+		if !web && !rpc {
 			return nil
 		}
+		opts := append(slices.Clone(opts), Serve(web, rpc))
 		var srv *Server
 		galleon.Provide[*Server](r, func(ops *galleon.Operations, mw *galleon.HTTPMiddleware, log *slog.Logger, tp trace.TracerProvider) (*Server, error) {
-			s, err := New(cfg, ops, mw, log, tp, codec.NewSet(o.codecs...))
+			s, err := New(cfg, ops, mw, log, tp, opts...)
 			srv = s
 			return s, err
 		})
@@ -155,8 +170,9 @@ type Server struct {
 	handler http.Handler
 	srv     *http.Server
 
-	trustUnix bool
-	fatal     func(error) // stops the app when serving fails after ready
+	trustUnix           bool
+	fatal               func(error) // stops the app when serving fails after ready
+	serveHTTP, serveRPC bool
 
 	mu   sync.Mutex
 	ln   net.Listener
@@ -165,12 +181,18 @@ type Server struct {
 
 // New builds the server and its routes. Use Module in an app; New is for
 // mounting operations somewhere else.
-func New(cfg *Config, ops *galleon.Operations, mw *galleon.HTTPMiddleware, log *slog.Logger, tp trace.TracerProvider, codecs *codec.Set) (*Server, error) {
+func New(cfg *Config, ops *galleon.Operations, mw *galleon.HTTPMiddleware, log *slog.Logger, tp trace.TracerProvider, opts ...Option) (*Server, error) {
+	o := options{http: true, rpc: true}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	s := &Server{
-		cfg:    cfg,
-		log:    log,
-		tracer: tp.Tracer("github.com/thec1oud/galleon/server"),
-		codecs: codecs,
+		cfg:       cfg,
+		log:       log,
+		tracer:    tp.Tracer("github.com/thec1oud/galleon/server"),
+		codecs:    codec.NewSet(o.codecs...),
+		serveHTTP: o.http,
+		serveRPC:  o.rpc,
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("http: %w", err)

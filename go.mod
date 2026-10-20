@@ -3,10 +3,12 @@ module github.com/thec1oud/galleon
 go 1.26.0
 
 require (
+	connectrpc.com/connect v1.21.1
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
 	golang.org/x/sys v0.49.0
+	google.golang.org/protobuf v1.36.11
 )
 
 require (

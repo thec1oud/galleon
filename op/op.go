@@ -204,6 +204,8 @@ func TypeOf[T any]() TypeInfo {
 var (
 	idPattern     = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`)
 	methodPattern = regexp.MustCompile(`^[A-Z]+$`)
+	rpcService    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$`)
+	rpcMethod     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // Check reports what is wrong with d on its own, before it is compared with
@@ -239,8 +241,8 @@ func (d *Descriptor) Check() []error {
 				errs = append(errs, fmt.Errorf("operation %q: HTTP binding needs an upper-case method and a path starting with /, got %q %q", d.ID, b.Method, b.Path))
 			}
 		case RPC:
-			if b.Service == "" || b.Method == "" {
-				errs = append(errs, fmt.Errorf("operation %q: RPC binding needs a service and a method", d.ID))
+			if !rpcService.MatchString(b.Service) || !rpcMethod.MatchString(b.Method) {
+				errs = append(errs, fmt.Errorf("operation %q: RPC binding needs a protobuf service name, such as orders.v1.Orders, and a method name, got %q %q", d.ID, b.Service, b.Method))
 			}
 		case Topic:
 			if b.Name == "" {
