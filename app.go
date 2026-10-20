@@ -23,6 +23,7 @@ import (
 
 	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/coord"
+	"github.com/thec1oud/galleon/op"
 	"github.com/thec1oud/galleon/process"
 )
 
@@ -161,6 +162,11 @@ type App struct {
 	stopHooks  []hook
 	drainHooks []hook
 
+	ops          []registeredOp
+	interceptors []op.Placed
+	stageImpls   map[op.Stage]stageImpl
+	operations   *Operations
+
 	bootErrs []error
 
 	mu           sync.Mutex
@@ -218,6 +224,8 @@ func New(opts ...Option) (*App, error) {
 		configRaw:    map[string]json.RawMessage{},
 		configOwners: map[string]string{},
 		knownRoles:   map[Role]bool{},
+		stageImpls:   map[op.Stage]stageImpl{},
+		operations:   &Operations{byID: map[string]*Operation{}},
 		fatal:        make(chan struct{}),
 	}
 
@@ -234,6 +242,7 @@ func New(opts ...Option) (*App, error) {
 	Supply[Node](kernel, node)
 	Supply[trace.TracerProvider](kernel, s.tracerProvider)
 	Supply[metric.MeterProvider](kernel, s.meterProvider)
+	Supply[*Operations](kernel, a.operations)
 	if a.backend != nil {
 		Supply[coord.Backend](kernel, a.backend)
 	}
@@ -264,6 +273,7 @@ func New(opts ...Option) (*App, error) {
 	a.applyReplacements()
 	a.checkCoordination()
 	a.checkRoles()
+	a.compileOperations()
 
 	if order, err := a.resolveGraph(); err != nil {
 		a.bootErrs = append(a.bootErrs, err)

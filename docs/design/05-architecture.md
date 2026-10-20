@@ -261,7 +261,7 @@ var CreateOrder = op.Unary[CreateOrderIn, CreateOrderOut]("orders.create").
     HTTP("POST", "/orders").
     RPC("orders.v1.Orders", "Create").
     Contexts("org").                       // operating contexts accepted (CBAC seam)
-    Authorize("orders:create", op.Resource("org", "org_id")).
+    AuthorizeResource("orders:create", op.Resource("org", "org_id")).
     Idempotent().
     Timeout(5 * time.Second)
 
