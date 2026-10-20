@@ -139,7 +139,7 @@ type settings struct {
 	err        error
 }
 
-// BaseURL resolves relative request URLs against u, and is where credentials
+// BaseURL resolves relative request URLs sent with Do against u, and is where credentials
 // go when no host is named for them.
 func BaseURL(u string) Option {
 	return func(s *settings) {
@@ -251,21 +251,26 @@ func New(name string, opts ...Option) (*Client, error) {
 	for i := len(s.middleware) - 1; i >= 0; i-- {
 		rt = s.middleware[i](rt)
 	}
-	rt = &resolving{next: rt, base: s.base}
+	rt = &absolute{next: rt}
 	c := &Client{name: name, cfg: s.cfg, base: s.base}
-	c.hc = &http.Client{Transport: rt, CheckRedirect: c.checkRedirect}
+	c.hc = &http.Client{Transport: rt}
 	return c, nil
 }
 
 // HTTP returns the client as an *http.Client, for connect-go clients and
-// other libraries. Its Timeout is unset: attempts have their own, and the
+// other libraries. Its requests need absolute URLs; only Do resolves relative
+// ones. Its Timeout is unset: attempts have their own, and the
 // caller's context bounds the whole call.
 func (c *Client) HTTP() *http.Client { return c.hc }
 
 // Do sends req through the client's layers. A relative URL is resolved
 // before the request is sent, so redirects resolve against where it went.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	if req.URL != nil && !req.URL.IsAbs() && c.base != nil {
+	if req.URL != nil && !req.URL.IsAbs() {
+		if c.base == nil {
+			closeBody(req)
+			return nil, fmt.Errorf("client: %q is relative and the client has no BaseURL", req.URL)
+		}
 		req = req.Clone(req.Context())
 		req.URL = resolve(c.base, req.URL)
 		req.Host = ""
@@ -276,82 +281,19 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 // Name is the name the client was built with.
 func (c *Client) Name() string { return c.name }
 
-// sensitiveHeaders are the headers http.Client drops on a redirect to
-// another host.
-var sensitiveHeaders = []string{"Authorization", "Www-Authenticate", "Cookie", "Cookie2", "Proxy-Authorization", "Proxy-Authenticate"}
-
-// checkRedirect is http.Client's default policy, plus a fix for a request
-// sent through HTTP() with a relative URL. http.Client resolves the first
-// redirect's Location against that relative URL, which resolving would then
-// put under the base path, so it is resolved against the absolute URL instead.
-// And http.Client decides which hops keep the sensitive headers by comparing
-// them with a URL that has no host, so that decision is made here too.
-func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
-	}
-	if via[0].URL.IsAbs() || c.base == nil {
-		return nil
-	}
-	first := resolve(c.base, via[0].URL)
-	if len(via) == 1 {
-		u, err := first.Parse(req.Response.Header.Get("Location"))
-		if err != nil {
-			return err
-		}
-		req.URL = u
-	}
-	// As http.Client does, once a hop leaves the first host's domain, the
-	// headers stay stripped even if a later hop comes back.
-	keep := sameDomain(first, req.URL)
-	for _, r := range via[1:] {
-		keep = keep && sameDomain(first, r.URL)
-	}
-	for _, h := range sensitiveHeaders {
-		if v := via[0].Header.Values(h); keep && len(v) > 0 {
-			req.Header[http.CanonicalHeaderKey(h)] = slices.Clone(v)
-		} else if !keep {
-			req.Header.Del(h)
-		}
-	}
-	return nil
-}
-
-// sameDomain reports whether u's host is first's or, for a name, one of its
-// subdomains: the hosts http.Client keeps sensitive headers for.
-func sameDomain(first, u *url.URL) bool {
-	a, b := strings.ToLower(first.Hostname()), strings.ToLower(u.Hostname())
-	if a == "" || b == "" {
-		return false
-	}
-	if a == b {
-		return true
-	}
-	if _, err := netip.ParseAddr(a); err == nil {
-		return false
-	}
-	return strings.HasSuffix(b, "."+a)
-}
-
-// resolving resolves relative URLs against the base URL, for requests sent
-// through HTTP() rather than Do.
-type resolving struct {
+// absolute refuses relative URLs, which only Do resolves. http.Client
+// resolves a redirect's Location against the request's URL and decides which
+// headers follow it by that URL's host, so it must see where the request went.
+type absolute struct {
 	next http.RoundTripper
-	base *url.URL
 }
 
-func (r *resolving) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.IsAbs() || r.base == nil {
-		if !req.URL.IsAbs() {
-			closeBody(req)
-			return nil, fmt.Errorf("client: %q is relative and the client has no BaseURL", req.URL)
-		}
-		return r.next.RoundTrip(req)
+func (a *absolute) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !req.URL.IsAbs() {
+		closeBody(req)
+		return nil, fmt.Errorf("client: %q is relative; send it with Client.Do, which resolves it against the BaseURL", req.URL)
 	}
-	req = req.Clone(req.Context())
-	req.URL = resolve(r.base, req.URL)
-	req.Host = ""
-	return r.next.RoundTrip(req)
+	return a.next.RoundTrip(req)
 }
 
 // resolve resolves a relative URL under the base URL's path: with base

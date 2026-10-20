@@ -683,15 +683,14 @@ func TestRedirectsResolveAgainstTheRequestURL(t *testing.T) {
 		if _, ok := seen.Load(want); !ok {
 			t.Errorf("Do: %s redirected, want %s; server saw %v", path, want, keys(&seen))
 		}
-		seen.Clear()
 		req := must(http.NewRequest("GET", path, nil))
-		res, err := c.HTTP().Do(req)
-		if err != nil {
-			t.Fatal(err)
+		if _, err := c.HTTP().Do(req); err == nil || !strings.Contains(err.Error(), "Client.Do") {
+			t.Errorf("HTTP() must refuse relative URLs: %v", err)
 		}
-		res.Body.Close()
-		if _, ok := seen.Load(want); !ok {
-			t.Errorf("HTTP(): %s redirected, want %s; server saw %v", path, want, keys(&seen))
+		if res, err := c.Do(req); err != nil {
+			t.Fatal(err)
+		} else {
+			res.Body.Close()
 		}
 		if req.URL.String() != path {
 			t.Errorf("the caller's request was changed to %s", req.URL)
@@ -770,7 +769,7 @@ func TestMaxResponseBytesMustBePositive(t *testing.T) {
 	}
 }
 
-func TestRedirectChainsThroughHTTPKeepHeadersOnlyOnTheSameDomain(t *testing.T) {
+func TestRedirectChainsKeepHeadersOnlyOnTheSameDomain(t *testing.T) {
 	var mu sync.Mutex
 	got := map[string]string{}
 	next := map[string]string{
@@ -780,7 +779,7 @@ func TestRedirectChainsThroughHTTPKeepHeadersOnlyOnTheSameDomain(t *testing.T) {
 	}
 	fake := rtFunc(func(r *http.Request) (*http.Response, error) {
 		mu.Lock()
-		got[r.URL.Host+r.URL.Path] = r.Header.Get("Authorization") + "|" + r.Header.Get("Cookie")
+		got[r.URL.Host+r.URL.Path] = anyCase(r.Header, "Authorization") + "|" + anyCase(r.Header, "Cookie")
 		mu.Unlock()
 		res := &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody, Request: r}
 		if to, ok := next[r.URL.Path]; ok {
@@ -796,8 +795,8 @@ func TestRedirectChainsThroughHTTPKeepHeadersOnlyOnTheSameDomain(t *testing.T) {
 	for _, path := range []string{"/evil1", "/same1", "/away1"} {
 		req := must(http.NewRequest("GET", path, nil))
 		req.Header.Set("Authorization", "Bearer caller")
-		req.Header.Set("Cookie", "s=1")
-		res, err := c.HTTP().Do(req)
+		req.Header["cookie"] = []string{"s=1"} // not canonical, as some callers write it
+		res, err := c.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -815,4 +814,14 @@ func TestRedirectChainsThroughHTTPKeepHeadersOnlyOnTheSameDomain(t *testing.T) {
 			t.Errorf("%s: got %q (reached: %v), want %q", at, v, ok, want)
 		}
 	}
+}
+
+// anyCase reads a header whatever the case of its key.
+func anyCase(h http.Header, key string) string {
+	for k, v := range h {
+		if strings.EqualFold(k, key) {
+			return strings.Join(v, ",")
+		}
+	}
+	return ""
 }
