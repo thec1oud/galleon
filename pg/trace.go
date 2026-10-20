@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/thec1oud/galleon/data"
 )
 
 const tracerName = "github.com/thec1oud/galleon/pg"
@@ -27,12 +29,16 @@ const (
 // the database semantic conventions. It records the SQL text, which carries
 // placeholders, and never the arguments.
 type queryTracer struct {
-	m      *Manager
-	source string
+	m       *Manager
+	source  string
+	replica string // the replica's name, on a replica's connections
 }
 
 func (t *queryTracer) attrs(conn *pgx.Conn) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{semconv.DBSystemNamePostgreSQL, attrSource.String(t.source)}
+	if t.replica != "" {
+		attrs = append(attrs, attrReplica.String(t.replica))
+	}
 	if conn != nil {
 		cfg := conn.Config()
 		attrs = append(attrs, semconv.DBNamespace(cfg.Database), semconv.ServerAddress(cfg.Host))
@@ -88,6 +94,19 @@ func (t *queryTracer) TraceCopyFromStart(ctx context.Context, conn *pgx.Conn, d 
 
 func (t *queryTracer) TraceCopyFromEnd(ctx context.Context, _ *pgx.Conn, d pgx.TraceCopyFromEndData) {
 	end(trace.SpanFromContext(ctx), d.Err)
+}
+
+// commitSpan starts the client span of a commit sent on conn without pgx's
+// tracer, as a statement span named COMMIT.
+func (m *Manager) commitSpan(ctx context.Context, conn *pgx.Conn, sql string) (context.Context, trace.Span) {
+	var attrs []attribute.KeyValue
+	if t, ok := conn.Config().Tracer.(*queryTracer); ok {
+		attrs = t.attrs(conn)
+	} else {
+		attrs = (&queryTracer{source: data.PrimarySource}).attrs(conn)
+	}
+	attrs = append(attrs, semconv.DBQueryText(sql), semconv.DBOperationName("COMMIT"))
+	return m.tracer().Start(ctx, "COMMIT", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 }
 
 // end ends a statement or transaction span, recording the SQLSTATE of a

@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -40,6 +41,8 @@ func TestClassify(t *testing.T) {
 		{"too many connections", bg, &pgconn.PgError{Code: "53300"}, errs.Unavailable, data.CodeUnavailable},
 		{"refused", bg, &net.OpError{Op: "dial", Err: errors.New("connection refused")}, errs.Unavailable, data.CodeUnavailable},
 		{"closed pool", bg, puddle.ErrClosedPool, errs.Unavailable, data.CodeUnavailable},
+		// A pooled connection whose server went away.
+		{"closed connection", bg, fmt.Errorf("begin: %w", pgconn.ErrConnClosed), errs.Unavailable, data.CodeUnavailable},
 		{"lock not available", bg, &pgconn.PgError{Code: "55P03"}, errs.Conflict, data.CodeLockNotAvailable},
 		{"statement timeout", bg, &pgconn.PgError{Code: "57014", Message: "canceling statement due to statement timeout"}, errs.DeadlineExceeded, data.CodeStatementTimeout},
 		{"statement timeout in German", bg, &pgconn.PgError{Code: "57014", Message: "storniere Anfrage wegen Zeitüberschreitung der Anweisung"}, errs.DeadlineExceeded, data.CodeStatementTimeout},

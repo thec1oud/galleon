@@ -122,6 +122,9 @@ const (
 	CodeStatementTimeout = "data.statement_timeout" // 57014
 	// Unavailable: the database can't be reached, or refused the session.
 	CodeUnavailable = "data.unavailable"
+	// Unavailable, retryable: a ReadYourWrites read with OrFail found no
+	// replica caught up with its causal floor within its wait.
+	CodeConsistencyTimeout = "data.consistency_timeout"
 	// Internal: the handle was used wrongly.
 	CodeTxEnded       = "data.tx_ended"      // used after Commit or Rollback
 	CodePropagation   = "data.propagation"   // Mandatory, Never, a read joined by a write, …

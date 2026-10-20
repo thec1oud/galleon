@@ -56,8 +56,9 @@ const (
 	Serializable   IsolationLevel = "serializable"
 )
 
-// Primary is the name of the primary source, as Source and spans call it.
-const Primary = "primary"
+// PrimarySource is the name of the primary source, as Source and spans call
+// it. (Primary is the read consistency that reads it.)
+const PrimarySource = "primary"
 
 // Options is what the options given to a Manager call add up to.
 // Implementations read it with ReadOptions and WriteOptions.
@@ -71,6 +72,10 @@ type Options struct {
 	// Retry is the retry policy of a closure; nil means the
 	// implementation's default. Begin calls refuse it.
 	Retry *RetryPolicy
+	// Consistency is the read consistency the call asked for, or nil for
+	// the operation's default (see ConsistencyFrom), and failing that the
+	// implementation's. Only reads set it.
+	Consistency *Level
 }
 
 // ReadOption configures a read transaction.

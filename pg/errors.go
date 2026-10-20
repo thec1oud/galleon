@@ -108,7 +108,7 @@ func unreachable(err error) bool {
 	var ce *pgconn.ConnectError
 	var ne net.Error
 	return errors.As(err, &ce) || errors.As(err, &ne) ||
-		errors.Is(err, puddle.ErrClosedPool) ||
+		errors.Is(err, puddle.ErrClosedPool) || errors.Is(err, pgconn.ErrConnClosed) ||
 		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
