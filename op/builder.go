@@ -35,6 +35,8 @@ func (b *Builder[In, Out]) Describe() Descriptor {
 	d.Security.Schemes = append([]string(nil), d.Security.Schemes...)
 	d.Security.Contexts = append([]string(nil), d.Security.Contexts...)
 	d.Docs.Tags = append([]string(nil), d.Docs.Tags...)
+	d.Input.Codecs = append([]Codec(nil), d.Input.Codecs...)
+	d.Output.Codecs = append([]Codec(nil), d.Output.Codecs...)
 	if d.Deprecated != nil {
 		v := *d.Deprecated
 		d.Deprecated = &v

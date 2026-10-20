@@ -10,6 +10,7 @@ import (
 	"github.com/thec1oud/galleon/coord"
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/op"
+	"github.com/thec1oud/galleon/validate"
 )
 
 // Operation is one registered operation, with its pipeline prepared at boot.
@@ -83,6 +84,21 @@ func (r *Registry) Operation(def op.Definition, handler any) {
 			bad = append(bad, fmt.Errorf("operation %q: %w", d.ID, err))
 		} else if h == nil {
 			bad = append(bad, fmt.Errorf("operation %q: the adapter returned a nil handler", d.ID))
+		}
+	}
+	if !d.Generated && d.Input.Type != nil && len(bad) == 0 {
+		builtin, err := validate.ForOperation(d.Input.Type)
+		switch {
+		case err != nil:
+			bad = append(bad, fmt.Errorf("operation %q: %w", d.ID, err))
+		case builtin != nil:
+			custom := d.Shape
+			d.Shape = builtin
+			if custom != nil {
+				d.Shape = func(ctx context.Context, in any) *op.ValidationError {
+					return builtin(ctx, in).Merge(custom(ctx, in))
+				}
+			}
 		}
 	}
 	for _, err := range bad {

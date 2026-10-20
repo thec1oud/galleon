@@ -6,6 +6,7 @@ package op
 import (
 	"context"
 	"fmt"
+	"io"
 	"reflect"
 	"regexp"
 	"time"
@@ -65,6 +66,21 @@ func (b Topic) String() string { return "topic " + b.Name }
 type TypeInfo struct {
 	Type reflect.Type // the struct type; values travel as pointers to it
 	New  func() any   // returns a new *T
+	// Codecs are codecs made for this type, such as generated reflection-free
+	// ones. Transports prefer them over the app's codecs for their media types.
+	Codecs []Codec
+}
+
+// Codec reads and writes one media type. It is the payload format seam; the
+// codec package has the built-in JSON codec and content negotiation.
+type Codec interface {
+	// MediaType is the type the codec handles, such as "application/json".
+	MediaType() string
+	// Decode reads one value from r into v, a pointer. Bad input is reported
+	// as errs.InvalidArgument with field violations where possible.
+	Decode(r io.Reader, v any, unknown UnknownFields) error
+	// Encode writes v.
+	Encode(w io.Writer, v any) error
 }
 
 // Security declares who may call an operation. An operation must either be
@@ -143,6 +159,9 @@ type Descriptor struct {
 	// Shape and Meaning are the validators for stages 7 and 9, if any.
 	Shape   func(ctx context.Context, in any) *ValidationError
 	Meaning func(ctx context.Context, in any) *ValidationError
+	// Generated means the codecs and validators were generated, so the
+	// kernel adds none of its built-in ones (validate tags, Validate methods).
+	Generated bool
 }
 
 // Definition is anything that yields a descriptor: a Descriptor itself, or a
@@ -199,6 +218,9 @@ func (d *Descriptor) Check() []error {
 	}
 	if d.Input.Type == nil || d.Input.New == nil || d.Output.Type == nil || d.Output.New == nil {
 		errs = append(errs, fmt.Errorf("operation %q: input and output types must be set (use op.TypeOf)", d.ID))
+	}
+	if d.Input.Type != nil && d.Input.Type.Kind() != reflect.Struct {
+		errs = append(errs, fmt.Errorf("operation %q: the input type must be a struct, not %v", d.ID, d.Input.Type))
 	}
 	if d.Adapt == nil {
 		errs = append(errs, fmt.Errorf("operation %q has no handler adapter: build it with op.Unary, or set Adapt to op.Adapter[In, Out]()", d.ID))
