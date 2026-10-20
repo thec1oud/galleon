@@ -142,6 +142,9 @@ type Descriptor struct {
 	// Shape and Meaning are the validators for stages 7 and 9, if any.
 	Shape   func(ctx context.Context, in any) *ValidationError
 	Meaning func(ctx context.Context, in any) *ValidationError
+	// Generated means the codecs and validators were generated, so the
+	// kernel adds none of its built-in ones (validate tags, Validate methods).
+	Generated bool
 }
 
 // Definition is anything that yields a descriptor: a Descriptor itself, or a

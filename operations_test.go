@@ -354,3 +354,43 @@ func TestOperationsCannotBeReplaced(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+type TaggedIn struct {
+	Name string `json:"name" validate:"required"`
+}
+
+func TestBuiltInValidationRunsBeforeCustomValidators(t *testing.T) {
+	custom := op.ValidatorFunc[TaggedIn](func(context.Context, *TaggedIn) *op.ValidationError {
+		return (*op.ValidationError)(nil).Add("/name", "custom", nil)
+	})
+	d := op.Unary[TaggedIn, GreetOut]("greet.tagged").Public().Validate(custom)
+	_, ops := bootOps(t, opsModule(func(r *galleon.Registry) {
+		r.Operation(d, func(context.Context, *TaggedIn) (*GreetOut, error) { return &GreetOut{}, nil })
+	}))
+	_, err := ops.Call(context.Background(), "greet.tagged", &TaggedIn{})
+	fv := errs.From(err).Details[0].(errs.FieldViolations)
+	if len(fv) != 2 || fv[0].Code != "required" || fv[1].Code != "custom" {
+		t.Fatalf("violations: %+v", fv)
+	}
+}
+
+func TestGeneratedDescriptorsGetNoBuiltInValidation(t *testing.T) {
+	d := op.Unary[TaggedIn, GreetOut]("greet.tagged").Public().Describe()
+	d.Generated = true
+	_, ops := bootOps(t, opsModule(func(r *galleon.Registry) {
+		r.Operation(d, func(context.Context, *TaggedIn) (*GreetOut, error) { return &GreetOut{}, nil })
+	}))
+	if _, err := ops.Call(context.Background(), "greet.tagged", &TaggedIn{}); err != nil {
+		t.Fatalf("a generated descriptor brings its own validators, got %v", err)
+	}
+}
+
+type BadTagIn struct {
+	Name string `validate:"sometimes"`
+}
+
+func TestBadValidationTagsFailBoot(t *testing.T) {
+	bootFails(t, `operation "greet.bad": validate: galleon_test.BadTagIn.Name: unknown rule "sometimes"`, opsModule(func(r *galleon.Registry) {
+		r.Operation(op.Unary[BadTagIn, GreetOut]("greet.bad").Public(), func(context.Context, *BadTagIn) (*GreetOut, error) { return nil, nil })
+	}))
+}
