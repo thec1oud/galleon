@@ -201,6 +201,8 @@ func (a *App) compileOperations() {
 	bindings := map[string]claim{}
 	mux := http.NewServeMux()
 	httpOwners := map[string]string{} // pattern -> operation ID
+	httpPaths := map[string]string{}  // HTTP binding path -> operation ID
+	rpcPaths := map[string]string{}   // RPC procedure path -> operation ID
 	needStage := func(o registeredOp, s op.Stage, why string) {
 		if _, ok := a.stageImpls[s]; !ok {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q %s, but no module implements the %v stage", o.module, o.site, o.desc.ID, why, s))
@@ -216,7 +218,11 @@ func (a *App) compileOperations() {
 			if hb, ok := b.(op.HTTP); ok {
 				// ServeMux knows which patterns conflict, so ask it now
 				// rather than when the transport mounts them.
-				if err := probeHTTP(mux, hb); err != nil && !strings.Contains(err.Error(), "conflicts with") {
+				if id, ok := rpcPaths[hb.Path]; ok {
+					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, the path of an RPC procedure of operation %q", o.module, o.site, o.desc.ID, b, id))
+					continue
+				}
+				if err := probePattern(mux, hb.String()); err != nil && !strings.Contains(err.Error(), "conflicts with") {
 					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, which is not a valid pattern: %v", o.module, o.site, o.desc.ID, b, err))
 					continue
 				} else if err != nil {
@@ -224,6 +230,7 @@ func (a *App) compileOperations() {
 					continue
 				}
 				httpOwners[hb.String()] = o.desc.ID
+				httpPaths[hb.Path] = o.desc.ID
 				continue
 			}
 			key := bindingKey(b)
@@ -232,6 +239,24 @@ func (a *App) compileOperations() {
 				continue
 			}
 			bindings[key] = claim{o.desc.ID, o.site}
+			if rb, ok := b.(op.RPC); ok {
+				// The RPC transport serves procedures on the same ServeMux as
+				// HTTP routes, as POSTs, so a binding can't be ambiguous with
+				// one. A POST wildcard over a procedure's path is allowed: the
+				// procedure wins where the rpc role runs, and the wildcard
+				// serves that path on nodes that run only web.
+				path := rb.String()
+				if id, ok := httpPaths[path]; ok {
+					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, whose path operation %q binds over HTTP", o.module, o.site, o.desc.ID, b, id))
+					continue
+				}
+				if err := probePattern(mux, "POST "+path); err != nil {
+					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, whose path %s conflicts with %s", o.module, o.site, o.desc.ID, b, path, httpOwner(err, httpOwners)))
+					continue
+				}
+				rpcPaths[path] = o.desc.ID
+				httpOwners["POST "+path] = o.desc.ID
+			}
 		}
 		sec := o.desc.Security
 		if !sec.Public {
@@ -279,15 +304,15 @@ func (a *App) compileOperations() {
 	}
 }
 
-// probeHTTP registers b on a scratch ServeMux, turning its panic on a
-// conflicting pattern into an error.
-func probeHTTP(mux *http.ServeMux, b op.HTTP) (err error) {
+// probePattern registers pattern on a scratch ServeMux, turning its panic on
+// a malformed or conflicting pattern into an error.
+func probePattern(mux *http.ServeMux, pattern string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%v", r)
 		}
 	}()
-	mux.Handle(b.String(), http.NotFoundHandler())
+	mux.Handle(pattern, http.NotFoundHandler())
 	return nil
 }
 

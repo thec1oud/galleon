@@ -19,24 +19,35 @@ import (
 	"github.com/thec1oud/galleon/op"
 )
 
-// routeAll registers every HTTP binding on a ServeMux, plus a catch-all that
-// answers unknown paths with 404 and wrong methods with 405, as problem+json.
+// routeAll registers every HTTP binding and every RPC procedure it serves on
+// a ServeMux, plus a catch-all that answers unknown paths with 404 and wrong
+// methods with 405, as problem+json.
 func (s *Server) routeAll(ops *galleon.Operations) (_ *http.ServeMux, err error) {
 	mux := http.NewServeMux()
 	var methods []string
 	for _, x := range ops.All() {
-		if !slices.ContainsFunc(x.Desc.Bindings, func(b op.Binding) bool { _, ok := b.(op.HTTP); return ok }) {
-			continue
-		}
-		binder, err := bind.Plan(x.Desc.Input.Type)
-		if err != nil {
-			return nil, fmt.Errorf("http: operation %q (module %q, %s): %w", x.Desc.ID, x.Module, x.Site, err)
+		var binder bind.Func
+		if s.serveHTTP && slices.ContainsFunc(x.Desc.Bindings, func(b op.Binding) bool { _, ok := b.(op.HTTP); return ok }) {
+			// Only HTTP fills inputs from the path, query and headers.
+			if binder, err = bind.Plan(x.Desc.Input.Type); err != nil {
+				return nil, fmt.Errorf("http: operation %q (module %q, %s): %w", x.Desc.ID, x.Module, x.Site, err)
+			}
 		}
 		in := s.codecs.With(x.Desc.Input.Codecs...)
 		out := s.codecs.With(x.Desc.Output.Codecs...)
 		for _, b := range x.Desc.Bindings {
+			if rb, ok := b.(op.RPC); ok && s.serveRPC {
+				if err := handle(mux, "POST "+rb.String(), s.rpcHandler(x, rb, in, out)); err != nil {
+					return nil, fmt.Errorf("rpc: operation %q (module %q, %s): %w", x.Desc.ID, x.Module, x.Site, err)
+				}
+				s.routes = append(s.routes, Route{Method: "RPC", Path: rb.String(), Operation: x.Desc.ID})
+				if !slices.Contains(methods, http.MethodPost) {
+					methods = append(methods, http.MethodPost) // so a GET there is a 405
+				}
+				continue
+			}
 			hb, ok := b.(op.HTTP)
-			if !ok {
+			if !ok || !s.serveHTTP {
 				continue
 			}
 			pattern := hb.Method + " " + hb.Path
@@ -123,7 +134,7 @@ func (h *opHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport: "http",
 		Binding:   h.b,
 		Header:    r.Header,
-		Peer:      h.s.peer(r),
+		Peer:      peerFrom(ctx),
 		Decode:    func(into any) error { return h.decode(w, r, into) },
 	}}
 	out, err := h.x.Invoke(ctx, call)

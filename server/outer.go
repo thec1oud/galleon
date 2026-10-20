@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
@@ -44,6 +45,8 @@ func (s *Server) outer(h http.Handler) http.Handler {
 			id = newRequestID()
 		}
 		ctx = galleon.WithLogAttrs(ctx, slog.String("request_id", id))
+		peer := s.peer(r)
+		ctx = context.WithValue(ctx, peerKey{}, peer)
 		sw := &statusWriter{ResponseWriter: w}
 		hdr := w.Header()
 		hdr.Set("X-Request-Id", id)
@@ -70,7 +73,7 @@ func (s *Server) outer(h http.Handler) http.Handler {
 				span.SetStatus(codes.Error, why)
 			}
 			if s.cfg.AccessLog {
-				s.log.InfoContext(ctx, "http request", "method", r.Method, "path", r.URL.Path, "status", status, "duration", time.Since(start), "peer", s.peer(r), "aborted", aborted)
+				s.log.InfoContext(ctx, "http request", "method", r.Method, "path", r.URL.Path, "status", status, "duration", time.Since(start), "peer", peer, "aborted", aborted)
 			}
 		}
 		defer func() {
@@ -166,6 +169,14 @@ func (s *Server) peer(r *http.Request) string {
 		return ""
 	}
 	return addr.String()
+}
+
+type peerKey struct{}
+
+// peerFrom returns the caller's address the outer middleware worked out.
+func peerFrom(ctx context.Context) string {
+	p, _ := ctx.Value(peerKey{}).(string)
+	return p
 }
 
 func (s *Server) isTrusted(a netip.Addr) bool {

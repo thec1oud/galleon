@@ -118,16 +118,17 @@ func TestAdapterReturnsNilOutputOnError(t *testing.T) {
 
 func TestCheckReportsProblems(t *testing.T) {
 	cases := map[string]op.Descriptor{
-		"dotted lower snake case": op.Unary[In, Out]("Orders").Public().Describe(),
-		"declares no security":    op.Unary[In, Out]("orders.create").Describe(),
-		"is Public but also":      op.Unary[In, Out]("orders.create").Public().Authorize("a").Describe(),
-		"upper-case method and":   op.Unary[In, Out]("orders.create").Public().HTTP("POST", "orders").Describe(),
-		"needs a service":         op.Unary[In, Out]("orders.create").Public().RPC("", "Create").Describe(),
-		"positive limit":          op.Unary[In, Out]("orders.create").Public().RateLimit(0, time.Second).Describe(),
-		"must be a struct":        {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[[]string](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
-		"no handler adapter":      {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}},
-		"input and output types":  {ID: "orders.create", Kind: op.KindUnary, Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
-		"not supported yet":       {ID: "orders.create", Kind: op.KindServerStream, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
+		"dotted lower snake case":  op.Unary[In, Out]("Orders").Public().Describe(),
+		"declares no security":     op.Unary[In, Out]("orders.create").Describe(),
+		"is Public but also":       op.Unary[In, Out]("orders.create").Public().Authorize("a").Describe(),
+		"upper-case method and":    op.Unary[In, Out]("orders.create").Public().HTTP("POST", "orders").Describe(),
+		"needs a protobuf service": op.Unary[In, Out]("orders.create").Public().RPC("", "Create").Describe(),
+		"a method name":            op.Unary[In, Out]("orders.create").Public().RPC("orders.v1.Orders", "Cre/ate").Describe(),
+		"positive limit":           op.Unary[In, Out]("orders.create").Public().RateLimit(0, time.Second).Describe(),
+		"must be a struct":         {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[[]string](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
+		"no handler adapter":       {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}},
+		"input and output types":   {ID: "orders.create", Kind: op.KindUnary, Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
+		"not supported yet":        {ID: "orders.create", Kind: op.KindServerStream, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
 	}
 	for want, d := range cases {
 		var msgs []string
