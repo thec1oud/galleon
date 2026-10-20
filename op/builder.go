@@ -2,6 +2,7 @@ package op
 
 import (
 	"context"
+	"reflect"
 	"time"
 )
 
@@ -159,7 +160,7 @@ func (b *Builder[In, Out]) Meta(key string, v any) *Builder[In, Out] {
 // Validate adds a shape validator (stage 7). It must be pure: no I/O. It
 // panics if v is nil, as the declaration is wrong.
 func (b *Builder[In, Out]) Validate(v Validator[In]) *Builder[In, Out] {
-	if v == nil {
+	if isNil(v) {
 		panic("op: Validate(nil) on operation " + b.d.ID)
 	}
 	b.d.Shape = chainValidators(b.d.Shape, func(ctx context.Context, in any) *ValidationError {
@@ -171,13 +172,26 @@ func (b *Builder[In, Out]) Validate(v Validator[In]) *Builder[In, Out] {
 // ValidateMeaning adds a meaning validator (stage 9), which may read through
 // the read transaction in ctx but must not write. It panics if v is nil.
 func (b *Builder[In, Out]) ValidateMeaning(v MeaningValidator[In]) *Builder[In, Out] {
-	if v == nil {
+	if isNil(v) {
 		panic("op: ValidateMeaning(nil) on operation " + b.d.ID)
 	}
 	b.d.Meaning = chainValidators(b.d.Meaning, func(ctx context.Context, in any) *ValidationError {
 		return v.ValidateMeaning(ctx, in.(*In))
 	})
 	return b
+}
+
+// isNil reports whether v is nil, or a nil func, pointer, map or the like
+// inside an interface, such as ValidatorFunc[In](nil).
+func isNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Func, reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Interface:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // chainValidators runs a then b and merges their violations.

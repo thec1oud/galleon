@@ -275,3 +275,20 @@ func TestValidateNilPanicsAtDeclaration(t *testing.T) {
 	}()
 	op.Unary[In, Out]("orders.create").Validate(nil)
 }
+
+func TestNilValidatorsOfAnyFormPanicAtDeclaration(t *testing.T) {
+	for name, f := range map[string]func(){
+		"typed nil":         func() { op.Unary[In, Out]("o.a").Validate(op.ValidatorFunc[In](nil)) },
+		"meaning nil":       func() { op.Unary[In, Out]("o.a").ValidateMeaning(nil) },
+		"typed meaning nil": func() { op.Unary[In, Out]("o.a").ValidateMeaning(op.MeaningValidatorFunc[In](nil)) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s must panic", name)
+				}
+			}()
+			f()
+		}()
+	}
+}
