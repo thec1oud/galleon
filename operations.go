@@ -242,17 +242,18 @@ func (a *App) compileOperations() {
 			if rb, ok := b.(op.RPC); ok {
 				// The RPC transport serves procedures on the same ServeMux as
 				// HTTP routes, so they can't overlap, whichever roles run.
-				path := "/" + rb.Service + "/" + rb.Method
+				// Unary calls are POSTs, so a GET catch-all doesn't clash.
+				path := rb.String()
 				if id, ok := httpPaths[path]; ok {
 					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, whose path operation %q binds over HTTP", o.module, o.site, o.desc.ID, b, id))
 					continue
 				}
-				if err := probePattern(mux, path); err != nil {
+				if err := probePattern(mux, "POST "+path); err != nil {
 					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, whose path %s conflicts with %s", o.module, o.site, o.desc.ID, b, path, httpOwner(err, httpOwners)))
 					continue
 				}
 				rpcPaths[path] = o.desc.ID
-				httpOwners[path] = o.desc.ID
+				httpOwners["POST "+path] = o.desc.ID
 			}
 		}
 		sec := o.desc.Security

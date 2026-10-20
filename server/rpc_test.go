@@ -502,20 +502,56 @@ func TestGRPCWebErrorDetails(t *testing.T) {
 	}
 }
 
-func TestAWildcardHTTPRouteOverAProcedureFailsBoot(t *testing.T) {
-	for name, roles := range map[string][]galleon.Role{"web": {server.RoleWeb}, "rpc": {server.RoleRPC}} {
-		_, err := galleon.New(
-			galleon.Coordination(local.New()), galleon.Deploy(galleon.SingleNode),
-			galleon.Logger(slog.New(slog.DiscardHandler)), galleon.Roles(roles...),
-			galleon.Modules(galleon.ModuleFunc("greet", func(r *galleon.Registry) error {
-				r.Operation(op.Unary[GreetIn, GreetOut]("greet.any").HTTP("POST", "/greet.v1.Greeter/{m}").Public(), func(context.Context, *GreetIn) (*GreetOut, error) { return nil, nil })
-				r.Operation(greetRPC, func(context.Context, *GreetIn) (*GreetOut, error) { return nil, nil })
-				return nil
-			}), server.Module()),
-		)
-		if err == nil || !strings.Contains(err.Error(), "conflicts with") {
-			t.Errorf("%s role: got %v", name, err)
-		}
+func TestHTTPCatchAllsLeaveProceduresToRPC(t *testing.T) {
+	catchAll := galleon.ModuleFunc("web", func(r *galleon.Registry) error {
+		r.Operation(op.Unary[Empty, GreetOut]("web.index").HTTP("GET", "/{path...}").Public(), func(context.Context, *Empty) (*GreetOut, error) {
+			return &GreetOut{Greeting: "index"}, nil
+		})
+		r.Operation(op.Unary[GreetIn, GreetOut]("web.any").HTTP("POST", "/greet.v1.Greeter/{m}").Public(), func(context.Context, *GreetIn) (*GreetOut, error) {
+			return &GreetOut{Greeting: "http"}, nil
+		})
+		return nil
+	})
+	e := bootRPC(t, nil, catchAll)
+	if out, _, err := greet[GreetIn, GreetOut](e, "Hello", &GreetIn{Name: "ann"}, connect.WithCodec(jsonCodec{})); err != nil || out.Greeting != "hello ann" {
+		t.Fatalf("the procedure must win at its own path: %+v, %v", out, err)
+	}
+	res, err := e.c.Post(e.url+"/greet.v1.Greeter/Other", "application/json", strings.NewReader(`{"name":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if b, _ := io.ReadAll(res.Body); !strings.Contains(string(b), `"http"`) {
+		t.Fatalf("other paths stay with the HTTP route: %d %s", res.StatusCode, b)
+	}
+}
+
+type unencodable struct {
+	C chan int `json:"c"`
+}
+
+func TestAnUnencodableResponseHidesItsCause(t *testing.T) {
+	bad := galleon.ModuleFunc("bad", func(r *galleon.Registry) error {
+		r.Operation(op.Unary[GreetIn, unencodable]("greet.bad").RPC("greet.v1.Greeter", "Bad").Public(), func(context.Context, *GreetIn) (*unencodable, error) {
+			return &unencodable{C: make(chan int)}, nil
+		})
+		return nil
+	})
+	e := bootRPC(t, nil, bad)
+	_, _, err := greet[GreetIn, GreetOut](e, "Bad", &GreetIn{Name: "ann"}, connect.WithCodec(jsonCodec{}), connect.WithGRPC())
+	if connect.CodeOf(err) != connect.CodeInternal || strings.Contains(err.Error(), "chan") {
+		t.Fatalf("got %v", err)
+	}
+	if !strings.Contains(e.logs.String(), "rpc response could not be encoded") {
+		t.Fatalf("the failure must be logged: %s", e.logs)
+	}
+}
+
+func TestAPanicIsLoggedOnce(t *testing.T) {
+	e := bootRPC(t, nil)
+	_, _, _ = greet[GreetIn, GreetOut](e, "Panic", &GreetIn{Name: "ann"}, connect.WithCodec(jsonCodec{}))
+	if n := strings.Count(e.logs.String(), "level=ERROR"); n != 1 {
+		t.Fatalf("logged %d errors: %s", n, e.logs)
 	}
 }
 

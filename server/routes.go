@@ -36,10 +36,10 @@ func (s *Server) routeAll(ops *galleon.Operations) (_ *http.ServeMux, err error)
 		out := s.codecs.With(x.Desc.Output.Codecs...)
 		for _, b := range x.Desc.Bindings {
 			if rb, ok := b.(op.RPC); ok && s.serveRPC {
-				if err := handle(mux, procedure(rb), s.rpcHandler(x, rb, in, out)); err != nil {
+				if err := handle(mux, "POST "+rb.String(), s.rpcHandler(x, rb, in, out)); err != nil {
 					return nil, fmt.Errorf("rpc: operation %q (module %q, %s): %w", x.Desc.ID, x.Module, x.Site, err)
 				}
-				s.routes = append(s.routes, Route{Method: "RPC", Path: procedure(rb), Operation: x.Desc.ID})
+				s.routes = append(s.routes, Route{Method: "RPC", Path: rb.String(), Operation: x.Desc.ID})
 				continue
 			}
 			hb, ok := b.(op.HTTP)
@@ -173,6 +173,11 @@ func (h *opHandler) decode(w http.ResponseWriter, r *http.Request, into any) err
 		}
 		body := http.MaxBytesReader(w, r.Body, limit)
 		if err := dec.Decode(body, into, h.x.Desc.Policies.UnknownFields); err != nil {
+			if r.Context().Err() != nil {
+				// The client went away mid-body. Over HTTP/1 that is the
+				// only way a body ends short, so don't blame its syntax.
+				return errs.Wrap(err, errs.Canceled, "galleon.canceled", "the request was canceled")
+			}
 			return err
 		}
 	}

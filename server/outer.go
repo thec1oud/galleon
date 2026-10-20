@@ -56,46 +56,55 @@ func (s *Server) outer(h http.Handler) http.Handler {
 		r = r.WithContext(ctx)
 
 		// finish records the request's outcome in the span and the access log.
-		finish := func(aborted bool) {
+		// An aborted request that wrote nothing has no status; why describes
+		// a failure the status doesn't.
+		finish := func(aborted bool, why string) {
 			status := sw.status
-			if status == 0 {
+			if status == 0 && !aborted {
 				status = http.StatusOK
 			}
-			span.SetAttributes(semconv.HTTPResponseStatusCode(status))
-			if status >= 500 || aborted {
-				span.SetStatus(codes.Error, http.StatusText(status))
+			if status != 0 {
+				span.SetAttributes(semconv.HTTPResponseStatusCode(status))
+			}
+			if status >= 500 || aborted || why != "" {
+				if why == "" {
+					why = http.StatusText(status)
+				}
+				span.SetStatus(codes.Error, why)
 			}
 			if s.cfg.AccessLog {
 				s.log.InfoContext(ctx, "http request", "method", r.Method, "path", r.URL.Path, "status", status, "duration", time.Since(start), "peer", peer, "aborted", aborted)
 			}
 		}
 		defer func() {
-			if p := recover(); p != nil {
-				if p == http.ErrAbortHandler {
-					finish(true)
-					panic(p)
-				}
-				s.log.ErrorContext(ctx, "panic while serving a request", "method", r.Method, "path", r.URL.Path, "panic", p, "stack", string(debug.Stack()))
-				span.SetStatus(codes.Error, "panic")
-				if sw.wrote {
-					// The response has started, so it can't become an error.
-					// Cut the connection, so the client can't mistake a
-					// truncated response for a whole one.
-					finish(true)
-					panic(http.ErrAbortHandler)
-				}
-				// Drop whatever the handler set, such as Content-Encoding or
-				// Set-Cookie, keeping only the headers set above. Module
-				// middleware's headers, CORS ones included, go too, since a
-				// panic may have left them half set.
-				for k := range hdr {
-					if k != "X-Request-Id" && k != "X-Content-Type-Options" && k != "X-Frame-Options" && k != "Referrer-Policy" {
-						delete(hdr, k)
-					}
-				}
-				s.writeError(sw, r, errs.New(errs.Internal, "galleon.panic", ""), 0)
+			p := recover()
+			if p == nil {
+				finish(false, "")
+				return
 			}
-			finish(false)
+			if p == http.ErrAbortHandler {
+				finish(true, "aborted")
+				panic(p)
+			}
+			s.log.ErrorContext(ctx, "panic while serving a request", "method", r.Method, "path", r.URL.Path, "panic", p, "stack", string(debug.Stack()))
+			if sw.wrote {
+				// The response has started, so it can't become an error.
+				// Cut the connection, so the client can't mistake a
+				// truncated response for a whole one.
+				finish(true, "panic")
+				panic(http.ErrAbortHandler)
+			}
+			// Drop whatever the handler set, such as Content-Encoding or
+			// Set-Cookie, keeping only the headers set above. Module
+			// middleware's headers, CORS ones included, go too, since a
+			// panic may have left them half set.
+			for k := range hdr {
+				if k != "X-Request-Id" && k != "X-Content-Type-Options" && k != "X-Frame-Options" && k != "Referrer-Policy" {
+					delete(hdr, k)
+				}
+			}
+			s.writeError(sw, r, errs.New(errs.Internal, "galleon.panic", ""), 0)
+			finish(false, "panic")
 		}()
 		h.ServeHTTP(sw, r)
 	})
@@ -188,8 +197,9 @@ type statusWriter struct {
 
 func (w *statusWriter) WriteHeader(code int) {
 	// An informational response, such as 103 Early Hints, isn't the final
-	// status, and the response can still become an error after it.
-	if !w.wrote && (code < 100 || code >= 200) {
+	// status, and the response can still become an error after it. 101
+	// Switching Protocols is final: the connection is handed over.
+	if !w.wrote && (code < 100 || code >= 200 || code == http.StatusSwitchingProtocols) {
 		w.status, w.wrote = code, true
 	}
 	w.ResponseWriter.WriteHeader(code)
