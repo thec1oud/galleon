@@ -38,6 +38,9 @@ const ErrorCodeHeader = "Galleon-Error-Code"
 type message struct {
 	decode func(into any) error // set by a codec's Unmarshal
 	out    any                  // set by the handler, encoded by a codec's Marshal
+	// encodeFailed, set by the handler, reports an error encoding out and
+	// gives what the client sees instead.
+	encodeFailed func(error) error
 }
 
 // rpcCodec is a connect-go codec for one operation and one payload format.
@@ -85,7 +88,11 @@ func (c *rpcCodec) Marshal(m any) ([]byte, error) {
 		})
 		return out, err
 	}
-	return c.enc(msg.out)
+	b, err := c.enc(msg.out)
+	if err != nil && msg.encodeFailed != nil {
+		return nil, msg.encodeFailed(err)
+	}
+	return b, err
 }
 
 func (c *rpcCodec) isJSON() bool { return strings.HasPrefix(c.name, "json") }
@@ -262,12 +269,12 @@ func (s *Server) rpcHandler(x *galleon.Operation, b op.RPC, in, out *codec.Set) 
 	// limit, at twice the operation's, bounds that read, compressed bodies
 	// included; the operation's limit itself is checked at the decode stage,
 	// after pre-authorization, with the same error as over HTTP.
-	opts := []connect.HandlerOption{connect.WithReadMaxBytes(int(min(max(2*limit, limit+64<<10), int64(math.MaxInt))))}
+	opts := []connect.HandlerOption{connect.WithReadMaxBytes(readMax(limit))}
 	for _, c := range rpcCodecs(x.Desc, in, out, limit) {
 		opts = append(opts, connect.WithCodec(c))
 	}
 	method := b.Service + "/" + b.Method
-	return connect.NewUnaryHandler(procedure(b), func(ctx context.Context, req *connect.Request[message]) (*connect.Response[message], error) {
+	return connect.NewUnaryHandler(b.String(), func(ctx context.Context, req *connect.Request[message]) (*connect.Response[message], error) {
 		span := trace.SpanFromContext(ctx)
 		system := semconv.RPCSystemNameConnectrpc
 		if p := req.Peer().Protocol; p == connect.ProtocolGRPC || p == connect.ProtocolGRPCWeb {
@@ -302,8 +309,25 @@ func (s *Server) rpcHandler(x *galleon.Operation, b op.RPC, in, out *codec.Set) 
 			return nil, ce
 		}
 		span.SetAttributes(semconv.RPCResponseStatusCode("OK"))
-		return connect.NewResponse(&message{out: res}), nil
+		return connect.NewResponse(&message{out: res, encodeFailed: func(err error) error {
+			// connect-go sends this error's text as Internal, so keep the
+			// cause out of it, as rpcError would.
+			s.log.ErrorContext(ctx, "rpc response could not be encoded", "method", method, "error", err)
+			span.SetAttributes(semconv.RPCResponseStatusCode("INTERNAL"), semconv.ErrorTypeKey.String("INTERNAL"))
+			span.SetStatus(codes.Error, "INTERNAL")
+			return errors.New("the response could not be encoded")
+		}}), nil
 	}, opts...)
+}
+
+// readMax is connect-go's read limit for an operation's body limit: twice it,
+// with at least 64 KiB of slack, without overflowing.
+func readMax(limit int64) int {
+	m := int64(math.MaxInt)
+	if limit < m/2 {
+		m = max(2*limit, limit+64<<10)
+	}
+	return int(min(m, int64(math.MaxInt)))
 }
 
 // invokeRPC runs the pipeline, turning a panic into an Internal error: an RPC
@@ -332,7 +356,6 @@ func serverFault(c connect.Code) bool {
 	return false
 }
 
-func procedure(b op.RPC) string { return "/" + b.Service + "/" + b.Method }
 
 // rpcError renders err as a connect-go error with the gRPC code of its kind,
 // the Galleon code in metadata and the problem details as a
@@ -345,7 +368,7 @@ func (s *Server) rpcError(ctx context.Context, method string, err error) *connec
 	if sc := span.SpanContext(); sc.HasTraceID() {
 		traceID = sc.TraceID().String()
 	}
-	if e.Kind == errs.Internal {
+	if e.Kind == errs.Internal && e.Code != "galleon.panic" { // a panic is logged where it's caught
 		s.log.ErrorContext(ctx, "rpc failed", "method", method, "error", errorText(e))
 		span.SetStatus(codes.Error, e.Code)
 	}
