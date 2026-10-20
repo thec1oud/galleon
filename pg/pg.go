@@ -143,6 +143,10 @@ func (s *settings) defaults() {
 	}
 }
 
+// beforePools runs in New between validating cfg and building the pools'
+// configs. Tests replace it.
+var beforePools = func() {}
+
 // New builds a Manager for cfg. It doesn't connect: Start opens the pools.
 func New(cfg Config, opts ...Option) (*Manager, error) {
 	if cfg.Leaks == "" {
@@ -165,14 +169,25 @@ func New(cfg Config, opts ...Option) (*Manager, error) {
 		leaks:   cfg.Leaks,
 	}
 	m.setTelemetry(s.tp, s.log)
-	add := func(name string, src Source) {
-		pc, _ := src.poolConfig() // Validate has parsed it
+	beforePools()
+	add := func(name string, src Source) error {
+		// Validate parsed it, but parsing reads files, such as an
+		// sslrootcert, that may have changed since.
+		pc, err := src.poolConfig()
+		if err != nil {
+			return fmt.Errorf("pg: source %q: %w", name, err)
+		}
 		pc.ConnConfig.Tracer = &queryTracer{m: m, source: name}
 		m.sources[name] = &source{name: name, config: pc, db: pc.ConnConfig.Database, host: pc.ConnConfig.Host, port: int(pc.ConnConfig.Port)}
+		return nil
 	}
-	add(data.Primary, cfg.Primary)
+	if err := add(data.Primary, cfg.Primary); err != nil {
+		return nil, err
+	}
 	for name, src := range cfg.Named {
-		add(name, src)
+		if err := add(name, src); err != nil {
+			return nil, err
+		}
 	}
 	m.names = sortedNames(cfg)
 	return m, nil

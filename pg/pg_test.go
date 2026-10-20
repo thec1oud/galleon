@@ -277,22 +277,50 @@ func TestRetryPolicyIsBounded(t *testing.T) {
 	}
 }
 
-// Any sslpassword, in the DSN or the environment, keeps application_name
-// out of the summary.
+// An sslpassword that may be set, by the DSN, a service or the
+// environment, keeps application_name out of the summary.
 func TestAnSSLPasswordHidesTheApplicationName(t *testing.T) {
 	cleanPGEnv(t)
-	plain := "postgres://app@db/orders?sslmode=disable&application_name=api"
-	if s := (pg.Source{DSN: plain}).String(); !strings.Contains(s, "application_name=api") {
-		t.Fatalf("without an sslpassword: %s", s)
+	// Not under t.TempDir, whose path holds the test's name, and so the
+	// word sslpassword.
+	dir, err := os.MkdirTemp("", "galleon-pg")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, dsn := range []string{plain + "&ss%6Cpassword=x", plain + "&SSLPASSWORD=x"} {
-		if s := (pg.Source{DSN: dsn}).String(); strings.Contains(s, "application_name") {
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	services := filepath.Join(dir, "pg_service.conf")
+	if err := os.WriteFile(services, []byte("[orders]\nhost=db\nsslpassword=x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url := "postgres://app@db/orders?sslmode=disable&application_name=api"
+	kv := "host=db user=app dbname=orders sslmode=disable application_name=api"
+	shown := map[string]bool{
+		url: true,
+		kv:  true,
+		// pgx's keys are case-sensitive: this is a runtime parameter.
+		url + "&SSLPASSWORD=x":                               true,
+		kv + " SSLPASSWORD=x":                                true,
+		url + "&ss%6Cpassword=x":                             false,
+		url + "&sslpassword=x":                               false,
+		url + "&servicefile=" + services + "&service=orders": false,
+		kv + " sslpassword=x":                                false,
+		kv + " servicefile=" + services + " service=orders":  false,
+	}
+	for dsn, want := range shown {
+		s := (pg.Source{DSN: dsn}).String()
+		if strings.Contains(s, "<invalid DSN>") {
+			t.Errorf("%q didn't parse", dsn)
+		} else if got := strings.Contains(s, "application_name=api"); got != want {
 			t.Errorf("%q prints as %s", dsn, s)
 		}
 	}
-	t.Setenv("PGSSLPASSWORD", "x")
-	if s := (pg.Source{DSN: plain}).String(); strings.Contains(s, "application_name") {
-		t.Errorf("with PGSSLPASSWORD set: %s", s)
+	for _, env := range [][2]string{{"PGSSLPASSWORD", "x"}, {"PGSERVICEFILE", services}} {
+		t.Run(env[0], func(t *testing.T) {
+			t.Setenv(env[0], env[1])
+			if s := (pg.Source{DSN: url}).String(); strings.Contains(s, "application_name") {
+				t.Errorf("with %s set: %s", env[0], s)
+			}
+		})
 	}
 }
 
@@ -322,6 +350,7 @@ func TestRevalidatingASourceRebuildsItsSummary(t *testing.T) {
 
 // New works on its own copy of the config, so one Config can be shared.
 func TestNewDoesNotWriteToItsConfig(t *testing.T) {
+	cleanPGEnv(t)
 	cfg := pg.Config{
 		Primary: pg.Source{DSN: "postgres://app@db/orders"},
 		Named: map[string]pg.Source{

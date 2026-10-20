@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
+	"github.com/thec1oud/galleon/internal/dsn"
 )
 
 // Config is the "pg" config section.
@@ -94,19 +95,39 @@ func (s Source) dsnSummary() string {
 	return summarize(c, s.DSN)
 }
 
-// setsSSLPassword reports whether s, or the environment, sets any
-// sslpassword, which pgx doesn't expose. Its key is looked for in s as
-// written and as unescaped.
-func setsSSLPassword(s string) bool {
-	if os.Getenv("PGSSLPASSWORD") != "" {
-		return true
+// keywordKey is a key of a keyword/value DSN, or text that looks like one
+// inside a quoted value, which only makes the check below stricter.
+var keywordKey = regexp.MustCompile(`([A-Za-z_]+)\s*=`)
+
+// maySetSSLPassword reports whether an sslpassword may be set for s, which
+// pgx doesn't expose: s has an sslpassword key, or names a service, whose
+// file may set one, or the environment sets either. Keys are matched as
+// pgx matches them, decoded and case-sensitive; a key that can't be
+// decoded counts as a match.
+func maySetSSLPassword(s string) bool {
+	for _, v := range []string{"PGSSLPASSWORD", "PGSERVICE", "PGSERVICEFILE"} {
+		if os.Getenv(v) != "" {
+			return true
+		}
 	}
-	forms := []string{s}
-	if u, err := url.PathUnescape(s); err == nil {
-		forms = append(forms, u)
+	risky := func(key string) bool { return key == "sslpassword" || key == "service" || key == "servicefile" }
+	if !dsn.IsURL(s) {
+		for _, m := range keywordKey.FindAllStringSubmatch(s, -1) {
+			if risky(m[1]) {
+				return true
+			}
+		}
+		return false
 	}
-	for _, f := range forms {
-		if strings.Contains(strings.ToLower(f), "sslpassword") {
+	// Every '?'- or '&'-separated part with an '=', wherever pgx might
+	// take the query to start.
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '?' || r == '&' }) {
+		k, _, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		key, err := url.QueryUnescape(k)
+		if err != nil || risky(key) {
 			return true
 		}
 	}
@@ -119,7 +140,8 @@ func setsSSLPassword(s string) bool {
 // allowlist: application_name, connect_timeout, and tls, which says how
 // TLS is used (off, allowed, preferred, required, verified-ca or verified)
 // since pgx keeps sslmode itself only as its effect. An application_name
-// is left out if it holds the password, or if an sslpassword is set at all. The
+// is left out if it holds the password, or if an sslpassword may be set at
+// all (see maySetSSLPassword). The
 // hosts are the others pgx would try.
 func summarize(c *pgconn.Config, s string) string {
 	// An '@' in what pgx reads as the user, host or database is most
@@ -147,7 +169,7 @@ func summarize(c *pgconn.Config, s string) string {
 		}
 	}
 	params := url.Values{}
-	if v := c.RuntimeParams["application_name"]; v != "" && (c.Password == "" || !strings.Contains(v, c.Password)) && !setsSSLPassword(s) {
+	if v := c.RuntimeParams["application_name"]; v != "" && (c.Password == "" || !strings.Contains(v, c.Password)) && !maySetSSLPassword(s) {
 		params.Set("application_name", v)
 	}
 	if c.ConnectTimeout > 0 {
