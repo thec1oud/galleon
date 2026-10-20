@@ -359,10 +359,23 @@ func (b noCounters) Capabilities() coord.Capabilities {
 
 func TestRateLimitNeedsTheCountersCapability(t *testing.T) {
 	limited := op.Unary[GreetIn, GreetOut]("greet.hello").Public().RateLimit(2, time.Hour)
-	opts := append(base(opsModule(func(r *galleon.Registry) { r.Operation(limited, greet) })), galleon.Coordination(noCounters{local.New()}))
+	other := op.Unary[GreetIn, GreetOut]("greet.other").Public().RateLimit(2, time.Hour)
+	opts := append(base(opsModule(func(r *galleon.Registry) { r.Operation(limited, greet); r.Operation(other, greet) })), galleon.Coordination(noCounters{local.New()}))
 	_, err := galleon.New(opts...)
 	if err == nil || !strings.Contains(err.Error(), "counters") {
 		t.Fatalf("want a boot error about counters, got %v", err)
+	}
+	if n := strings.Count(err.Error(), "counters"); n != 1 {
+		t.Fatalf("a module needs the capability once, however many operations it limits; got %d mentions: %v", n, err)
+	}
+}
+
+func TestAnAdapterReturningNoHandlerFailsBoot(t *testing.T) {
+	d := op.Unary[GreetIn, GreetOut]("greet.nil").Public().Describe()
+	d.Adapt = func(any) (op.Handler, error) { return nil, nil }
+	_, err := galleon.New(base(opsModule(func(r *galleon.Registry) { r.Operation(&d, greet) }))...)
+	if err == nil || !strings.Contains(err.Error(), "nil handler") {
+		t.Fatalf("got %v", err)
 	}
 }
 

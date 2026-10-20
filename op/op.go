@@ -206,7 +206,7 @@ func (d *Descriptor) Check() []error {
 	s := d.Security
 	switch {
 	case !s.Public && s.Action == "":
-		errs = append(errs, fmt.Errorf("operation %q declares no security: call Public() or Authorize(action, ...)", d.ID))
+		errs = append(errs, fmt.Errorf("operation %q declares no security: call Public(), Authorize(action) or AuthorizeResource(action, resource)", d.ID))
 	case s.Public && (s.Action != "" || s.Resource != nil || len(s.Contexts) > 0):
 		errs = append(errs, fmt.Errorf("operation %q is Public but also declares authorization or contexts", d.ID))
 	}
