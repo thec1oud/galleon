@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
 
@@ -165,10 +166,11 @@ func (h *opHandler) decode(w http.ResponseWriter, r *http.Request, into any) err
 		}
 		body := http.MaxBytesReader(w, r.Body, limit)
 		if err := dec.Decode(body, into, h.x.Desc.Policies.UnknownFields); err != nil {
-			if r.Context().Err() != nil {
+			if r.Context().Err() != nil && !timedOut(err) {
 				// The client went away mid-body. Over HTTP/1 that is the
-				// only way a body ends short, so don't blame its syntax.
-				return errs.Wrap(err, errs.Canceled, "galleon.canceled", "the request was canceled")
+				// only way a body ends short, so don't blame its syntax. A
+				// read timeout cancels the request too, but that one is ours.
+				return errs.Wrap(err, errs.Canceled, "galleon.body_read", "reading the request body was canceled")
 			}
 			return err
 		}
@@ -179,6 +181,11 @@ func (h *opHandler) decode(w http.ResponseWriter, r *http.Request, into any) err
 		}
 	}
 	return nil
+}
+
+func timedOut(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func hasBody(r *http.Request) bool {
