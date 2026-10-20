@@ -82,6 +82,8 @@ func (r *Registry) Operation(def op.Definition, handler any) {
 			bad = append(bad, fmt.Errorf("operation %q: %w", d.ID, err))
 		} else if h, err = d.Adapt(handler); err != nil {
 			bad = append(bad, fmt.Errorf("operation %q: %w", d.ID, err))
+		} else if h == nil {
+			bad = append(bad, fmt.Errorf("operation %q: the adapter returned a nil handler", d.ID))
 		}
 	}
 	if !d.Generated && d.Input.Type != nil && len(bad) == 0 {
@@ -105,8 +107,9 @@ func (r *Registry) Operation(def op.Definition, handler any) {
 	if len(bad) > 0 {
 		return
 	}
-	if d.Policies.RateLimit != nil {
+	if d.Policies.RateLimit != nil && !r.needsCounters {
 		r.Needs(coord.CountersCap)
+		r.needsCounters = true
 	}
 	r.app.ops = append(r.app.ops, registeredOp{desc: d, handler: h, module: r.module, site: callerSite(2)})
 }
@@ -213,7 +216,10 @@ func (a *App) compileOperations() {
 			if hb, ok := b.(op.HTTP); ok {
 				// ServeMux knows which patterns conflict, so ask it now
 				// rather than when the transport mounts them.
-				if err := probeHTTP(mux, hb); err != nil {
+				if err := probeHTTP(mux, hb); err != nil && !strings.Contains(err.Error(), "conflicts with") {
+					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, which is not a valid pattern: %v", o.module, o.site, o.desc.ID, b, err))
+					continue
+				} else if err != nil {
 					a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q binds %v, which conflicts with %s", o.module, o.site, o.desc.ID, b, httpOwner(err, httpOwners)))
 					continue
 				}

@@ -109,6 +109,9 @@ func TestRegistrationErrorsFailBoot(t *testing.T) {
 			r.Operation(op.Unary[GreetIn, GreetOut]("greet.other").HTTP("POST", "/hello").Public(), greet)
 		},
 		"the definition is nil": func(r *galleon.Registry) { r.Operation(nil, greet) },
+		"binds GET /o/{id, which is not a valid pattern": func(r *galleon.Registry) {
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.bad").HTTP("GET", "/o/{id").Public(), greet)
+		},
 		"binds GET /a/b/{y}, which conflicts with GET /a/{x}/b": func(r *galleon.Registry) {
 			r.Operation(op.Unary[GreetIn, GreetOut]("greet.a").HTTP("GET", "/a/{x}/b").Public(), greet)
 			r.Operation(op.Unary[GreetIn, GreetOut]("greet.b").HTTP("GET", "/a/b/{y}").Public(), greet)
@@ -174,7 +177,7 @@ func TestErrorsNameTheModuleAndSite(t *testing.T) {
 }
 
 func TestNonPublicOperationsNeedAuthorization(t *testing.T) {
-	secured := op.Unary[GreetIn, GreetOut]("greet.secret").Authorize("greet:secret", op.Resource("org", "org_id")).Contexts("org").Schemes("bearer")
+	secured := op.Unary[GreetIn, GreetOut]("greet.secret").AuthorizeResource("greet:secret", op.Resource("org", "org_id")).Contexts("org").Schemes("bearer")
 	mod := opsModule(func(r *galleon.Registry) { r.Operation(secured, greet) })
 	for _, want := range []string{
 		"no module implements the pre_authorize stage",
@@ -227,7 +230,7 @@ func TestPreAuthorizeRunsBeforeDecodeAndShapeBeforeAuthorize(t *testing.T) {
 		log = append(log, "meaning")
 		return nil
 	})
-	d := op.Unary[GreetIn, GreetOut]("greet.secret").Authorize("greet:secret", op.Resource("org", "id")).Validate(shape).ValidateMeaning(meaning)
+	d := op.Unary[GreetIn, GreetOut]("greet.secret").AuthorizeResource("greet:secret", op.Resource("org", "id")).Validate(shape).ValidateMeaning(meaning)
 	mod := opsModule(func(r *galleon.Registry) {
 		r.Operation(d, func(ctx context.Context, in *GreetIn) (*GreetOut, error) {
 			log = append(log, "handle")

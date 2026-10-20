@@ -281,3 +281,26 @@ func TestRulesSkipEmptyStrings(t *testing.T) {
 		t.Fatalf("an empty optional string passes every rule but required, and json:\"-,\" names a field \"-\": %v", got)
 	}
 }
+
+func TestRulesRejectPointersToPointers(t *testing.T) {
+	_, err := validate.Plan(reflect.TypeFor[struct {
+		N **int `validate:"min=1"`
+	}]())
+	if err == nil {
+		t.Fatal("a rule on **int must fail boot")
+	}
+}
+
+func TestPointerToEmptyStringIsChecked(t *testing.T) {
+	type T struct {
+		E *string `json:"e" validate:"email"`
+	}
+	f, err := validate.Plan(reflect.TypeFor[T]())
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := ""
+	if ve := f(&T{E: &empty}); ve == nil {
+		t.Fatal("a pointer to \"\" was sent and must be checked")
+	}
+}

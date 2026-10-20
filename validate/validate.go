@@ -324,8 +324,12 @@ func escape(s string) string {
 func parseChecks(sf reflect.StructField) ([]check, error) {
 	var out []check
 	t := sf.Type
-	for t.Kind() == reflect.Pointer {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	_, hasPattern := sf.Tag.Lookup("pattern")
+	if t.Kind() == reflect.Pointer && (sf.Tag.Get("validate") != "" || hasPattern) {
+		return nil, fmt.Errorf("rules apply to a value or a pointer to one, not %v", sf.Type)
 	}
 	if tag := sf.Tag.Get("validate"); tag != "" {
 		for _, rule := range strings.Split(tag, ",") {
@@ -400,7 +404,7 @@ func makeCheck(name, arg string, hasArg bool, t reflect.Type) (check, error) {
 			return check{}, fmt.Errorf("%s applies to strings, not %v", name, t)
 		}
 		fn := map[string]func(string) bool{"email": isEmail, "uuid": isUUID, "url": isURL}[name]
-		return check{code: name, fn: func(v reflect.Value) bool { return v.String() == "" || fn(v.String()) }}, nil
+		return check{code: name, fn: func(v reflect.Value) bool { return fn(v.String()) }}, nil
 	}
 	return check{}, fmt.Errorf("unknown rule %q", name)
 }
