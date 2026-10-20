@@ -356,7 +356,6 @@ func serverFault(c connect.Code) bool {
 	return false
 }
 
-
 // rpcError renders err as a connect-go error with the gRPC code of its kind,
 // the Galleon code in metadata and the problem details as a
 // google.protobuf.Struct detail. An Internal error is logged and shows clients
