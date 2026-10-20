@@ -356,3 +356,31 @@ func TestReplaceRefusesKernelValuesAndDuplicates(t *testing.T) {
 		t.Fatalf("a nil replacement should fail boot, got %v", err)
 	}
 }
+
+func TestRegistryFatalStopsTheApp(t *testing.T) {
+	var reg *galleon.Registry
+	app, err := galleon.New(base(galleon.ModuleFunc("listener", func(r *galleon.Registry) error {
+		reg = r
+		return nil
+	}))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx) }()
+	for app.Ready(ctx) != nil {
+		if ctx.Err() != nil {
+			t.Fatal("the app never became ready")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	reg.Fatal(errors.New("listener died"))
+	if err := app.Ready(ctx); err == nil {
+		t.Fatal("readiness must fail after Fatal")
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), `module "listener": listener died`) {
+		t.Fatalf("Run must return the fatal error, got %v", err)
+	}
+}

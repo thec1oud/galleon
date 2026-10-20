@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"slices"
 	"strconv"
@@ -77,17 +79,26 @@ func (r *readErr) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// failure returns the read error as an Unavailable error, or nil when the body
-// was read without one or only went over the body limit.
+// failure classifies the read error, or returns nil when the body was read
+// without one or only went over the body limit. A network failure, timeouts
+// included, is Unavailable; a canceled request is Canceled; anything else,
+// such as a body shorter than its Content-Length or broken chunked encoding,
+// is the client's malformed request.
 func (r *readErr) failure() error {
-	var tooBig *http.MaxBytesError
-	if r.err == nil || errors.As(r.err, &tooBig) {
+	var (
+		tooBig *http.MaxBytesError
+		netErr net.Error
+	)
+	switch {
+	case r.err == nil || errors.As(r.err, &tooBig):
 		return nil
-	}
-	if errors.Is(r.err, context.Canceled) {
+	case errors.Is(r.err, context.Canceled):
 		return errs.Wrap(r.err, errs.Canceled, "galleon.body_read", "reading the request body was canceled")
+	case errors.As(r.err, &netErr), errors.Is(r.err, os.ErrDeadlineExceeded), errors.Is(r.err, context.DeadlineExceeded):
+		return errs.Wrap(r.err, errs.Unavailable, "galleon.body_read", "the request body could not be read")
 	}
-	return errs.Wrap(r.err, errs.Unavailable, "galleon.body_read", "the request body could not be read")
+	return errs.Wrap(r.err, errs.InvalidArgument, "galleon.body_read", "the request body is malformed",
+		errs.FieldViolations{{Path: "", Code: "body_read", MsgKey: "validation.body_read"}})
 }
 
 // jsonError turns an encoding/json error into an InvalidArgument error with a

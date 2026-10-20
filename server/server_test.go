@@ -566,3 +566,57 @@ func TestUnixSocketReplacesAStaleFile(t *testing.T) {
 		t.Fatal("the forwarded address must key the rate limit")
 	}
 }
+
+func TestPanicAfterEarlyHintsIsStillAnError(t *testing.T) {
+	mw := galleon.ModuleFunc("hints", func(r *galleon.Registry) error {
+		r.Middleware(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Link", "</style.css>; rel=preload")
+				w.WriteHeader(http.StatusEarlyHints)
+				panic("boom")
+			})
+		})
+		return nil
+	})
+	e := boot(t, "", mw)
+	res, err := http.Get("http://" + listening(t, e) + "/orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 500 {
+		t.Fatalf("got %d", res.StatusCode)
+	}
+}
+
+func TestUnixSocketInUseIsLeftAlone(t *testing.T) {
+	dir, err := os.MkdirTemp("", "gs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "s.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	app, err := galleon.New(
+		galleon.Coordination(local.New()), galleon.Deploy(galleon.SingleNode),
+		galleon.Logger(slog.New(slog.DiscardHandler)), galleon.DrainGrace(0),
+		galleon.ConfigJSON([]byte(`{"http":{"addr":"unix:`+path+`"}}`)), galleon.Modules(server.Module()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := app.Run(ctx); err == nil || !strings.Contains(err.Error(), "in use by another process") {
+		t.Fatalf("got %v", err)
+	}
+	c, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("the other process's socket must survive: %v", err)
+	}
+	c.Close()
+}

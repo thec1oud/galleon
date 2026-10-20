@@ -7,6 +7,9 @@
 //
 //	galleon.New(..., galleon.Modules(server.Module()))
 //
+// An HTTP binding's path is a ServeMux pattern, so "GET /" matches every GET
+// path the other routes don't; "GET /{$}" matches only the root.
+//
 // The listener opens once the app is ready (OnReady), so a new generation
 // under a supervisor gets no connections before it can serve them, and closes
 // when draining begins (OnDrain).
@@ -25,6 +28,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -290,9 +294,15 @@ func removeStaleSocket(path string) error {
 	if err != nil || fi.Mode()&os.ModeSocket == 0 {
 		return nil // nothing there, or not a socket: let the bind report it
 	}
-	if c, err := net.DialTimeout("unix", path, time.Second); err == nil {
+	c, err := net.DialTimeout("unix", path, time.Second)
+	if err == nil {
 		c.Close()
 		return fmt.Errorf("%s is in use by another process", path)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		// A full backlog, a permission problem or a timeout doesn't mean
+		// nobody owns the socket, so leave it and let the bind report it.
+		return nil
 	}
 	return os.Remove(path)
 }

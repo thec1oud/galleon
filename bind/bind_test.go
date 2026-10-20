@@ -148,3 +148,23 @@ func TestPlanRejectsEmbeddedPointersWithParameters(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+type Node struct {
+	*Node
+	ID string `json:"id"`
+}
+
+type MutualA struct{ *MutualB }
+type MutualB struct {
+	*MutualA
+	X string `query:"x"`
+}
+
+func TestPlanHandlesTypesThatEmbedThemselves(t *testing.T) {
+	if b, err := bind.Plan(reflect.TypeFor[Node]()); err != nil || b != nil {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := bind.Plan(reflect.TypeFor[MutualA]()); err == nil || !strings.Contains(err.Error(), "embed") {
+		t.Fatalf("an embedded pointer with parameters further down fails boot: %v", err)
+	}
+}

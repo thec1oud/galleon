@@ -76,6 +76,33 @@ func Plan(t reflect.Type) (Func, error) {
 	}, nil
 }
 
+// hasParams reports whether t, or a struct embedded in it at any depth, has a
+// parameter tag. seen stops it at types that embed themselves through
+// pointers.
+func hasParams(t reflect.Type, seen map[reflect.Type]bool) bool {
+	if seen[t] {
+		return false
+	}
+	seen[t] = true
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		for _, k := range []kind{fromPath, fromQuery, fromHeader} {
+			if sf.Tag.Get(k.tag()) != "" {
+				return true
+			}
+		}
+		if ft := sf.Type; sf.Anonymous {
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct && hasParams(ft, seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // planFields plans the parameter fields of t, and of structs embedded in it,
 // whose fields Go promotes. index is the path to t from the planned type.
 func planFields(t reflect.Type, index []int) ([]field, error) {
@@ -92,7 +119,7 @@ func planFields(t reflect.Type, index []int) ([]field, error) {
 		}
 		if sf.Anonymous && sf.Type.Kind() == reflect.Pointer && sf.Type.Elem().Kind() == reflect.Struct {
 			// Filling one would mean allocating it on every call; embed it by value.
-			if inner, err := planFields(sf.Type.Elem(), nil); err != nil || len(inner) > 0 {
+			if hasParams(sf.Type.Elem(), map[reflect.Type]bool{}) {
 				return nil, fmt.Errorf("bind: %v.%s is an embedded pointer with parameter fields; embed %v by value", t, sf.Name, sf.Type.Elem())
 			}
 			continue
