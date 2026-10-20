@@ -1,7 +1,6 @@
 package pg
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -10,13 +9,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
+	"github.com/thec1oud/galleon/internal/dsn"
 )
 
 // Config is the "pg" config section.
@@ -61,6 +60,9 @@ type Source struct {
 	// pgx's defaults of an hour and 30 minutes.
 	MaxConnLifetime time.Duration `json:"max_conn_lifetime"`
 	MaxConnIdleTime time.Duration `json:"max_conn_idle_time"`
+
+	// summary is what String shows of the DSN, set by validation.
+	summary string
 }
 
 // String describes the source for a config report. It never shows the
@@ -69,7 +71,7 @@ type Source struct {
 // that hold no secret (see summarize).
 func (s Source) String() string {
 	return fmt.Sprintf("{dsn:%s max_conns:%d min_conns:%d connect_timeout:%v max_conn_lifetime:%v max_conn_idle_time:%v}",
-		summary(s.DSN), s.MaxConns, s.MinConns, s.ConnectTimeout, s.MaxConnLifetime, s.MaxConnIdleTime)
+		s.dsnSummary(), s.MaxConns, s.MinConns, s.ConnectTimeout, s.MaxConnLifetime, s.MaxConnIdleTime)
 }
 
 // invalidDSN stands in for a DSN pgx can't parse, and ambiguousDSN for one
@@ -79,30 +81,61 @@ const (
 	ambiguousDSN = "<ambiguous DSN>"
 )
 
-// summaries caches summarize's result by a hash of the DSN, so parsing,
-// which may read files such as a password file, happens once per DSN.
-var summaries sync.Map // [sha256.Size]byte -> string
-
-func summary(s string) string {
-	key := sha256.Sum256([]byte(s))
-	if v, ok := summaries.Load(key); ok {
-		return v.(string)
+// dsnSummary is the summary validation made, or, for a Source never
+// validated, one made now.
+func (s Source) dsnSummary() string {
+	if s.summary != "" {
+		return s.summary
 	}
-	v, _ := summaries.LoadOrStore(key, summarize(s))
-	return v.(string)
-}
-
-// summarize describes s from what pgconn.ParseConfig reads from it, as
-// postgres://user@host:port/database?settings +N hosts. The settings are an
-// allowlist: application_name, connect_timeout, and tls, which says how TLS is used (off, allowed,
-// preferred, required or verified) since pgx keeps sslmode itself only as
-// its effect. A setting whose value holds the password is left out. The
-// hosts are the others pgx would try.
-func summarize(s string) string {
-	c, err := pgconn.ParseConfig(s)
+	c, err := pgconn.ParseConfig(s.DSN)
 	if err != nil {
 		return invalidDSN
 	}
+	return summarize(c, s.DSN)
+}
+
+// holdsSecret reports whether v contains any of the non-empty secrets.
+func holdsSecret(v string, secrets ...string) bool {
+	for _, s := range secrets {
+		if s != "" && strings.Contains(v, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// sslPasswordKV is a keyword/value sslpassword setting, quoted or not.
+var sslPasswordKV = regexp.MustCompile(`(?:^|\s)sslpassword\s*=\s*(?:'((?:[^'\\]|\\.)*)'|(\S+))`)
+
+// sslPassword is the sslpassword s sets, which pgx doesn't expose: a
+// simple lookup, good enough to keep it out of the summary.
+func sslPassword(s string) string {
+	if dsn.IsURL(s) {
+		if u, err := url.Parse(strings.TrimSpace(s)); err == nil {
+			return u.Query().Get("sslpassword")
+		}
+		return ""
+	}
+	m := sslPasswordKV.FindStringSubmatch(s)
+	switch {
+	case m == nil:
+		return ""
+	case m[2] != "":
+		return m[2]
+	default:
+		return strings.NewReplacer(`\'`, `'`, `\\`, `\`).Replace(m[1])
+	}
+}
+
+// summarize describes c, parsed from s, as what pgconn.ParseConfig reads
+// from it, as
+// postgres://user@host:port/database?settings +N hosts. The settings are an
+// allowlist: application_name, connect_timeout, and tls, which says how
+// TLS is used (off, allowed, preferred, required, verified-ca or verified)
+// since pgx keeps sslmode itself only as its effect. An application_name
+// that holds the password or the sslpassword is left out. The
+// hosts are the others pgx would try.
+func summarize(c *pgconn.Config, s string) string {
 	// An '@' in what pgx reads as the user, host or database is most
 	// likely a password with an unescaped '/' or '@' that the URL split
 	// elsewhere, as in postgres://app:5432/secret@db/orders.
@@ -128,7 +161,7 @@ func summarize(s string) string {
 		}
 	}
 	params := url.Values{}
-	if v := c.RuntimeParams["application_name"]; v != "" && (c.Password == "" || !strings.Contains(v, c.Password)) {
+	if v := c.RuntimeParams["application_name"]; v != "" && !holdsSecret(v, c.Password, sslPassword(s)) {
 		params.Set("application_name", v)
 	}
 	if c.ConnectTimeout > 0 {
@@ -141,6 +174,10 @@ func summarize(s string) string {
 		params.Set("tls", "allowed")
 	case plainLater:
 		params.Set("tls", "preferred")
+	case c.TLSConfig.InsecureSkipVerify && c.TLSConfig.VerifyPeerCertificate != nil:
+		// verify-ca, or require with an sslrootcert, which libpq treats
+		// as verify-ca: the certificate is checked, the host name isn't.
+		params.Set("tls", "verified-ca")
 	case c.TLSConfig.InsecureSkipVerify:
 		params.Set("tls", "required")
 	default:
@@ -188,9 +225,11 @@ func (c *Config) Validate() error {
 		case !sourceName.MatchString(name):
 			errs = append(errs, fmt.Errorf("named: source name %q must be lower snake case", name))
 		}
-		if err := c.Named[name].validate(); err != nil {
+		src := c.Named[name]
+		if err := src.validate(); err != nil {
 			errs = append(errs, fmt.Errorf("named %q: %w", name, err))
 		}
+		c.Named[name] = src
 	}
 	if c.RetryAttempts < 0 || c.RetryBackoff < 0 || c.RetryBackoffMax < 0 {
 		errs = append(errs, errors.New("retry_attempts, retry_backoff and retry_backoff_max must not be negative"))
@@ -201,7 +240,7 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-func (s Source) validate() error {
+func (s *Source) validate() error {
 	if strings.TrimSpace(s.DSN) == "" {
 		return errors.New(`dsn must be set ("postgres://" takes everything from the PG* environment variables)`)
 	}
@@ -211,21 +250,30 @@ func (s Source) validate() error {
 	if s.ConnectTimeout < 0 || s.MaxConnLifetime < 0 || s.MaxConnIdleTime < 0 {
 		return errors.New("timeouts must not be negative")
 	}
-	if _, err := s.poolConfig(); err != nil {
+	_, summary, err := s.parse()
+	if err != nil {
 		return err
 	}
-	summary(s.DSN) // parsed now, not when the config is first reported
+	s.summary = summary
 	return nil
 }
 
 // poolConfig parses the DSN and applies the source's settings.
 func (s Source) poolConfig() (*pgxpool.Config, error) {
+	pc, _, err := s.parse()
+	return pc, err
+}
+
+// parse parses the DSN and applies the source's settings, and summarizes
+// the DSN as parsed, before those settings.
+func (s Source) parse() (*pgxpool.Config, string, error) {
 	pc, err := pgxpool.ParseConfig(s.DSN)
 	if err != nil {
 		// pgx masks passwords in its message only on a best-effort basis
 		// for malformed input, so none of it is repeated.
-		return nil, errors.New("dsn can't be parsed: check its syntax")
+		return nil, "", errors.New("dsn can't be parsed: check its syntax")
 	}
+	summary := summarize(&pc.ConnConfig.Config, s.DSN)
 	if s.MaxConns > 0 {
 		pc.MaxConns = s.MaxConns
 	}
@@ -242,9 +290,9 @@ func (s Source) poolConfig() (*pgxpool.Config, error) {
 		pc.MaxConnIdleTime = s.MaxConnIdleTime
 	}
 	if pc.MinConns > pc.MaxConns {
-		return nil, fmt.Errorf("min_conns (%d) exceeds the pool's max_conns (%d)", pc.MinConns, pc.MaxConns)
+		return nil, "", fmt.Errorf("min_conns (%d) exceeds the pool's max_conns (%d)", pc.MinConns, pc.MaxConns)
 	}
-	return pc, nil
+	return pc, summary, nil
 }
 
 func (c *Config) retryPolicy() data.RetryPolicy {

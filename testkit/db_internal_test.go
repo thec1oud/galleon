@@ -384,3 +384,23 @@ func TestLiveMarksAreCheckedAtMostSoOften(t *testing.T) {
 		t.Errorf("%s isn't marked live", first)
 	}
 }
+
+// With no live marks' connection at all, as after a failed reconnect, a
+// recent check doesn't excuse a package database from making one.
+func TestNoLiveMarksConnectionIsNeverTakenAsChecked(t *testing.T) {
+	f := fresh(t)
+	first := f.mustRun(t)
+	liveCheckEvery = time.Hour
+	killLive(t, f.conn, first)
+	packageDBs.mu.Lock()
+	packageDBs.live.Close(context.Background())
+	packageDBs.live = nil
+	packageDBs.checked = time.Now()
+	packageDBs.mu.Unlock()
+	if _, err := f.again(t); err != nil {
+		t.Fatal(err)
+	}
+	if !held(t, f.conn, first) {
+		t.Errorf("%s isn't marked live", first)
+	}
+}

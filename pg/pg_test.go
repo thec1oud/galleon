@@ -2,11 +2,21 @@ package pg_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -48,6 +58,7 @@ func TestConfigIsValidated(t *testing.T) {
 // Every DSN that leaked through masking its text: none of what pgx reads as
 // the password shows, and nothing needed masking.
 func TestSourcesNeverShowTheirPasswords(t *testing.T) {
+	cleanPGEnv(t)
 	for _, dsn := range []string{
 		"postgres://app:hunter2@db/orders",
 		"postgres://app@db/orders?password=hunter2",
@@ -96,10 +107,51 @@ func TestSourcesNeverShowTheirPasswords(t *testing.T) {
 
 // A source prints as a summary of what pgx reads from its DSN, never the
 // DSN's text.
+// cleanPGEnv clears the PG* variables pgconn reads, so what a DSN parses
+// to doesn't depend on where the test runs.
+func cleanPGEnv(t *testing.T) {
+	t.Helper()
+	for _, v := range []string{"PGAPPNAME", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGSSLMODE",
+		"PGCONNECT_TIMEOUT", "PGPASSWORD", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE", "PGTARGETSESSIONATTRS",
+		"PGSSLCERT", "PGSSLKEY", "PGSSLROOTCERT", "PGSSLPASSWORD", "PGSSLSNI", "PGSSLNEGOTIATION", "PGOPTIONS"} {
+		t.Setenv(v, "")
+	}
+	// Nor on a password file in the home directory.
+	t.Setenv("PGPASSFILE", filepath.Join(t.TempDir(), "none"))
+}
+
+// rootCert writes a self-signed CA certificate and returns its path.
+func rootCert(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test"},
+		NotBefore: time.Now(), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "root.crt")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestSourcesPrintASummaryOfTheirDSN(t *testing.T) {
+	cleanPGEnv(t)
+	root := rootCert(t)
 	for dsn, want := range map[string]string{
-		"postgres://app:hunter2@db/orders": "postgres://app@db:5432/orders?tls=preferred",
-		"host=db port=5433 user=app dbname=orders sslmode=disable application_name=api connect_timeout=5": "postgres://app@db:5433/orders?application_name=api&connect_timeout=5s&tls=off",
+		"postgres://app@db/orders?sslmode=verify-ca&sslrootcert=" + root:                                      "postgres://app@db:5432/orders?tls=verified-ca",
+		"postgres://app@db/orders?sslmode=require&sslrootcert=" + root:                                        "postgres://app@db:5432/orders?tls=verified-ca",
+		"postgres://app@db/orders?sslmode=verify-full&sslrootcert=" + root:                                    "postgres://app@db:5432/orders?tls=verified",
+		"postgres://app@db/orders?sslmode=disable&sslpassword=s3cret&application_name=s3cret-api":             "postgres://app@db:5432/orders?tls=off",
+		"host=db user=app dbname=orders sslmode=disable sslpassword='s3 cret' application_name='s3 cret-api'": "postgres://app@db:5432/orders?tls=off",
+		"host=db user=app dbname=orders sslmode=disable sslpassword=other application_name=api":               "postgres://app@db:5432/orders?application_name=api&tls=off",
+		"postgres://app:hunter2@db/orders":                                                                    "postgres://app@db:5432/orders?tls=preferred",
+		"host=db port=5433 user=app dbname=orders sslmode=disable application_name=api connect_timeout=5":     "postgres://app@db:5433/orders?application_name=api&connect_timeout=5s&tls=off",
 		// The password is also the user's and the database's name, which
 		// show as they would with any other password.
 		"postgres://postgres:postgres@localhost/postgres?sslmode=disable":            "postgres://postgres@localhost:5432/postgres?tls=off",
@@ -119,6 +171,28 @@ func TestSourcesPrintASummaryOfTheirDSN(t *testing.T) {
 		if s := fmt.Sprint(pg.Source{DSN: dsn}); !strings.HasPrefix(s, "{dsn:"+want+" max_conns") {
 			t.Errorf("%q prints as %s, want %s", dsn, s, want)
 		}
+	}
+}
+
+// A validated source shows the DSN as validation parsed it; one never
+// validated parses it when printed.
+func TestValidatedSourcesKeepTheirSummary(t *testing.T) {
+	cleanPGEnv(t)
+	t.Setenv("PGHOST", "first")
+	c := pg.Config{Primary: pg.Source{DSN: "postgres://app@/orders?sslmode=disable"},
+		Named: map[string]pg.Source{"other": {DSN: "postgres://app@/other?sslmode=disable"}}, Leaks: "error"}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PGHOST", "second")
+	if s := c.Primary.String(); !strings.Contains(s, "@first:5432/") {
+		t.Errorf("the validated source prints as %s", s)
+	}
+	if s := c.Named["other"].String(); !strings.Contains(s, "@first:5432/") {
+		t.Errorf("the validated named source prints as %s", s)
+	}
+	if s := (pg.Source{DSN: c.Primary.DSN}).String(); !strings.Contains(s, "@second:5432/") {
+		t.Errorf("a source never validated prints as %s", s)
 	}
 }
 

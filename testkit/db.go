@@ -232,7 +232,7 @@ func packageDB(admin string, schema []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if d, ok := packageDBs.dbs[key]; ok {
-		if time.Since(packageDBs.checked) < liveCheckEvery || liveAlive(ctx) {
+		if packageDBs.live != nil && time.Since(packageDBs.checked) < liveCheckEvery || liveAlive(ctx) {
 			return d.dsn, nil
 		}
 	}
@@ -346,6 +346,7 @@ func liveAlive(ctx context.Context) bool {
 	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if l.Ping(pctx) != nil {
+		packageDBs.checked = time.Time{}
 		return false
 	}
 	packageDBs.checked = time.Now()
@@ -368,6 +369,7 @@ func liveConn(ctx context.Context, conn *pgx.Conn, admin string) (*pgx.Conn, err
 	if l := packageDBs.live; l != nil {
 		l.Close(context.WithoutCancel(ctx))
 		packageDBs.live = nil
+		packageDBs.checked = time.Time{}
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
