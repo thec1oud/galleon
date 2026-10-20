@@ -7,8 +7,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -332,6 +335,7 @@ func TestConfigValidation(t *testing.T) {
 		`{"http":{"trusted_proxies":["nope"]}}`: "trusted_proxies",
 		`{"http":{"addr":""}}`:                  "addr must be set",
 		`{"http":{"body_limit":0}}`:             "must be positive",
+		`{"http":{"read_header_timeout":0}}`:    "read_header_timeout must be positive",
 	} {
 		_, err := galleon.New(
 			galleon.Coordination(local.New()), galleon.Deploy(galleon.SingleNode),
@@ -362,5 +366,203 @@ func TestOnlyTheWebRoleServes(t *testing.T) {
 	defer app.Shutdown(context.Background())
 	if _, err := galleon.Resolve[*server.Server](app); err == nil {
 		t.Fatal("a worker process must not build the HTTP server")
+	}
+}
+
+type HeaderIn struct {
+	Tenant string `header:"X-Tenant" json:"-"`
+}
+
+type BadOut struct {
+	C chan int `json:"c"`
+}
+
+type textCodec struct{}
+
+func (textCodec) MediaType() string { return "text/plain" }
+func (textCodec) Encode(w io.Writer, v any) error {
+	_, err := io.WriteString(w, v.(*CreateOut).Customer)
+	return err
+}
+func (textCodec) Decode(r io.Reader, v any, _ op.UnknownFields) error {
+	b, err := io.ReadAll(r)
+	v.(*CreateIn).Customer, v.(*CreateIn).Qty = string(b), 1
+	return err
+}
+
+func extraOps(release <-chan struct{}, started chan<- struct{}) galleon.Module {
+	return galleon.ModuleFunc("extra", func(r *galleon.Registry) error {
+		r.Operation(op.Unary[HeaderIn, CreateOut]("x.header").HTTP("GET", "/tenant").Public(), func(_ context.Context, in *HeaderIn) (*CreateOut, error) {
+			return &CreateOut{Org: in.Tenant}, nil
+		})
+		r.Operation(op.Unary[Empty, BadOut]("x.bad").HTTP("GET", "/bad").Public(), func(context.Context, *Empty) (*BadOut, error) {
+			return &BadOut{C: make(chan int)}, nil
+		})
+		r.Operation(op.Unary[Empty, Empty]("x.slow").HTTP("GET", "/slow").Public(), func(context.Context, *Empty) (*Empty, error) {
+			started <- struct{}{}
+			<-release
+			return &Empty{}, nil
+		})
+		d := op.Unary[CreateIn, CreateOut]("x.text").HTTP("POST", "/text").Public().Describe()
+		d.Input.Codecs = []op.Codec{textCodec{}}
+		d.Output.Codecs = []op.Codec{textCodec{}}
+		r.Operation(&d, func(_ context.Context, in *CreateIn) (*CreateOut, error) {
+			return &CreateOut{Customer: strings.ToUpper(in.Customer)}, nil
+		})
+		return nil
+	})
+}
+
+func TestHeaderParameters(t *testing.T) {
+	e := boot(t, "", extraOps(nil, nil))
+	w := e.do("GET", "/tenant", "", "X-Tenant", "acme")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"org":"acme"`) {
+		t.Fatalf("got %d: %s", w.Code, w.Body)
+	}
+}
+
+func TestEncodingFailureIsACleanInternalError(t *testing.T) {
+	e := boot(t, "", extraOps(nil, nil))
+	w := e.do("GET", "/bad", "")
+	if p := problem(t, w); w.Code != 500 || p.Code != "galleon.internal" {
+		t.Fatalf("got %d %+v", w.Code, p)
+	}
+}
+
+func TestAnOperationsOwnCodecs(t *testing.T) {
+	e := boot(t, "", extraOps(nil, nil))
+	r := httptest.NewRequest("POST", "/text", strings.NewReader("ann"))
+	r.Header.Set("Content-Type", "text/plain")
+	r.Header.Set("Accept", "text/plain")
+	w := httptest.NewRecorder()
+	e.h.ServeHTTP(w, r)
+	if w.Code != 200 || w.Body.String() != "ANN" || w.Header().Get("Content-Type") != "text/plain" {
+		t.Fatalf("got %d %q %q", w.Code, w.Header().Get("Content-Type"), w.Body)
+	}
+	if w := e.do("POST", "/orgs/a/orders", "ann", "Content-Type", "text/plain"); w.Code != 415 {
+		t.Fatalf("another operation doesn't get the codec: %d", w.Code)
+	}
+}
+
+func listening(t *testing.T, e *env) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for e.srv.Addr() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the server never listened")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return e.srv.Addr().String()
+}
+
+func TestDrainWaitsForInFlightRequests(t *testing.T) {
+	release, started := make(chan struct{}), make(chan struct{})
+	e := boot(t, "", extraOps(release, started))
+	url := "http://" + listening(t, e)
+	got := make(chan int, 1)
+	go func() {
+		res, err := http.Get(url + "/slow")
+		if err != nil {
+			got <- 0
+			return
+		}
+		res.Body.Close()
+		got <- res.StatusCode
+	}()
+	<-started
+	done := make(chan error, 1)
+	go func() { done <- e.app.Shutdown(context.Background()) }()
+	select {
+	case <-done:
+		t.Fatal("shutdown returned while a request was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if code := <-got; code != 200 {
+		t.Fatalf("the in-flight request got %d", code)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPanicAfterTheResponseStartedCutsTheConnection(t *testing.T) {
+	mw := galleon.ModuleFunc("streamer", func(r *galleon.Registry) error {
+		r.Middleware(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/stream" {
+					next.ServeHTTP(w, r)
+					return
+				}
+				w.Header().Set("Set-Cookie", "a=b")
+				_, _ = io.WriteString(w, "part1")
+				w.(http.Flusher).Flush()
+				panic("boom")
+			})
+		})
+		return nil
+	})
+	e := boot(t, "", mw)
+	res, err := http.Get("http://" + listening(t, e) + "/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if _, err := io.ReadAll(res.Body); err == nil {
+		t.Fatal("a response cut by a panic must not read as complete")
+	}
+}
+
+func TestPanicResponseDropsTheHandlersHeaders(t *testing.T) {
+	mw := galleon.ModuleFunc("cookie", func(r *galleon.Registry) error {
+		r.Middleware(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Set-Cookie", "a=b")
+				w.Header().Set("Content-Encoding", "gzip")
+				next.ServeHTTP(w, r)
+			})
+		})
+		return nil
+	})
+	w := boot(t, "", mw).do("GET", "/panic", "")
+	if w.Code != 500 || w.Header().Get("Set-Cookie") != "" || w.Header().Get("Content-Encoding") != "" || w.Header().Get("X-Request-Id") == "" {
+		t.Fatalf("got %d %v", w.Code, w.Header())
+	}
+}
+
+func TestUnixSocketReplacesAStaleFile(t *testing.T) {
+	dir, err := os.MkdirTemp("", "gs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "s.sock")
+	// A listener closed without unlinking leaves the file behind, as a crash does.
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	ln.Close()
+
+	e := boot(t, `{"http":{"addr":"unix:`+path+`","trusted_proxies":["unix"]}}`)
+	listening(t, e)
+	c := http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
+	}}}
+	get := func(xff string) int {
+		r, _ := http.NewRequest("GET", "http://x/orders", nil)
+		r.Header.Set("X-Forwarded-For", xff)
+		res, err := c.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+	// Behind a proxy trusted as "unix", each forwarded client has its own limit.
+	if get("203.0.113.1") != 200 || get("203.0.113.2") != 200 || get("203.0.113.1") != 429 {
+		t.Fatal("the forwarded address must key the rate limit")
 	}
 }

@@ -24,6 +24,9 @@ func (s *Server) routeAll(ops *galleon.Operations) (_ *http.ServeMux, err error)
 	mux := http.NewServeMux()
 	var methods []string
 	for _, x := range ops.All() {
+		if !slices.ContainsFunc(x.Desc.Bindings, func(b op.Binding) bool { _, ok := b.(op.HTTP); return ok }) {
+			continue
+		}
 		binder, err := bind.Plan(x.Desc.Input.Type)
 		if err != nil {
 			return nil, fmt.Errorf("http: operation %q (module %q, %s): %w", x.Desc.ID, x.Module, x.Site, err)

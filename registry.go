@@ -54,6 +54,13 @@ func (r *Registry) Needs(caps ...coord.Capability) {
 	}
 }
 
+// Fatal stops the app because of err, from a module's own goroutine after
+// start, such as a server whose listener failed: readiness fails from then on,
+// and Run shuts the app down and returns err.
+func (r *Registry) Fatal(err error) {
+	r.app.die(fmt.Errorf("module %q: %w", r.module, err))
+}
+
 // Requires declares that other modules must be installed.
 func (r *Registry) Requires(modules ...string) {
 	for _, m := range modules {

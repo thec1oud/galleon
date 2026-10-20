@@ -59,9 +59,21 @@ func (s *Server) outer(h http.Handler) http.Handler {
 				}
 				s.log.ErrorContext(ctx, "panic while serving a request", "method", r.Method, "path", r.URL.Path, "panic", p, "stack", string(debug.Stack()))
 				span.SetStatus(codes.Error, "panic")
-				if !sw.wrote {
-					s.writeError(sw, r, errs.New(errs.Internal, "galleon.panic", ""), 0)
+				if sw.wrote {
+					// The response has started, so it can't become an error.
+					// Cut the connection, so the client can't mistake a
+					// truncated response for a whole one.
+					span.SetAttributes(semconv.HTTPResponseStatusCode(sw.status))
+					panic(http.ErrAbortHandler)
 				}
+				// Drop whatever the handler set, such as Content-Encoding or
+				// Set-Cookie, keeping only the headers set above.
+				for k := range hdr {
+					if k != "X-Request-Id" && k != "X-Content-Type-Options" && k != "X-Frame-Options" && k != "Referrer-Policy" {
+						delete(hdr, k)
+					}
+				}
+				s.writeError(sw, r, errs.New(errs.Internal, "galleon.panic", ""), 0)
 			}
 			status := sw.status
 			if status == 0 {
@@ -114,10 +126,12 @@ func (s *Server) peer(r *http.Request) string {
 	}
 	addr, err := netip.ParseAddr(host)
 	if err != nil {
-		return "" // a Unix socket, or something we can't read
-	}
-	addr = addr.Unmap()
-	if !s.isTrusted(addr) {
+		// A Unix socket, or something we can't read. Behind a local proxy
+		// listed as "unix", the header names the caller.
+		if !s.trustUnix {
+			return ""
+		}
+	} else if addr = addr.Unmap(); !s.isTrusted(addr) {
 		return addr.String()
 	}
 	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
@@ -131,6 +145,9 @@ func (s *Server) peer(r *http.Request) string {
 			return hop.String()
 		}
 		addr = hop
+	}
+	if !addr.IsValid() {
+		return ""
 	}
 	return addr.String()
 }

@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -47,7 +48,9 @@ type Config struct {
 	TLSCert string `json:"tls_cert"`
 	TLSKey  string `json:"tls_key" secret:"true"`
 	// TrustedProxies are the CIDRs whose X-Forwarded-For header is believed
-	// when working out the caller's address.
+	// when working out the caller's address. "unix" trusts connections on a
+	// Unix socket, from a proxy on the same host. Without it, callers on a
+	// Unix socket have no address, so rate limits keyed by address skip them.
 	TrustedProxies []string `json:"trusted_proxies"`
 	// AccessLog logs one line per request.
 	AccessLog bool `json:"access_log"`
@@ -80,7 +83,16 @@ func (c *Config) Validate() error {
 	if c.BodyLimit <= 0 || c.MaxHeaderBytes <= 0 {
 		errs = append(errs, errors.New("body_limit and max_header_bytes must be positive"))
 	}
+	if c.ReadHeaderTimeout <= 0 || c.ReadTimeout < 0 || c.WriteTimeout < 0 || c.IdleTimeout < 0 {
+		errs = append(errs, errors.New("read_header_timeout must be positive, and the other timeouts not negative (zero means none)"))
+	}
+	if strings.HasPrefix(c.Addr, "unix:") && len(c.Addr) == len("unix:") {
+		errs = append(errs, errors.New("addr: unix: needs a path"))
+	}
 	for _, p := range c.TrustedProxies {
+		if p == "unix" {
+			continue
+		}
 		if _, err := netip.ParsePrefix(p); err != nil {
 			errs = append(errs, fmt.Errorf("trusted_proxies: %w", err))
 		}
@@ -118,7 +130,10 @@ func Module(opts ...Option) galleon.Module {
 			srv = s
 			return s, err
 		})
-		r.OnReady(func(ctx context.Context) error { return srv.Listen(ctx) })
+		r.OnReady(func(ctx context.Context) error {
+			srv.fatal = r.Fatal
+			return srv.Listen(ctx)
+		})
 		r.OnDrain(func(ctx context.Context) error { return srv.Shutdown(ctx) })
 		return nil
 	})
@@ -140,6 +155,9 @@ type Server struct {
 	handler http.Handler
 	srv     *http.Server
 
+	trustUnix bool
+	fatal     func(error) // stops the app when serving fails after ready
+
 	mu   sync.Mutex
 	ln   net.Listener
 	done chan struct{} // closed when Serve returns
@@ -154,8 +172,18 @@ func New(cfg *Config, ops *galleon.Operations, mw *galleon.HTTPMiddleware, log *
 		tracer: tp.Tracer("github.com/thec1oud/galleon/server"),
 		codecs: codecs,
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("http: %w", err)
+	}
 	for _, p := range cfg.TrustedProxies {
+		if p == "unix" {
+			s.trustUnix = true
+			continue
+		}
 		s.trusted = append(s.trusted, netip.MustParsePrefix(p).Masked())
+	}
+	if mw == nil {
+		mw = &galleon.HTTPMiddleware{}
 	}
 	mux, err := s.routeAll(ops)
 	if err != nil {
@@ -199,7 +227,14 @@ func (s *Server) Listen(ctx context.Context) error {
 	}
 	network, addr := "tcp", s.cfg.Addr
 	if p, ok := strings.CutPrefix(addr, "unix:"); ok {
+		if process.Supervised() {
+			// Workers can't share a Unix socket the way they share a port.
+			return errors.New("http: a unix: address can't be used under the supervisor; listen on a TCP port")
+		}
 		network, addr = "unix", p
+		if err := removeStaleSocket(addr); err != nil {
+			return fmt.Errorf("http: %w", err)
+		}
 	}
 	ln, err := process.Listen(ctx, network, addr)
 	if err != nil {
@@ -217,9 +252,27 @@ func (s *Server) Listen(ctx context.Context) error {
 		defer close(done)
 		if err := s.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.log.Error("http server stopped serving", "error", err)
+			if s.fatal != nil {
+				s.fatal(fmt.Errorf("http: serving stopped: %w", err))
+			}
 		}
 	}()
 	return nil
+}
+
+// removeStaleSocket removes a Unix socket file left by a process that is
+// gone, which would otherwise stop the listener from binding. A socket that
+// still accepts connections is left alone, so the bind fails as it should.
+func removeStaleSocket(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode()&os.ModeSocket == 0 {
+		return nil // nothing there, or not a socket: let the bind report it
+	}
+	if c, err := net.DialTimeout("unix", path, time.Second); err == nil {
+		c.Close()
+		return fmt.Errorf("%s is in use by another process", path)
+	}
+	return os.Remove(path)
 }
 
 // Addr is the address the server listens on, once Listen has returned.
