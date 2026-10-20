@@ -41,6 +41,9 @@ func (s *Server) routeAll(ops *galleon.Operations) (_ *http.ServeMux, err error)
 					return nil, fmt.Errorf("rpc: operation %q (module %q, %s): %w", x.Desc.ID, x.Module, x.Site, err)
 				}
 				s.routes = append(s.routes, Route{Method: "RPC", Path: rb.String(), Operation: x.Desc.ID})
+				if !slices.Contains(methods, http.MethodPost) {
+					methods = append(methods, http.MethodPost) // so a GET there is a 405
+				}
 				continue
 			}
 			hb, ok := b.(op.HTTP)

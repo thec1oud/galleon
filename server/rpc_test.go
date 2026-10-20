@@ -605,3 +605,15 @@ func TestServerCodecsServeRPC(t *testing.T) {
 		t.Fatalf("got %v, %v", res, err)
 	}
 }
+
+func TestAWrongMethodOnAProcedureIsNotAllowed(t *testing.T) {
+	e := bootRPC(t, []galleon.Role{server.RoleRPC})
+	res, err := e.c.Get(e.url + "/greet.v1.Greeter/Hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusMethodNotAllowed || res.Header.Get("Allow") != "POST" {
+		t.Fatalf("got %d, Allow %q", res.StatusCode, res.Header.Get("Allow"))
+	}
+}
