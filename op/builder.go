@@ -11,7 +11,7 @@ import (
 //	var CreateOrder = op.Unary[CreateOrderIn, CreateOrderOut]("orders.create").
 //		HTTP("POST", "/orders").
 //		RPC("orders.v1.Orders", "Create").
-//		Authorize("orders:create", op.Resource("org", "org_id")).
+//		AuthorizeResource("orders:create", op.Resource("org", "org_id")).
 //		Timeout(5 * time.Second)
 type Builder[In, Out any] struct{ d Descriptor }
 
@@ -96,14 +96,18 @@ func (b *Builder[In, Out]) Contexts(kinds ...string) *Builder[In, Out] {
 	return b
 }
 
-// Authorize requires permission for action, checked before decode, and for the
-// resource, if one is given, checked after decode.
-func (b *Builder[In, Out]) Authorize(action string, resource ...ResourceRef) *Builder[In, Out] {
+// Authorize requires permission for action, checked before decode.
+func (b *Builder[In, Out]) Authorize(action string) *Builder[In, Out] {
 	b.d.Security.Action = action
-	if len(resource) > 0 {
-		r := resource[0]
-		b.d.Security.Resource = &r
-	}
+	b.d.Security.Resource = nil
+	return b
+}
+
+// AuthorizeResource requires permission for action, checked before decode, and
+// for the resource, checked after decode.
+func (b *Builder[In, Out]) AuthorizeResource(action string, resource ResourceRef) *Builder[In, Out] {
+	b.d.Security.Action = action
+	b.d.Security.Resource = &resource
 	return b
 }
 
@@ -152,8 +156,12 @@ func (b *Builder[In, Out]) Meta(key string, v any) *Builder[In, Out] {
 	return b
 }
 
-// Validate adds a shape validator (stage 7). It must be pure: no I/O.
+// Validate adds a shape validator (stage 7). It must be pure: no I/O. It
+// panics if v is nil, as the declaration is wrong.
 func (b *Builder[In, Out]) Validate(v Validator[In]) *Builder[In, Out] {
+	if v == nil {
+		panic("op: Validate(nil) on operation " + b.d.ID)
+	}
 	b.d.Shape = chainValidators(b.d.Shape, func(ctx context.Context, in any) *ValidationError {
 		return v.Validate(ctx, in.(*In))
 	})
@@ -161,8 +169,11 @@ func (b *Builder[In, Out]) Validate(v Validator[In]) *Builder[In, Out] {
 }
 
 // ValidateMeaning adds a meaning validator (stage 9), which may read through
-// the read transaction in ctx but must not write.
+// the read transaction in ctx but must not write. It panics if v is nil.
 func (b *Builder[In, Out]) ValidateMeaning(v MeaningValidator[In]) *Builder[In, Out] {
+	if v == nil {
+		panic("op: ValidateMeaning(nil) on operation " + b.d.ID)
+	}
 	b.d.Meaning = chainValidators(b.d.Meaning, func(ctx context.Context, in any) *ValidationError {
 		return v.ValidateMeaning(ctx, in.(*In))
 	})

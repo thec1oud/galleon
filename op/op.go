@@ -248,6 +248,8 @@ func (d *Descriptor) Check() []error {
 			}
 		case nil:
 			errs = append(errs, fmt.Errorf("operation %q has a nil binding", d.ID))
+		default:
+			errs = append(errs, fmt.Errorf("operation %q: binding of type %T is not supported; use op.HTTP, op.RPC or op.Topic values", d.ID, b))
 		}
 	}
 	if rl := d.Policies.RateLimit; rl != nil && (rl.Limit <= 0 || rl.Window <= 0) {
