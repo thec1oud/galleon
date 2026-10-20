@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +27,10 @@ import (
 // postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable. When
 // it is unset, tests that need Postgres skip; in CI (where CI is set) they
 // fail instead, so a misconfigured pipeline can't pass by skipping them.
+//
+// Runs mark the databases they use with advisory locks, which Postgres keeps
+// per database, so runs that share a server must name the same database in
+// it, or they may drop each other's.
 const PostgresEnv = "GALLEON_TEST_POSTGRES"
 
 // DBOption configures DB.
@@ -196,7 +199,8 @@ var packageDBs struct {
 	// live holds, for as long as the process runs, a session-level
 	// advisory lock on each package database it created: the mark that
 	// the database is in use, even while nothing is connected to it.
-	live *pgx.Conn
+	live   *pgx.Conn
+	marked []string // the databases live marks
 }
 
 // liveLock is the advisory lock key, in SQL, that marks database $1 live.
@@ -245,36 +249,72 @@ func packageDB(admin string, schema []string) (string, error) {
 			return "", err
 		}
 	}
-	if err := dropStale(ctx, conn, base); err != nil {
-		return "", err
-	}
-	if packageDBs.live == nil {
-		// Its own connection, which nothing else uses or closes: a
-		// session's advisory locks are reentrant, so one that tried the
-		// locks of others' databases would win its own too.
-		live, err := pgx.Connect(context.Background(), admin)
-		if err != nil {
-			return "", fmt.Errorf("connecting to %s: %w", PostgresEnv, err)
-		}
-		packageDBs.live = live
-	}
-	// Marked before it exists, and under the turn-taking lock, so no other
-	// run sees it unmarked.
-	if _, err := packageDBs.live.Exec(ctx, "SELECT pg_advisory_lock("+liveLock+")", name); err != nil {
-		return "", fmt.Errorf("marking the package database live: %w", err)
-	}
-	if _, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{tpl}.Sanitize()); err != nil {
-		return "", fmt.Errorf("cloning the template: %w", err)
-	}
-	dsn, err := withDatabase(admin, name)
+	// Before dropStale, which would otherwise win this run's own marks if
+	// their connection had died.
+	live, err := liveConn(ctx, admin)
 	if err != nil {
 		return "", err
 	}
+	if err := dropStale(ctx, conn, base); err != nil {
+		return "", err
+	}
+	// Marked before it exists, and under the turn-taking lock, so no other
+	// run sees it unmarked.
+	if _, err := live.Exec(ctx, "SELECT pg_advisory_lock("+liveLock+")", name); err != nil {
+		return "", fmt.Errorf("marking the package database live: %w", err)
+	}
+	dsn, err := withDatabase(admin, name)
+	if err == nil {
+		_, err = conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{tpl}.Sanitize())
+		if err != nil {
+			err = fmt.Errorf("cloning the template: %w", err)
+		}
+	}
+	if err != nil {
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_, derr := conn.Exec(dctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+		_, uerr := live.Exec(dctx, "SELECT pg_advisory_unlock("+liveLock+")", name)
+		return "", errors.Join(err, derr, uerr)
+	}
+	packageDBs.marked = append(packageDBs.marked, name)
 	if packageDBs.dsns == nil {
 		packageDBs.dsns = map[string]string{}
 	}
 	packageDBs.dsns[key] = dsn
 	return dsn, nil
+}
+
+// liveConn returns the connection that holds the live marks, opening it
+// the first time, and again, with the marks taken anew, if it has died.
+// It is its own connection, which nothing else uses: a session's advisory
+// locks are reentrant, so one that tried the locks of others' databases
+// would win its own too.
+func liveConn(ctx context.Context, admin string) (*pgx.Conn, error) {
+	if l := packageDBs.live; l != nil {
+		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := l.Ping(pctx)
+		cancel()
+		if err == nil {
+			return l, nil
+		}
+		l.Close(context.WithoutCancel(ctx))
+		packageDBs.live = nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	l, err := pgx.Connect(cctx, admin)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to %s: %w", PostgresEnv, err)
+	}
+	for _, name := range packageDBs.marked {
+		if _, err := l.Exec(cctx, "SELECT pg_advisory_lock("+liveLock+")", name); err != nil {
+			l.Close(context.WithoutCancel(ctx))
+			return nil, fmt.Errorf("marking the package databases live again: %w", err)
+		}
+	}
+	packageDBs.live = l
+	return l, nil
 }
 
 // dbNames returns the schema's key, its template's name, and the prefix of
@@ -374,13 +414,9 @@ func createTemplate(ctx context.Context, conn *pgx.Conn, admin, tpl string, sche
 	return fmt.Errorf("naming the template: %w", err)
 }
 
-// urlDSN is the start of a DSN in URL form, whatever its scheme, as package
-// pg tells the forms apart. A keyword/value DSN may hold "://" in a value.
-var urlDSN = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
-
 // withDatabase returns dsn with its database replaced, in either DSN form.
 func withDatabase(dsn, db string) (string, error) {
-	if urlDSN.MatchString(dsn) {
+	if pg.IsURLDSN(dsn) {
 		u, err := url.Parse(dsn)
 		if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
 			return "", fmt.Errorf("%s is not a postgres:// URL or a keyword/value string", PostgresEnv)

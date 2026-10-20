@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -157,7 +156,7 @@ func TestUseLeavesTheManagerToItsOwner(t *testing.T) {
 // withAppName sets application_name in dsn, in either DSN form.
 func withAppName(t *testing.T, dsn, name string) string {
 	t.Helper()
-	if !strings.Contains(strings.SplitN(dsn, " ", 2)[0], "://") {
+	if !pg.IsURLDSN(dsn) {
 		return dsn + " application_name=" + name
 	}
 	u, err := url.Parse(dsn)

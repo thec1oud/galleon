@@ -229,7 +229,12 @@ END $$`, time.Now().UnixNano())
 			t.Fatal(err)
 		}
 		defer admin.Close(context.Background())
-		key := name[strings.LastIndex(name, "_")+1:]
+		// galleon_pkg_<dir>_<key>_<pid>_<random>
+		parts := strings.Split(name, "_")
+		if len(parts) != 6 {
+			t.Fatalf("can't read the schema's key from %s", name)
+		}
+		key := parts[3]
 		for _, db := range []string{name, "galleon_tpl_" + key} {
 			if _, err := admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+pgx.Identifier{db}.Sanitize()+" WITH (FORCE)"); err != nil {
 				t.Error(err)

@@ -3,6 +3,7 @@ package pg
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -66,30 +67,63 @@ func (s Source) String() string {
 
 var (
 	passwordKV = regexp.MustCompile(`(?i)(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)`)
-	// urlDSN is the start of a DSN in URL form, whatever its scheme, so a
-	// mistyped one is redacted as a URL too.
-	urlDSN = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
-	// passwordQuery is a password parameter in a URL's query.
-	passwordQuery = regexp.MustCompile(`(?i)([?&]password=)[^&]*`)
+	urlDSN     = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
 )
 
-// redactDSN hides the password in either DSN form, valid or not. In a URL,
-// everything from the first ':' after the scheme to the last '@' is the
-// password: one url.Parse refuses, or reads otherwise, can hold '@', '/' or
-// ':' itself. Where that hides more than the password, such as an '@' in the
-// query, too much is hidden rather than too little.
+// IsURLDSN reports whether dsn is in URL form, scheme://..., whatever the
+// scheme, rather than keyword/value form, whose values may hold "://"
+// themselves.
+func IsURLDSN(dsn string) bool { return urlDSN.MatchString(dsn) }
+
+// redactDSN hides the passwords in either DSN form, valid or not.
 func redactDSN(dsn string) string {
-	loc := urlDSN.FindStringIndex(dsn)
-	if loc == nil {
+	if !IsURLDSN(dsn) {
 		return passwordKV.ReplaceAllString(dsn, "${1}xxxxx")
 	}
-	head, rest := dsn[:loc[1]], dsn[loc[1]:]
+	if u, err := url.Parse(dsn); err == nil {
+		// Read as pgx reads it.
+		if _, ok := u.User.Password(); ok {
+			u.User = url.UserPassword(u.User.Username(), "xxxxx")
+		}
+		u.RawQuery = redactQuery(u.RawQuery)
+		return u.String()
+	}
+	// One url.Parse refuses: everything from the first ':' after the scheme
+	// to the last '@' is taken for the password, since it can hold '@', '/'
+	// or ':' itself. Where that hides more than the password, too much is
+	// hidden rather than too little.
+	i := strings.Index(dsn, "://") + len("://")
+	head, rest := dsn[:i], dsn[i:]
 	if at := strings.LastIndex(rest, "@"); at >= 0 {
 		if c := strings.Index(rest[:at], ":"); c >= 0 {
 			rest = rest[:c+1] + "xxxxx" + rest[at:]
 		}
 	}
-	return passwordQuery.ReplaceAllString(head+rest, "${1}xxxxx")
+	if q := strings.Index(rest, "?"); q >= 0 {
+		rest = rest[:q+1] + redactQuery(rest[q+1:])
+	}
+	return head + rest
+}
+
+// redactQuery hides the value of each password or sslpassword parameter in
+// a raw URL query, matching the names as decoded, and of any parameter
+// whose name can't be decoded.
+func redactQuery(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	params := strings.Split(raw, "&")
+	for i, p := range params {
+		k, _, ok := strings.Cut(p, "=")
+		if !ok {
+			continue
+		}
+		name, err := url.QueryUnescape(k)
+		if err != nil || strings.EqualFold(name, "password") || strings.EqualFold(name, "sslpassword") {
+			params[i] = k + "=xxxxx"
+		}
+	}
+	return strings.Join(params, "&")
 }
 
 // Default sets the defaults: no sources, the default retry policy, and

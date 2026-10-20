@@ -1108,8 +1108,13 @@ func errorKinds(t *testing.T, f Factory) {
 		if err := r.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
 			return err
 		}
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
 		go func() {
-			// Cancel once the backend is in pg_sleep, not before it starts.
+			defer wg.Done()
+			// Cancel once the backend is in pg_sleep, not before it starts,
+			// and give up once the Read is over.
 			for range 500 {
 				var canceled bool
 				err := e.pool.QueryRow(context.Background(), `SELECT pg_cancel_backend(pid) FROM pg_stat_activity
@@ -1117,9 +1122,15 @@ func errorKinds(t *testing.T, f Factory) {
 				if err == nil && canceled {
 					return
 				}
-				time.Sleep(10 * time.Millisecond)
+				select {
+				case <-done:
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
 			}
 		}()
+		defer wg.Wait()
+		defer close(done)
 		var x string
 		return r.QueryRow(ctx, "SELECT pg_sleep(5)::text").Scan(&x)
 	})

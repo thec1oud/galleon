@@ -57,11 +57,15 @@ func TestSourcesHideTheirPasswords(t *testing.T) {
 		"host=db user=app password=hunter2 application_name=http://x",
 		"postgres://app:hunter2@db/orders?sslmode=%zz&password=hunter2",
 		"postgres://app:hun/ter2@db/orders",
-		"postgres://app:5432/ter2@db/orders",
 		"postgress://app:hunter2@db",
 		"POSTGRES://app:hunter2@db/orders",
 		"postgres://app@db/orders?password=hunter2%zz",
 		"postgres://app@db/orders?sslmode=disable&password=hunter2&password=hunter2",
+		"postgres://app@db:5432/orders?password=hun@ter2",
+		"postgres://app@db/orders?pass%77ord=hunter2",
+		"postgres://app@db/orders?SSLPassword=hunter2",
+		"postgres://app:hun%2Fter2@db/orders",
+		"postgres://app:hun/ter2@db/orders?pass%77ord=hunter2",
 	} {
 		// "ter2" is the end of every password here, '@' or not.
 		if s := fmt.Sprint(pg.Source{DSN: dsn}); strings.Contains(s, "ter2") || !strings.Contains(s, "db") {
@@ -150,5 +154,19 @@ func TestRetryPolicyIsBounded(t *testing.T) {
 	_ = data.RetryPolicy{Attempts: 10, Backoff: 1 << 40}.Run(ctx, func(context.Context) error { runs++; return &pgconn.PgError{Code: "40001"} })
 	if runs != 1 {
 		t.Fatalf("retried %d times after ctx ended", runs-1)
+	}
+}
+
+func TestIsURLDSN(t *testing.T) {
+	for dsn, want := range map[string]bool{
+		"postgres://app@db/orders":                       true,
+		"postgress://app@db":                             true,
+		"host=db user=app":                               false,
+		"application_name=http://x host=db user=app":     false,
+		"host=db application_name=postgres://x user=app": false,
+	} {
+		if got := pg.IsURLDSN(dsn); got != want {
+			t.Errorf("IsURLDSN(%q) = %v", dsn, got)
+		}
 	}
 }
