@@ -282,16 +282,21 @@ type Violation struct {
 ```go
 package data
 
-type Querier interface {
-    Exec(ctx context.Context, sql string, args ...any) (CommandTag, error)
+// CommandTag, Rows, Row, Batch, BatchResults, Identifier and CopyFromSource are pgx's types.
+type Reader interface {
     Query(ctx context.Context, sql string, args ...any) (Rows, error)
     QueryRow(ctx context.Context, sql string, args ...any) Row
     SendBatch(ctx context.Context, b *Batch) BatchResults
+}
+
+type Querier interface {
+    Reader
+    Exec(ctx context.Context, sql string, args ...any) (CommandTag, error)
     CopyFrom(ctx context.Context, table Identifier, cols []string, src CopyFromSource) (int64, error)
 }
 
 type ReadTx interface {
-    Querier
+    Reader                                     // no Exec or CopyFrom: a write doesn't compile
     Begin(ctx context.Context) (ReadTx, error) // savepoint
     Commit(ctx context.Context) error
     Rollback(ctx context.Context) error
@@ -299,6 +304,8 @@ type ReadTx interface {
 
 type WriteTx interface {
     ReadTx
+    Exec(ctx context.Context, sql string, args ...any) (CommandTag, error)
+    CopyFrom(ctx context.Context, table Identifier, cols []string, src CopyFromSource) (int64, error)
     BeginWrite(ctx context.Context) (WriteTx, error)
     AfterCommit(fn func(ctx context.Context))
     AfterRollback(fn func(ctx context.Context))
@@ -311,25 +318,28 @@ type Manager interface {
     Write(ctx context.Context, fn func(context.Context, WriteTx) error, o ...WriteOpt) error
 }
 
-// Options: Propagation (Join, Independent, Nested, Mandatory, Never),
-// Consistency (Primary, ReadYourWrites, BoundedStaleness(d), Any, Snapshot(tok)),
-// Source(name), Isolation(level), Retry(policy) [closure form only]
+// Options: Propagation (Join, Independent, Nested, Mandatory, Never: each value is an option),
+// Consistency (Primary, ReadYourWrites, BoundedStaleness(d), Any, Snapshot(tok)) [reads only],
+// Source(name), Isolation(level), Retry(policy) [closure form only; Retry(policy).Do(ctx, fn) reruns pair code]
+
+func With(ctx context.Context, tx ReadTx) context.Context // transactions begun with ctx join or nest in tx
+func From(ctx context.Context) ReadTx                    // the closure forms set it for fn's ctx
 ```
 
 **Rules**
 1. **Join is the default** (D8). Inside a write transaction, `BeginRead` with `Join` returns a read view of that same transaction.
 2. Only the root owner's `Commit` commits. A nested handle's `Commit` MUST only release its savepoint.
 3. `Rollback` after `Commit` MUST be a no-op that returns nil. `Commit` after `Rollback` MUST return an error.
-4. A read transaction on a replica MUST run `SET TRANSACTION READ ONLY`.
-5. `AfterCommit` callbacks MUST run only after the root transaction commits, in registration order, and MUST NOT run on rollback. A callback registered on a nested handle belongs to the root.
-6. Closure form: on SQLSTATE `40001` or `40P01`, the whole closure MUST be retried under the retry policy. `AfterCommit` registrations from failed attempts MUST be discarded.
+4. A read transaction, on a replica or the primary, MUST run `READ ONLY` (`BEGIN … READ ONLY`, or `SET TRANSACTION READ ONLY`), at its requested isolation level.
+5. `AfterCommit` callbacks MUST run only after the root transaction commits, in registration order, and MUST NOT run on rollback. A callback registered on a nested handle belongs to the root, and is dropped if that handle's savepoint rolls back. `AfterRollback` callbacks run when the work they were registered with is rolled back: the root's (a failed commit included), or a nested handle's savepoint.
+6. Closure form: on SQLSTATE `40001` or `40P01`, the whole closure MUST be retried under the retry policy, when it owns the root transaction; a joined or nested closure MUST NOT retry, and its error goes to the owner. `AfterCommit` registrations from failed attempts MUST be discarded; each failed attempt is a rollback, so its `AfterRollback` callbacks run. The pair form never retries. Serialization failures and deadlocks are `Conflict` errors with a `RetryInfo` detail.
 7. `ReadYourWrites` MUST never return data older than the causal token's LSN. If no replica qualifies within the wait budget, it MUST read from the primary or fail with `Unavailable`, as the policy says.
 8. A transaction open at the end of its owning request or job MUST be rolled back and reported (an error in dev and test).
 9. Two-phase commit across sources MUST be refused.
 
 **Conformance:** savepoint semantics; ownership (a nested `Commit` doesn't commit the root); commit hooks on commit, rollback and retry; retry on injected serialization failures; read-only enforcement on replicas; read-your-writes against an artificially lagged replica; leak detection.
 
-**Ships with:** `galleon/pg` (pgx); `testkit.DB` (template database per package, transaction per test); a lag-injecting replica proxy for tests.
+**Ships with:** `galleon/pg` (pgx, a package of the core module); `testkit/conformance/datatest`; `testkit.DB` (template database per package, transaction per test, through `pg.Within`; it skips without `GALLEON_TEST_POSTGRES`, and fails without it in CI); a lag-injecting replica proxy for tests.
 
 ### 6.2 ORM integration
 
