@@ -3,6 +3,7 @@ package galleon_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -103,11 +104,28 @@ func TestRegistrationErrorsFailBoot(t *testing.T) {
 			r.Operation(Greet, greet)
 			r.Operation(op.Unary[GreetIn, GreetOut]("greet.hello").Public(), greet)
 		},
-		`which operation "greet.hello" already binds`: func(r *galleon.Registry) {
+		`which conflicts with POST /hello of operation "greet.hello"`: func(r *galleon.Registry) {
 			r.Operation(Greet, greet)
 			r.Operation(op.Unary[GreetIn, GreetOut]("greet.other").HTTP("POST", "/hello").Public(), greet)
 		},
 		"the definition is nil": func(r *galleon.Registry) { r.Operation(nil, greet) },
+		"binds GET /a/b/{y}, which conflicts with GET /a/{x}/b": func(r *galleon.Registry) {
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.a").HTTP("GET", "/a/{x}/b").Public(), greet)
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.b").HTTP("GET", "/a/b/{y}").Public(), greet)
+		},
+		"has a New that returns *galleon_test.GreetOut, want *galleon_test.GreetIn": func(r *galleon.Registry) {
+			d := op.Descriptor{
+				ID: "greet.hand", Kind: op.KindUnary, Security: op.Security{Public: true},
+				Input:  op.TypeInfo{Type: reflect.TypeFor[GreetIn](), New: func() any { return new(GreetOut) }},
+				Output: op.TypeOf[GreetOut](),
+				Adapt:  op.Adapter[GreetIn, GreetOut](),
+			}
+			r.Operation(d, greet)
+		},
+		"Operation: the definition is nil": func(r *galleon.Registry) {
+			var b *op.Builder[GreetIn, GreetOut]
+			r.Operation(b, greet)
+		},
 		"handler is a nil": func(r *galleon.Registry) {
 			var h func(context.Context, *GreetIn) (*GreetOut, error)
 			r.Operation(Greet, h)
@@ -115,7 +133,7 @@ func TestRegistrationErrorsFailBoot(t *testing.T) {
 		"upper-case method": func(r *galleon.Registry) {
 			r.Operation(op.Unary[GreetIn, GreetOut]("greet.lower").HTTP("post", "/lower").Public(), greet)
 		},
-		`binds GET /o/{oid}, which operation "greet.a" already binds`: func(r *galleon.Registry) {
+		`binds GET /o/{oid}, which conflicts with GET /o/{id} of operation "greet.a"`: func(r *galleon.Registry) {
 			r.Operation(op.Unary[GreetIn, GreetOut]("greet.a").HTTP("GET", "/o/{id}").Public(), greet)
 			r.Operation(op.Unary[GreetIn, GreetOut]("greet.b").HTTP("GET", "/o/{oid}").Public(), greet)
 		},
@@ -425,8 +443,9 @@ func TestDistinctWildcardsAreNotDuplicates(t *testing.T) {
 		r.Operation(op.Unary[GreetIn, GreetOut]("greet.a").HTTP("GET", "/o/{id}").Public(), greet)
 		r.Operation(op.Unary[GreetIn, GreetOut]("greet.b").HTTP("GET", "/o/{rest...}").Public(), greet)
 		r.Operation(op.Unary[GreetIn, GreetOut]("greet.c").HTTP("POST", "/o/{id}").Public(), greet)
+		r.Operation(op.Unary[GreetIn, GreetOut]("greet.d").HTTP("GET", "/o/{$}").Public(), greet)
 	}))
-	if len(ops.All()) != 3 {
+	if len(ops.All()) != 4 {
 		t.Fatal(ops.All())
 	}
 }

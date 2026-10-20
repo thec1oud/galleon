@@ -89,8 +89,10 @@ type Request struct {
 
 // Call is one invocation passing through the pipeline.
 type Call struct {
-	Desc    *Descriptor
-	Input   any // the decoded *In, set by the decode stage
+	Desc *Descriptor
+	// Input is the decoded *In. The decode stage sets it; a caller that sets
+	// it beforehand, skipping decode, must pass a non-nil *In.
+	Input   any
 	Request *Request
 }
 
