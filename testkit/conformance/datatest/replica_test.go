@@ -1,0 +1,727 @@
+package datatest_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/embedded"
+	"go.opentelemetry.io/otel/metric/noop"
+
+	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/coord/local"
+	"github.com/thec1oud/galleon/data"
+	"github.com/thec1oud/galleon/errs"
+	"github.com/thec1oud/galleon/op"
+	"github.com/thec1oud/galleon/pg"
+	"github.com/thec1oud/galleon/server"
+	"github.com/thec1oud/galleon/testkit"
+	"github.com/thec1oud/galleon/testkit/conformance/datatest"
+)
+
+// The tests here run against a real streaming replica, and skip without
+// one (testkit.ReplicaEnv); CI provisions one.
+
+// replicaEnv is a test's table, committed on the primary and replayed on
+// the replica.
+type replicaEnv struct {
+	t     *testing.T
+	db    *testkit.Database
+	rep   *testkit.Replica
+	pool  *pgxpool.Pool
+	table string
+}
+
+func newReplicaEnv(t *testing.T) *replicaEnv {
+	t.Helper()
+	db := testkit.DB(t)
+	rep := db.Replica(t)
+	pool, err := pgxpool.New(context.Background(), db.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	e := &replicaEnv{t: t, db: db, rep: rep, pool: pool, table: fmt.Sprintf("replica_%d", time.Now().UnixNano())}
+	e.exec("CREATE TABLE " + e.table + " (id int PRIMARY KEY)")
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+e.table) })
+	rep.CatchUp()
+	return e
+}
+
+func (e *replicaEnv) exec(sql string, args ...any) {
+	e.t.Helper()
+	if _, err := e.pool.Exec(context.Background(), sql, args...); err != nil {
+		e.t.Fatalf("%s: %v", sql, err)
+	}
+}
+
+// manager starts a Manager on the primary and the replica (or replicaDSN),
+// tracked every 10ms.
+func (e *replicaEnv) manager(cfg pg.Config, opts ...pg.Option) *pg.Manager {
+	e.t.Helper()
+	if cfg.Primary.DSN == "" {
+		cfg.Primary.DSN = e.db.DSN()
+	}
+	if cfg.Replicas == nil {
+		cfg.Replicas = []pg.Source{{DSN: e.rep.DSN()}}
+	}
+	if cfg.LagPoll == 0 {
+		cfg.LagPoll = 10 * time.Millisecond
+	}
+	m, err := pg.New(cfg, opts...)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if err := m.Start(context.Background()); err != nil {
+		e.t.Fatal(err)
+	}
+	e.t.Cleanup(func() { _ = m.Stop(context.Background()) })
+	return m
+}
+
+// where reads row id at level l and says whether it was found, and on the
+// replica.
+func (e *replicaEnv) where(ctx context.Context, m data.Manager, id int, l data.Level) (found, onReplica bool, err error) {
+	err = m.Read(ctx, func(ctx context.Context, r data.ReadTx) error {
+		return r.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+e.table+" WHERE id = $1), pg_is_in_recovery()", id).Scan(&found, &onReplica)
+	}, data.Consistency(l))
+	return found, onReplica, err
+}
+
+// until polls cond until it holds, failing after 30 seconds.
+func until(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("waited 30s for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (e *replicaEnv) untilOnReplica(m data.Manager, want bool) {
+	e.t.Helper()
+	until(e.t, fmt.Sprintf("Any reads to run on the replica: %v", want), func() bool {
+		_, on, err := e.where(context.Background(), m, 0, data.Any)
+		if err != nil {
+			e.t.Fatalf("a read failed: %v", err)
+		}
+		return on == want
+	})
+}
+
+// syncBuffer is a log destination for a test to read.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+func (s *syncBuffer) String() string { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
+func TestReplicaReadsAreReadOnlyAndWritesNeverReachAReplica(t *testing.T) {
+	e := newReplicaEnv(t)
+	logs := &syncBuffer{}
+	m := e.manager(pg.Config{}, pg.Logger(slog.New(slog.NewTextHandler(logs, nil))))
+	e.untilOnReplica(m, true)
+	ctx := context.Background()
+
+	err := m.Read(ctx, func(ctx context.Context, r data.ReadTx) error {
+		rows, err := r.Query(ctx, "INSERT INTO "+e.table+" (id) VALUES (1)")
+		if err == nil {
+			rows.Close()
+			err = rows.Err()
+		}
+		return err
+	}, data.Consistency(data.Any))
+	if err == nil {
+		t.Fatal("a write through a replica's read transaction worked")
+	}
+	if _, err := m.BeginWrite(ctx, data.Source("replica_1")); errs.From(err).Code != data.CodeUnknownSource {
+		t.Fatalf("a replica can be named as a source: %v", err)
+	}
+	if found, on, err := e.where(ctx, m, 0, data.Primary); err != nil || on {
+		t.Fatalf("a Primary read ran on the replica: %v %v", found, err)
+	}
+
+	err = m.Write(ctx, func(ctx context.Context, w data.WriteTx) error {
+		if _, err := w.Exec(ctx, "INSERT INTO "+e.table+" (id) VALUES (2)"); err != nil {
+			return err
+		}
+		var inRecovery bool
+		if err := w.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery); err != nil || inRecovery {
+			t.Errorf("a write ran on the replica: %v", err)
+		}
+		for _, p := range []data.Propagation{data.Join, data.Nested} {
+			var found, on bool
+			r, err := m.BeginRead(ctx, p, data.Consistency(data.Any))
+			if err != nil {
+				return err
+			}
+			err = r.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+e.table+" WHERE id = 2), pg_is_in_recovery()").Scan(&found, &on)
+			_ = r.Commit(ctx)
+			if err != nil || on || !found {
+				t.Errorf("a %v read in a write transaction left it: found %v, on the replica %v, %v", p, found, on, err)
+			}
+		}
+		// Independent may leave, and is flagged in development.
+		r, err := m.BeginRead(ctx, data.Independent, data.Consistency(data.Any))
+		if err != nil {
+			return err
+		}
+		return r.Rollback(ctx)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "an Independent read began while a write transaction is open") {
+		t.Fatalf("no warning for an Independent read in a write transaction:\n%s", logs)
+	}
+}
+
+func TestALaggingReplicaLeavesRotationAndReturnsOnceCaughtUp(t *testing.T) {
+	e := newReplicaEnv(t)
+	logs := &syncBuffer{}
+	tp := &datatest.Recorder{}
+	m := e.manager(pg.Config{MaxLag: 200 * time.Millisecond}, pg.Logger(slog.New(slog.NewTextHandler(logs, nil))), pg.TracerProvider(tp))
+	e.untilOnReplica(m, true)
+
+	e.rep.Pause()
+	// The replica lags once the primary moves on without it.
+	e.exec("INSERT INTO " + e.table + " (id) VALUES (1)")
+	e.untilOnReplica(m, false)
+	if !strings.Contains(logs.String(), "replica left rotation") || !strings.Contains(logs.String(), "reason=lagging") {
+		t.Errorf("leaving rotation wasn't logged:\n%s", logs)
+	}
+	fell := tp.Find(func(s *datatest.Span) bool {
+		return s.Name() == "transaction" && s.Attr("galleon.data.fallback") == "no_replica" && s.Attr("galleon.data.consistency") == "any"
+	})
+	if len(fell) == 0 {
+		t.Error("no span says a read fell back to the primary")
+	}
+
+	e.rep.Resume()
+	e.untilOnReplica(m, true)
+	if !strings.Contains(logs.String(), "replica joined rotation") {
+		t.Errorf("rejoining wasn't logged:\n%s", logs)
+	}
+}
+
+func TestAReplicaThatGoesDownIsLeftOutUntilItComesBack(t *testing.T) {
+	e := newReplicaEnv(t)
+	proxy := testkit.NewProxy(t, e.rep.DSN())
+	m := e.manager(pg.Config{Replicas: []pg.Source{{DSN: proxy.DSN(e.rep.DSN())}}})
+	e.untilOnReplica(m, true)
+
+	proxy.Cut()
+	// Every read works while the replica is down, from the primary.
+	e.untilOnReplica(m, false)
+	for range 20 {
+		if _, on, err := e.where(context.Background(), m, 0, data.ReadYourWrites.Wait(time.Second)); err != nil || on {
+			t.Fatalf("with the replica down: on the replica %v, %v", on, err)
+		}
+	}
+	proxy.Restore()
+	e.untilOnReplica(m, true)
+
+	// A replica down from the start doesn't stop the Manager starting.
+	proxy.Cut()
+	m2 := e.manager(pg.Config{Replicas: []pg.Source{{DSN: proxy.DSN(e.rep.DSN())}}})
+	if _, on, err := e.where(context.Background(), m2, 0, data.Any); err != nil || on {
+		t.Fatalf("all replicas down: on the replica %v, %v", on, err)
+	}
+	proxy.Restore()
+	e.untilOnReplica(m2, true)
+}
+
+func TestAPrimaryThatIsDownIsUnavailableToPrimaryReadsAndWrites(t *testing.T) {
+	e := newReplicaEnv(t)
+	proxy := testkit.NewProxy(t, e.db.DSN())
+	m := e.manager(pg.Config{Primary: pg.Source{DSN: proxy.DSN(e.db.DSN())}})
+	e.untilOnReplica(m, true)
+	proxy.Cut()
+	ctx := context.Background()
+	if _, _, err := e.where(ctx, m, 0, data.Primary); errs.KindOf(err) != errs.Unavailable {
+		t.Fatalf("a Primary read: %v", err)
+	}
+	if err := m.Write(ctx, func(context.Context, data.WriteTx) error { return nil }); errs.KindOf(err) != errs.Unavailable {
+		t.Fatalf("a write: %v", err)
+	}
+}
+
+// When a database comes back, the connections the pool kept from before
+// are dead; the first transaction after replaces them instead of failing.
+func TestTheFirstTransactionAfterADatabaseReturnsSucceeds(t *testing.T) {
+	db := testkit.DB(t)
+	proxy := testkit.NewProxy(t, db.DSN())
+	m, err := pg.New(pg.Config{Primary: pg.Source{DSN: proxy.DSN(db.DSN()), MaxConns: 4}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(context.Background()) })
+	// Fill the pool: four transactions at once.
+	var held []data.ReadTx
+	for range 4 {
+		r, err := m.BeginRead(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var x int
+		if err := r.QueryRow(ctx, "SELECT 1").Scan(&x); err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, r)
+	}
+	for _, r := range held {
+		if err := r.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	proxy.Cut()
+	proxy.Restore()
+	for _, write := range []bool{false, true} {
+		var err error
+		if write {
+			err = m.Write(ctx, func(context.Context, data.WriteTx) error { return nil }, data.Retry(data.NoRetry))
+		} else {
+			err = m.Read(ctx, func(context.Context, data.ReadTx) error { return nil }, data.Retry(data.NoRetry))
+		}
+		if err != nil {
+			t.Fatalf("the first transaction (write %v) after the database came back: %v", write, err)
+		}
+	}
+}
+
+// The commit's WAL position is read in the round trip of the COMMIT
+// itself: what the client sends to commit is one simple query.
+func TestTheCommitPositionComesWithTheCommitInOneRoundTrip(t *testing.T) {
+	db := testkit.DB(t)
+	proxy := testkit.NewProxy(t, db.DSN())
+	m, err := pg.New(pg.Config{Primary: pg.Source{DSN: proxy.DSN(db.DSN()), MaxConns: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := pg.CausalContext(context.Background())
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(context.Background()) })
+	table := fmt.Sprintf("commit_%d", time.Now().UnixNano())
+	if err := m.Write(ctx, func(ctx context.Context, w data.WriteTx) error {
+		_, err := w.Exec(ctx, "CREATE TABLE "+table+" (id int)")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = m.Write(context.Background(), func(ctx context.Context, w data.WriteTx) error {
+			_, err := w.Exec(ctx, "DROP TABLE "+table)
+			return err
+		})
+	})
+
+	w, err := m.BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Exec(ctx, "INSERT INTO "+table+" VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	proxy.Reset()
+	if err := w.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	msgs := proxy.Messages()
+	if len(msgs) != 1 || msgs[0].Type != 'Q' || !strings.Contains(msgs[0].SQL, "COMMIT") || !strings.Contains(msgs[0].SQL, "pg_current_wal_insert_lsn()") {
+		t.Fatalf("committing sent %+v, want one simple query that commits and reads the position", msgs)
+	}
+
+	// A read commits as it always did.
+	r, err := m.BeginRead(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.Reset()
+	if err := r.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if msgs := proxy.Messages(); len(msgs) != 1 || msgs[0].SQL != "commit" {
+		t.Fatalf("a read's commit sent %+v", msgs)
+	}
+
+	// A failed transaction's commit rolls back, as before.
+	w, err = m.BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Exec(ctx, "SELECT 1/0")
+	if err := w.Commit(ctx); err == nil {
+		t.Fatal("a failed transaction committed")
+	}
+	if err := m.Write(ctx, func(ctx context.Context, w data.WriteTx) error {
+		var n int
+		return w.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n)
+	}); err != nil {
+		t.Fatalf("the connection is unusable after: %v", err)
+	}
+}
+
+func TestTheTrackerStopsWithTheManagerAndStartsAgain(t *testing.T) {
+	e := newReplicaEnv(t)
+	pollers := func() int {
+		buf := make([]byte, 1<<20)
+		buf = buf[:runtime.Stack(buf, true)]
+		n := 0
+		for _, g := range strings.Split(string(buf), "\n\n") {
+			if strings.Contains(g, "galleon/pg.(*topology).") {
+				n++
+			}
+		}
+		return n
+	}
+	m, err := pg.New(pg.Config{Primary: pg.Source{DSN: e.db.DSN()}, Replicas: []pg.Source{{DSN: e.rep.DSN()}}, LagPoll: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for round := range 2 {
+		before := pollers()
+		if err := m.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n := pollers() - before; n != 2 {
+			t.Fatalf("round %d: %d pollers, want one for the primary and one for the replica", round, n)
+		}
+		e.untilOnReplica(m, true)
+		if err := m.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Stop waits for them.
+		if n := pollers() - before; n != 0 {
+			t.Fatalf("round %d: %d pollers outlived Stop", round, n)
+		}
+	}
+}
+
+// recMeter keeps what the data plane counts and observes.
+type recMeter struct {
+	noop.Meter
+	mu        sync.Mutex
+	counts    map[string]int64
+	callbacks []metric.Callback
+}
+
+type recCounter struct {
+	noop.Int64Counter
+	m    *recMeter
+	name string
+}
+
+func (c recCounter) Add(_ context.Context, n int64, opts ...metric.AddOption) {
+	cfg := metric.NewAddConfig(opts)
+	c.m.mu.Lock()
+	defer c.m.mu.Unlock()
+	key := c.name
+	set := cfg.Attributes()
+	for _, kv := range set.ToSlice() {
+		key += " " + string(kv.Key) + "=" + kv.Value.Emit()
+	}
+	c.m.counts[key] += n
+}
+
+type (
+	recIntGauge struct {
+		noop.Int64ObservableGauge
+		name string
+	}
+	recFloatGauge struct {
+		noop.Float64ObservableGauge
+		name string
+	}
+)
+
+func (m *recMeter) Int64Counter(name string, _ ...metric.Int64CounterOption) (metric.Int64Counter, error) {
+	return recCounter{m: m, name: name}, nil
+}
+func (m *recMeter) Int64ObservableGauge(name string, _ ...metric.Int64ObservableGaugeOption) (metric.Int64ObservableGauge, error) {
+	return recIntGauge{name: name}, nil
+}
+func (m *recMeter) Float64ObservableGauge(name string, _ ...metric.Float64ObservableGaugeOption) (metric.Float64ObservableGauge, error) {
+	return recFloatGauge{name: name}, nil
+}
+func (m *recMeter) RegisterCallback(f metric.Callback, _ ...metric.Observable) (metric.Registration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.callbacks = append(m.callbacks, f)
+	return noop.Registration{}, nil
+}
+
+// observe runs the callbacks and returns what they observed, by
+// instrument and attributes.
+func (m *recMeter) observe() map[string]float64 {
+	m.mu.Lock()
+	cbs := append([]metric.Callback(nil), m.callbacks...)
+	m.mu.Unlock()
+	o := &recObserver{seen: map[string]float64{}}
+	for _, f := range cbs {
+		_ = f(context.Background(), o)
+	}
+	return o.seen
+}
+
+func (m *recMeter) count(prefix string) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var n int64
+	for k, v := range m.counts {
+		if strings.HasPrefix(k, prefix) {
+			n += v
+		}
+	}
+	return n
+}
+
+type recObserver struct {
+	embedded.Observer
+	seen map[string]float64
+}
+
+func attrsOf(opts []metric.ObserveOption) string {
+	var s string
+	set := metric.NewObserveConfig(opts).Attributes()
+	for _, kv := range set.ToSlice() {
+		s += " " + string(kv.Key) + "=" + kv.Value.Emit()
+	}
+	return s
+}
+
+func (o *recObserver) ObserveFloat64(i metric.Float64Observable, v float64, opts ...metric.ObserveOption) {
+	o.seen[i.(recFloatGauge).name+attrsOf(opts)] = v
+}
+func (o *recObserver) ObserveInt64(i metric.Int64Observable, v int64, opts ...metric.ObserveOption) {
+	o.seen[i.(recIntGauge).name+attrsOf(opts)] = float64(v)
+}
+
+type recProvider struct {
+	embedded.MeterProvider
+	m *recMeter
+}
+
+func (p recProvider) Meter(string, ...metric.MeterOption) metric.Meter { return p.m }
+
+func TestSpansAndMetricsNameTheReplicaAndTheFallbacks(t *testing.T) {
+	e := newReplicaEnv(t)
+	tp := &datatest.Recorder{}
+	meter := &recMeter{counts: map[string]int64{}}
+	m := e.manager(pg.Config{MaxLag: time.Hour}, pg.TracerProvider(tp), pg.MeterProvider(recProvider{m: meter}))
+	e.untilOnReplica(m, true)
+
+	onReplica := tp.Find(func(s *datatest.Span) bool {
+		return s.Name() == "transaction" && s.Attr("galleon.data.replica") == "replica_1" && s.Attr("galleon.data.consistency") == "any"
+	})
+	if len(onReplica) == 0 {
+		t.Fatalf("no transaction span names the replica: %v", tp.Names())
+	}
+	stmts := tp.Find(func(s *datatest.Span) bool { return s.Parent() == onReplica[0] && s.Attr("db.query.text") != "" })
+	if len(stmts) == 0 || stmts[0].Attr("galleon.data.replica") != "replica_1" || stmts[0].Attr("galleon.data.source") != "primary" {
+		t.Errorf("a statement on the replica doesn't say so: %v", stmts)
+	}
+	seen := meter.observe()
+	if seen["galleon.data.replica.in_rotation galleon.data.replica=replica_1"] != 1 {
+		t.Errorf("rotation isn't observed: %v", seen)
+	}
+	if _, ok := seen["galleon.data.replica.lag galleon.data.replica=replica_1"]; !ok {
+		t.Errorf("lag isn't observed: %v", seen)
+	}
+	if _, ok := seen["galleon.data.replica.lag_bytes galleon.data.replica=replica_1"]; !ok {
+		t.Errorf("lag in bytes isn't observed: %v", seen)
+	}
+	if meter.count("galleon.data.reads galleon.data.consistency=any galleon.data.target=replica_1") == 0 {
+		t.Errorf("reads on the replica aren't counted: %v", meter.counts)
+	}
+
+	// A ReadYourWrites read after a write the replica hasn't replayed
+	// waits, then reads the primary.
+	e.rep.Pause()
+	ctx := pg.CausalContext(context.Background())
+	if err := m.Write(ctx, func(ctx context.Context, w data.WriteTx) error {
+		_, err := w.Exec(ctx, "INSERT INTO "+e.table+" (id) VALUES (1)")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if found, on, err := e.where(ctx, m, 1, data.ReadYourWrites.Wait(30*time.Millisecond)); err != nil || !found || on {
+		t.Fatalf("found %v, on the replica %v, %v", found, on, err)
+	}
+	waited := tp.Find(func(s *datatest.Span) bool {
+		return s.Name() == "transaction" && s.Attr("galleon.data.fallback") == "wait_timeout" && s.Attr("galleon.data.wait.duration") != ""
+	})
+	if len(waited) != 1 {
+		t.Errorf("no span says the read waited and fell back")
+	}
+	if meter.count("galleon.data.read.fallbacks galleon.data.consistency=read_your_writes galleon.data.fallback=wait_timeout") != 1 {
+		t.Errorf("the fallback isn't counted: %v", meter.counts)
+	}
+	for _, s := range tp.Find(func(*datatest.Span) bool { return true }) {
+		if s.Contains("postgres://") || s.Contains("sslmode") {
+			t.Fatalf("span %s holds a DSN", s.Name())
+		}
+	}
+}
+
+// Notes is an app with operations over HTTP and RPC, for tokens across
+// requests and apps.
+type NoteIn struct {
+	ID int `json:"id"`
+}
+
+type NoteOut struct {
+	Found     bool `json:"found"`
+	OnReplica bool `json:"on_replica"`
+}
+
+func notesApp(t *testing.T, e *replicaEnv, key string) http.Handler {
+	t.Helper()
+	var m data.Manager
+	mod := galleon.ModuleFunc("notes", func(r *galleon.Registry) error {
+		r.Operation(op.Unary[NoteIn, NoteOut]("notes.add").HTTP("POST", "/notes/add").RPC("notes.v1.Notes", "Add").Public(), func(ctx context.Context, in *NoteIn) (*NoteOut, error) {
+			return &NoteOut{}, m.Write(ctx, func(ctx context.Context, w data.WriteTx) error {
+				_, err := w.Exec(ctx, "INSERT INTO "+e.table+" (id) VALUES ($1)", in.ID)
+				return err
+			})
+		})
+		r.Operation(op.Unary[NoteIn, NoteOut]("notes.get").HTTP("POST", "/notes/get").RPC("notes.v1.Notes", "Get").Public().Consistency(data.ReadYourWrites), func(ctx context.Context, in *NoteIn) (*NoteOut, error) {
+			var out NoteOut
+			found, on, err := e.where(ctx, m, in.ID, data.ReadYourWrites)
+			out.Found, out.OnReplica = found, on
+			return &out, err
+		})
+		return nil
+	})
+	cfg, _ := json.Marshal(map[string]any{
+		"http": map[string]any{"addr": "127.0.0.1:0"},
+		"pg": map[string]any{
+			"primary":   map[string]any{"dsn": e.db.DSN()},
+			"replicas":  []any{map[string]any{"dsn": e.rep.DSN()}},
+			"lag_poll":  int64(10 * time.Millisecond),
+			"max_lag":   int64(time.Hour),
+			"token_key": key,
+		},
+	})
+	app, err := galleon.New(galleon.Name("notes"), galleon.Coordination(local.New()), galleon.Deploy(galleon.SingleNode), galleon.DrainGrace(0),
+		galleon.ConfigJSON(cfg), galleon.Modules(pg.Module(), server.Module(), mod))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.Shutdown(context.Background()) })
+	m = galleon.MustResolve[data.Manager](app)
+	return galleon.MustResolve[*server.Server](app).Handler()
+}
+
+func post(t *testing.T, h http.Handler, path string, id int, hdr http.Header) (NoteOut, http.Header) {
+	t.Helper()
+	r := httptest.NewRequest("POST", path, strings.NewReader(fmt.Sprintf(`{"id":%d}`, id)))
+	r.Header.Set("Content-Type", "application/json")
+	for k, v := range hdr {
+		r.Header[k] = v
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	var out NoteOut
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &out) != nil {
+		t.Fatalf("%s: %d %s", path, w.Code, w.Body)
+	}
+	return out, w.Header()
+}
+
+type jsonCodec struct{}
+
+func (jsonCodec) Name() string                    { return "json" }
+func (jsonCodec) Marshal(v any) ([]byte, error)   { return json.Marshal(v) }
+func (jsonCodec) Unmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
+
+func rpc(t *testing.T, srv *httptest.Server, method string, id int, hdr http.Header) (NoteOut, http.Header) {
+	t.Helper()
+	c := connect.NewClient[NoteIn, NoteOut](srv.Client(), srv.URL+"/notes.v1.Notes/"+method, connect.WithCodec(jsonCodec{}))
+	req := connect.NewRequest(&NoteIn{ID: id})
+	for k, v := range hdr {
+		req.Header()[k] = v
+	}
+	res, err := c.CallUnary(context.Background(), req)
+	if err != nil {
+		t.Fatalf("%s: %v", method, err)
+	}
+	return *res.Msg, res.Header()
+}
+
+func TestTokensCarryReadYourWritesAcrossRequestsAndApps(t *testing.T) {
+	e := newReplicaEnv(t)
+	const key = "a key the two apps share, of 32 bytes or more"
+	a, b := notesApp(t, e, key), notesApp(t, e, key)
+	stranger := notesApp(t, e, "a key of another deployment, also 32 bytes long")
+	for _, h := range []http.Handler{a, b} {
+		until(t, "reads to run on the replica", func() bool {
+			out, _ := post(t, h, "/notes/get", 0, nil)
+			return out.OnReplica
+		})
+	}
+	e.rep.Pause()
+
+	_, hdr := post(t, a, "/notes/add", 1, nil)
+	tok := hdr.Get(pg.ConsistencyHeader)
+	if tok == "" {
+		t.Fatal("a write over HTTP sent no token")
+	}
+	if _, hdr := post(t, a, "/notes/get", 1, nil); hdr.Get(pg.ConsistencyHeader) != "" {
+		t.Fatal("a read sent a token")
+	}
+	with := http.Header{pg.ConsistencyHeader: {tok}}
+	if out, _ := post(t, b, "/notes/get", 1, nil); out.Found || !out.OnReplica {
+		t.Fatalf("without the token the lagging replica serves, and hasn't the write: %+v", out)
+	}
+	if out, _ := post(t, b, "/notes/get", 1, with); !out.Found {
+		t.Fatalf("another app, with the token: %+v", out)
+	}
+	if out, _ := post(t, stranger, "/notes/get", 1, with); out.Found {
+		t.Fatalf("an app with another key honored the token: %+v", out)
+	}
+
+	sa, sb := httptest.NewServer(a), httptest.NewServer(b)
+	t.Cleanup(sa.Close)
+	t.Cleanup(sb.Close)
+	_, rh := rpc(t, sa, "Add", 2, nil)
+	rtok := rh.Get(pg.ConsistencyHeader)
+	if rtok == "" {
+		t.Fatal("a write over RPC sent no token")
+	}
+	if out, _ := rpc(t, sb, "Get", 2, nil); out.Found {
+		t.Fatalf("over RPC, without the token: %+v", out)
+	}
+	if out, _ := rpc(t, sb, "Get", 2, http.Header{pg.ConsistencyHeader: {rtok}}); !out.Found {
+		t.Fatalf("over RPC, with the token: %+v", out)
+	}
+}

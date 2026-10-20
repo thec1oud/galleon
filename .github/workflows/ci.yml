@@ -8,28 +8,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
-      # The server tests that need Postgres create their databases on
-      # (testkit.PostgresEnv). With CI set, they fail rather than skip
-      # when it is missing.
+      # The tests that need Postgres create their databases on
+      # GALLEON_TEST_POSTGRES (testkit.PostgresEnv), and the ones that need
+      # a streaming replica use GALLEON_TEST_POSTGRES_REPLICA
+      # (testkit.ReplicaEnv), a standby of it. With CI set, they fail
+      # rather than skip when either is missing. The "Start Postgres" step
+      # runs both.
       GALLEON_TEST_POSTGRES: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      GALLEON_TEST_POSTGRES_REPLICA: postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.work
+      # A service container can't be a standby of another, so both run
+      # here, on the host's network.
+      - name: Start Postgres, with a streaming replica
+        run: .github/scripts/postgres-replica.sh
       - name: Check formatting
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: Vet and test every workspace module
@@ -39,3 +35,8 @@ jobs:
             (cd "$dir" && go vet ./... && go test -race ./...)
             echo "::endgroup::"
           done
+      - name: Postgres logs
+        if: failure()
+        run: |
+          docker logs galleon-pg-primary || true
+          docker logs galleon-pg-standby || true
