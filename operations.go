@@ -373,3 +373,30 @@ func validateStage(pick func(*op.Descriptor) func(context.Context, any) *op.Vali
 		}
 	}
 }
+
+// Middleware adds outer HTTP middleware, which runs before routing for every
+// request the HTTP transport serves. It suits concerns that don't depend on
+// the operation, such as CORS or compression; any func(http.Handler)
+// http.Handler from the Go ecosystem works. Middleware runs in registration
+// order, earliest outermost.
+func (r *Registry) Middleware(mw func(http.Handler) http.Handler) {
+	if mw == nil {
+		r.errorf("Middleware: the middleware is nil")
+		return
+	}
+	r.app.middleware.list = append(r.app.middleware.list, mw)
+}
+
+// HTTPMiddleware is the outer middleware modules registered. The kernel
+// provides it for the HTTP transport.
+type HTTPMiddleware struct {
+	list []func(http.Handler) http.Handler
+}
+
+// Wrap returns h wrapped in every middleware, earliest outermost.
+func (m *HTTPMiddleware) Wrap(h http.Handler) http.Handler {
+	for i := len(m.list) - 1; i >= 0; i-- {
+		h = m.list[i](h)
+	}
+	return h
+}

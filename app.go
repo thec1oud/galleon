@@ -166,6 +166,7 @@ type App struct {
 	interceptors []op.Placed
 	stageImpls   map[op.Stage]stageImpl
 	operations   *Operations
+	middleware   *HTTPMiddleware
 
 	bootErrs []error
 
@@ -226,6 +227,7 @@ func New(opts ...Option) (*App, error) {
 		knownRoles:   map[Role]bool{},
 		stageImpls:   map[op.Stage]stageImpl{},
 		operations:   &Operations{byID: map[string]*Operation{}},
+		middleware:   &HTTPMiddleware{},
 		fatal:        make(chan struct{}),
 	}
 
@@ -243,6 +245,7 @@ func New(opts ...Option) (*App, error) {
 	Supply[trace.TracerProvider](kernel, s.tracerProvider)
 	Supply[metric.MeterProvider](kernel, s.meterProvider)
 	Supply[*Operations](kernel, a.operations)
+	Supply[*HTTPMiddleware](kernel, a.middleware)
 	if a.backend != nil {
 		Supply[coord.Backend](kernel, a.backend)
 	}
