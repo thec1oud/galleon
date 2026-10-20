@@ -33,6 +33,19 @@ func (b *Builder[In, Out]) Describe() Descriptor {
 	d.Errors = append([]string(nil), d.Errors...)
 	d.Security.Schemes = append([]string(nil), d.Security.Schemes...)
 	d.Security.Contexts = append([]string(nil), d.Security.Contexts...)
+	d.Docs.Tags = append([]string(nil), d.Docs.Tags...)
+	if d.Deprecated != nil {
+		v := *d.Deprecated
+		d.Deprecated = &v
+	}
+	if d.Security.Resource != nil {
+		v := *d.Security.Resource
+		d.Security.Resource = &v
+	}
+	if d.Policies.RateLimit != nil {
+		v := *d.Policies.RateLimit
+		d.Policies.RateLimit = &v
+	}
 	if d.Meta != nil {
 		m := make(map[string]any, len(d.Meta))
 		for k, v := range d.Meta {

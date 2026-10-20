@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"strings"
+	"regexp"
 
 	"github.com/thec1oud/galleon/coord"
 	"github.com/thec1oud/galleon/errs"
@@ -21,6 +21,8 @@ type Operation struct {
 	Invoke op.Invoker
 	// Steps lists the pipeline's interceptors and stages, outermost first.
 	Steps []string
+
+	inType reflect.Type // *In
 }
 
 // Operations is every operation in the app. The kernel provides it, so
@@ -44,8 +46,8 @@ func (o *Operations) Call(ctx context.Context, id string, in any) (any, error) {
 	if x == nil {
 		return nil, errs.New(errs.NotFound, "galleon.unknown_operation", "no such operation")
 	}
-	if want := reflect.PointerTo(x.Desc.Input.Type); reflect.TypeOf(in) != want {
-		return nil, errs.New(errs.Internal, "galleon.wrong_input", fmt.Sprintf("operation %q takes %v, not %T", id, want, in))
+	if reflect.TypeOf(in) != x.inType || reflect.ValueOf(in).IsNil() {
+		return nil, errs.New(errs.Internal, "galleon.wrong_input", fmt.Sprintf("operation %q takes a non-nil %v, not %T", id, x.inType, in))
 	}
 	return x.Invoke(ctx, &op.Call{Desc: x.Desc, Input: in, Request: &op.Request{Transport: "local"}})
 }
@@ -73,9 +75,10 @@ func (r *Registry) Operation(def op.Definition, handler any) {
 	d := def.Describe()
 	bad := d.Check()
 	var h op.Handler
-	if d.Adapt != nil {
-		var err error
-		if h, err = d.Adapt(handler); err != nil {
+	if len(bad) == 0 {
+		if err := checkHandler(&d, handler); err != nil {
+			bad = append(bad, fmt.Errorf("operation %q: %w", d.ID, err))
+		} else if h, err = d.Adapt(handler); err != nil {
 			bad = append(bad, fmt.Errorf("operation %q: %w", d.ID, err))
 		}
 	}
@@ -91,8 +94,36 @@ func (r *Registry) Operation(def op.Definition, handler any) {
 	r.app.ops = append(r.app.ops, registeredOp{desc: d, handler: h, module: r.module, site: callerSite(2)})
 }
 
+// checkHandler compares the handler with the descriptor's own types, so a
+// hand-written descriptor whose adapter disagrees with its TypeInfo fails boot
+// instead of the first call.
+func checkHandler(d *op.Descriptor, handler any) error {
+	ht := reflect.TypeOf(handler)
+	want := reflect.FuncOf(
+		[]reflect.Type{contextType, reflect.PointerTo(d.Input.Type)},
+		[]reflect.Type{reflect.PointerTo(d.Output.Type), errorType}, false)
+	switch {
+	case ht != want:
+		return fmt.Errorf("handler is %v, want %v", ht, want)
+	case reflect.ValueOf(handler).IsNil():
+		return fmt.Errorf("handler is a nil %v", ht)
+	}
+	return nil
+}
+
+var contextType = reflect.TypeFor[context.Context]()
+
 // Intercept attaches an interceptor before or after a stage of every
 // operation's pipeline.
+//
+// Interceptors at Before and After a stage that acts on the way in (route to
+// validate meaning) run before and after that stage's work. Route has already
+// matched by the time the pipeline starts, so Before(StageRoute) is simply the
+// outermost position. Commit hooks and encode act on the way out: an After
+// interceptor there sees the output after the stage did its work, a Before
+// one sees it first. Before(StageHandle) and After(StageHandle) both wrap the
+// handler directly; After is the inner one, so it sees the output first. See
+// op.Compile for the full order.
 func (r *Registry) Intercept(at op.Position, i op.Interceptor) {
 	site := callerSite(2)
 	switch {
@@ -193,16 +224,29 @@ func (a *App) compileOperations() {
 		}
 		d := o.desc
 		inv, steps := op.Compile(o.handler, op.Plan{Stages: stages, Placed: a.interceptors})
-		x := &Operation{Desc: &d, Module: o.module, Site: o.site, Invoke: inv, Steps: steps}
+		x := &Operation{Desc: &d, Module: o.module, Site: o.site, Steps: steps, inType: reflect.PointerTo(d.Input.Type)}
+		// The invoker always runs this operation's descriptor, whatever the
+		// caller put in the call.
+		x.Invoke = func(ctx context.Context, call *op.Call) (any, error) {
+			call.Desc = x.Desc
+			if call.Request == nil {
+				call.Request = &op.Request{}
+			}
+			return inv(ctx, call)
+		}
 		a.operations.all = append(a.operations.all, x)
 		a.operations.byID[d.ID] = x
 	}
 }
 
+// wildcardName matches a ServeMux wildcard, so "{id}" and "{oid}" compare
+// equal while "{rest...}" stays distinct from "{id}".
+var wildcardName = regexp.MustCompile(`\{([^}.]*)(\.\.\.)?\}`)
+
 func bindingKey(b op.Binding) string {
 	switch b := b.(type) {
 	case op.HTTP:
-		return "http " + strings.ToUpper(b.Method) + " " + b.Path
+		return "http " + b.Method + " " + wildcardName.ReplaceAllString(b.Path, "{$2}")
 	case op.RPC:
 		return "rpc " + b.Service + "/" + b.Method
 	case op.Topic:
@@ -211,18 +255,25 @@ func bindingKey(b op.Binding) string {
 	return fmt.Sprintf("%T", b)
 }
 
-// admit applies the operation's timeout and rate limit. A coordination error
-// while counting lets the call through, so an outage of the backend doesn't
-// take down every rate-limited operation; it is logged.
+// admit applies the operation's timeout and rate limit. The limit is kept per
+// caller IP, or per key when the operation sets one; a call with no key, such
+// as one made in process, isn't limited. A coordination error while counting
+// lets the call through, so an outage of the backend doesn't take down every
+// rate-limited operation; it is logged.
 func (a *App) admit(next op.Invoker) op.Invoker {
 	return func(ctx context.Context, call *op.Call) (any, error) {
 		p := &call.Desc.Policies
+		if p.Timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, p.Timeout)
+			defer cancel()
+		}
 		if rl := p.RateLimit; rl != nil {
 			key := call.Request.Peer
 			if rl.Key != nil {
 				key = rl.Key(call)
 			}
-			if key != "" || rl.Key == nil {
+			if key != "" {
 				n, err := a.backend.Counters().Add(ctx, "galleon/ratelimit/"+call.Desc.ID+"/"+key, 1, rl.Window)
 				switch {
 				case err != nil:
@@ -231,11 +282,6 @@ func (a *App) admit(next op.Invoker) op.Invoker {
 					return nil, errs.New(errs.TooManyRequests, "galleon.rate_limited", "too many requests", errs.RetryInfo{After: rl.Window})
 				}
 			}
-		}
-		if p.Timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, p.Timeout)
-			defer cancel()
 		}
 		return next(ctx, call)
 	}

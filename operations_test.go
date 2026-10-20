@@ -105,9 +105,34 @@ func TestRegistrationErrorsFailBoot(t *testing.T) {
 		},
 		`which operation "greet.hello" already binds`: func(r *galleon.Registry) {
 			r.Operation(Greet, greet)
-			r.Operation(op.Unary[GreetIn, GreetOut]("greet.other").HTTP("post", "/hello").Public(), greet)
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.other").HTTP("POST", "/hello").Public(), greet)
 		},
 		"the definition is nil": func(r *galleon.Registry) { r.Operation(nil, greet) },
+		"handler is a nil": func(r *galleon.Registry) {
+			var h func(context.Context, *GreetIn) (*GreetOut, error)
+			r.Operation(Greet, h)
+		},
+		"upper-case method": func(r *galleon.Registry) {
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.lower").HTTP("post", "/lower").Public(), greet)
+		},
+		`binds GET /o/{oid}, which operation "greet.a" already binds`: func(r *galleon.Registry) {
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.a").HTTP("GET", "/o/{id}").Public(), greet)
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.b").HTTP("GET", "/o/{oid}").Public(), greet)
+		},
+		`binds /greet.v1.Greeter/Hello, which operation "greet.a" already binds`: func(r *galleon.Registry) {
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.a").RPC("greet.v1.Greeter", "Hello").Public(), greet)
+			r.Operation(op.Unary[GreetIn, GreetOut]("greet.b").RPC("greet.v1.Greeter", "Hello").Public(), greet)
+		},
+		"want func(context.Context, *galleon_test.GreetIn) (*galleon_test.GreetOut, error)": func(r *galleon.Registry) {
+			// The adapter agrees with the handler, but the descriptor's own
+			// types don't.
+			d := op.Descriptor{
+				ID: "greet.hand", Kind: op.KindUnary, Security: op.Security{Public: true},
+				Input: op.TypeOf[GreetIn](), Output: op.TypeOf[GreetOut](),
+				Adapt: op.Adapter[TaggedIn, GreetOut](),
+			}
+			r.Operation(d, func(context.Context, *TaggedIn) (*GreetOut, error) { return nil, nil })
+		},
 		"invalid position": func(r *galleon.Registry) {
 			r.Intercept(op.Position{Stage: 99, Where: op.BeforeStage}, func(n op.Invoker) op.Invoker { return n })
 		},
@@ -330,7 +355,7 @@ func (brokenCounters) Add(context.Context, string, int64, time.Duration) (int64,
 }
 
 func TestRateLimitLetsCallsThroughWhenCountingFails(t *testing.T) {
-	limited := op.Unary[GreetIn, GreetOut]("greet.hello").Public().RateLimit(1, time.Hour)
+	limited := op.Unary[GreetIn, GreetOut]("greet.hello").Public().RateLimitBy(1, time.Hour, func(*op.Call) string { return "everyone" })
 	opts := append(base(opsModule(func(r *galleon.Registry) { r.Operation(limited, greet) })), galleon.Coordination(failingCounters{local.New()}))
 	app, err := galleon.New(opts...)
 	if err != nil {
@@ -352,5 +377,66 @@ func TestOperationsCannotBeReplaced(t *testing.T) {
 	opts := append(base(), galleon.Replace(&galleon.Operations{}))
 	if _, err := galleon.New(opts...); err == nil || !strings.Contains(err.Error(), "the kernel provides") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+type TaggedIn struct {
+	Name string `json:"name"`
+}
+
+func TestDistinctWildcardsAreNotDuplicates(t *testing.T) {
+	_, ops := bootOps(t, opsModule(func(r *galleon.Registry) {
+		r.Operation(op.Unary[GreetIn, GreetOut]("greet.a").HTTP("GET", "/o/{id}").Public(), greet)
+		r.Operation(op.Unary[GreetIn, GreetOut]("greet.b").HTTP("GET", "/o/{rest...}").Public(), greet)
+		r.Operation(op.Unary[GreetIn, GreetOut]("greet.c").HTTP("POST", "/o/{id}").Public(), greet)
+	}))
+	if len(ops.All()) != 3 {
+		t.Fatal(ops.All())
+	}
+}
+
+func TestInvokeUsesItsOwnDescriptor(t *testing.T) {
+	limited := op.Unary[GreetIn, GreetOut]("greet.limited").Public().RateLimitBy(1, time.Hour, func(*op.Call) string { return "k" })
+	_, ops := bootOps(t, opsModule(func(r *galleon.Registry) {
+		r.Operation(Greet, greet)
+		r.Operation(limited, greet)
+	}))
+	hello, other := ops.Lookup("greet.hello"), ops.Lookup("greet.limited")
+	for i := 0; i < 3; i++ {
+		// A wrong descriptor in the call must not bring the other
+		// operation's rate limit along, and a nil request is allowed.
+		if _, err := hello.Invoke(context.Background(), &op.Call{Desc: other.Desc, Input: &GreetIn{}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := hello.Invoke(context.Background(), &op.Call{Input: &GreetIn{}}); err != nil {
+		t.Fatalf("a nil descriptor is filled in: %v", err)
+	}
+}
+
+func TestCallRefusesATypedNilInput(t *testing.T) {
+	_, ops := bootOps(t, opsModule(func(r *galleon.Registry) { r.Operation(Greet, greet) }))
+	if _, err := ops.Call(context.Background(), "greet.hello", (*GreetIn)(nil)); errs.KindOf(err) != errs.Internal {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestNilOutputComesBackAsNil(t *testing.T) {
+	_, ops := bootOps(t, opsModule(func(r *galleon.Registry) {
+		r.Operation(Greet, func(context.Context, *GreetIn) (*GreetOut, error) { return nil, nil })
+	}))
+	out, err := ops.Call(context.Background(), "greet.hello", &GreetIn{})
+	if err != nil || out != nil {
+		t.Fatalf("a nil *Out must be a plain nil, got %#v, %v", out, err)
+	}
+}
+
+func TestRateLimitSkipsCallsWithoutAPeer(t *testing.T) {
+	limited := op.Unary[GreetIn, GreetOut]("greet.hello").Public().RateLimit(1, time.Hour)
+	_, ops := bootOps(t, opsModule(func(r *galleon.Registry) { r.Operation(limited, greet) }))
+	for i := 0; i < 3; i++ {
+		if _, err := ops.Call(context.Background(), "greet.hello", &GreetIn{}); err != nil {
+			t.Fatalf("an in-process call has no peer and isn't limited, got %v", err)
+		}
 	}
 }

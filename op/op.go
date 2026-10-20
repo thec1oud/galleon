@@ -99,7 +99,8 @@ const (
 )
 
 // RateLimit allows Limit calls per Window for each key. Key defaults to the
-// caller's peer address; return "" from it to skip the limit for a call.
+// caller's IP address, and a call without one isn't limited; a custom Key can
+// return "" to skip the limit for a call.
 type RateLimit struct {
 	Limit  int64
 	Window time.Duration
@@ -163,10 +164,13 @@ func Adapter[In, Out any]() func(h any) (Handler, error) {
 		if !ok {
 			return nil, fmt.Errorf("handler is %T, want func(context.Context, *%s) (*%s, error)", h, reflect.TypeFor[In](), reflect.TypeFor[Out]())
 		}
+		if f == nil {
+			return nil, fmt.Errorf("handler is a nil %T", h)
+		}
 		return func(ctx context.Context, in any) (any, error) {
 			out, err := f(ctx, in.(*In))
-			if err != nil {
-				return nil, err
+			if err != nil || out == nil {
+				return nil, err // a nil *Out comes back as a plain nil
 			}
 			return out, nil
 		}, nil
@@ -178,7 +182,10 @@ func TypeOf[T any]() TypeInfo {
 	return TypeInfo{Type: reflect.TypeFor[T](), New: func() any { return new(T) }}
 }
 
-var idPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`)
+var (
+	idPattern     = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`)
+	methodPattern = regexp.MustCompile(`^[A-Z]+$`)
+)
 
 // Check reports what is wrong with d on its own, before it is compared with
 // other operations or a handler.
@@ -206,8 +213,8 @@ func (d *Descriptor) Check() []error {
 	for _, b := range d.Bindings {
 		switch b := b.(type) {
 		case HTTP:
-			if b.Method == "" || len(b.Path) == 0 || b.Path[0] != '/' {
-				errs = append(errs, fmt.Errorf("operation %q: HTTP binding needs a method and a path starting with /, got %q %q", d.ID, b.Method, b.Path))
+			if !methodPattern.MatchString(b.Method) || len(b.Path) == 0 || b.Path[0] != '/' {
+				errs = append(errs, fmt.Errorf("operation %q: HTTP binding needs an upper-case method and a path starting with /, got %q %q", d.ID, b.Method, b.Path))
 			}
 		case RPC:
 			if b.Service == "" || b.Method == "" {

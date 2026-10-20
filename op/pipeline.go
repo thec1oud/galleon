@@ -22,7 +22,7 @@ const (
 	StageValidateMeaning                  // validators that read
 	StageHandle                           // the handler
 	StageCommitHooks                      // after commit: outbox, cache, events
-	StageEncode                           // the output, on its way out
+	StageEncode                           // the output, on its way out; the transport serializes it
 )
 
 var stageNames = [...]string{
@@ -80,7 +80,7 @@ type Request struct {
 	Transport string      // "http", "rpc", "event", "job" or "test"
 	Binding   Binding     // the binding the call arrived on
 	Header    http.Header // HTTP headers or RPC metadata
-	Peer      string      // the caller's network address, if known
+	Peer      string      // the caller's IP address, without a port; empty if unknown
 
 	// Decode fills into, a *In, from the call's payload. The transport sets
 	// it; it enforces the body limit and the unknown-fields policy.
