@@ -81,7 +81,9 @@ func newMetrics(mp metric.MeterProvider, topo *topology) *metrics {
 			if rd.lag != unknownLag {
 				o.ObserveFloat64(lag, rd.lag.Seconds(), set)
 			}
-			o.ObserveInt64(lagBytes, rd.lagBytes, set)
+			if rd.lagBytes != unknownBytes {
+				o.ObserveInt64(lagBytes, rd.lagBytes, set)
+			}
 		}
 		return nil
 	}, lag, lagBytes, rotating)

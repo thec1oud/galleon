@@ -604,6 +604,12 @@ type NoteOut struct {
 
 func notesApp(t *testing.T, e *replicaEnv, key string) http.Handler {
 	t.Helper()
+	return notesAppOn(t, e, key, e.db.DSN())
+}
+
+// notesAppOn is notesApp with its primary at dsn.
+func notesAppOn(t *testing.T, e *replicaEnv, key, dsn string) http.Handler {
+	t.Helper()
 	var m data.Manager
 	mod := galleon.ModuleFunc("notes", func(r *galleon.Registry) error {
 		r.Operation(op.Unary[NoteIn, NoteOut]("notes.add").HTTP("POST", "/notes/add").RPC("notes.v1.Notes", "Add").Public(), func(ctx context.Context, in *NoteIn) (*NoteOut, error) {
@@ -623,7 +629,7 @@ func notesApp(t *testing.T, e *replicaEnv, key string) http.Handler {
 	cfg, _ := json.Marshal(map[string]any{
 		"http": map[string]any{"addr": "127.0.0.1:0"},
 		"pg": map[string]any{
-			"primary":   map[string]any{"dsn": e.db.DSN()},
+			"primary":   map[string]any{"dsn": dsn},
 			"replicas":  []any{map[string]any{"dsn": e.rep.DSN()}},
 			"lag_poll":  int64(10 * time.Millisecond),
 			"max_lag":   int64(time.Hour),
@@ -729,7 +735,7 @@ func TestTokensCarryReadYourWritesAcrossRequestsAndApps(t *testing.T) {
 
 // asRole creates a login role without superuser for the test, and returns
 // dsn for it.
-func asRole(t *testing.T, pool *pgxpool.Pool, dsn string) string {
+func asRole(t *testing.T, pool *pgxpool.Pool, dsn string) (string, string) {
 	t.Helper()
 	role := fmt.Sprintf("galleon_role_%d", time.Now().UnixNano())
 	ctx := context.Background()
@@ -745,7 +751,7 @@ func asRole(t *testing.T, pool *pgxpool.Pool, dsn string) string {
 		t.Fatal(err)
 	}
 	u.User = url.User(role)
-	return u.String()
+	return u.String(), role
 }
 
 // revoke takes fn, a function of the package's database, from everyone but
@@ -772,8 +778,7 @@ func TestAWriteThatCommittedSucceedsWhenItsPositionCantBeRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	dsn := asRole(t, pool, db.DSN())
-	role := strings.SplitN(strings.TrimPrefix(dsn, "postgres://"), "@", 2)[0]
+	dsn, role := asRole(t, pool, db.DSN())
 	table := fmt.Sprintf("committed_%d", time.Now().UnixNano())
 	for _, sql := range []string{"CREATE TABLE " + table + " (id int PRIMARY KEY)", "GRANT ALL ON TABLE " + table + " TO " + role} {
 		if _, err := pool.Exec(ctx, sql); err != nil {
@@ -813,12 +818,56 @@ func TestAWriteThatCommittedSucceedsWhenItsPositionCantBeRead(t *testing.T) {
 	}
 }
 
+// A write whose position can't be read still sends a token. The next
+// request with it reads the primary when it can't ask the primary for its
+// position either, and otherwise a replica past the primary's position
+// then.
+func TestAWriteWhosePositionCantBeReadStillCarriesReadYourWrites(t *testing.T) {
+	e := newReplicaEnv(t)
+	dsn, role := asRole(t, e.pool, e.db.DSN())
+	e.exec("GRANT ALL ON TABLE " + e.table + " TO " + role)
+	const key = "a key the two apps share, of 32 bytes or more"
+	blind, sighted := notesAppOn(t, e, key, dsn), notesApp(t, e, key)
+	for _, h := range []http.Handler{blind, sighted} {
+		until(t, "reads to run on the replica", func() bool {
+			out, _ := post(t, h, "/notes/get", 0, nil)
+			return out.OnReplica
+		})
+	}
+	revoke(t, e.pool, "pg_current_wal_insert_lsn()")
+	e.rep.Pause()
+
+	_, hdr := post(t, blind, "/notes/add", 1, nil)
+	tok := hdr.Get(pg.ConsistencyHeader)
+	if tok == "" {
+		t.Fatal("a write that committed, of unknown position, sent no token")
+	}
+	with := http.Header{pg.ConsistencyHeader: {tok}}
+	if out, _ := post(t, blind, "/notes/get", 1, with); !out.Found || out.OnReplica {
+		t.Fatalf("an app that can't ask the primary its position: %+v", out)
+	}
+	if out, _ := post(t, sighted, "/notes/get", 1, with); !out.Found || out.OnReplica {
+		t.Fatalf("an app that can, with the replica paused: %+v", out)
+	}
+	e.rep.Resume()
+	// The insert position the token is clamped to can sit past what has
+	// been flushed, so replicated, on a quiet primary, by a record no
+	// commit has flushed yet: a commit flushes it.
+	e.exec("INSERT INTO " + e.table + " (id) VALUES (2)")
+	until(t, "the token's reads to run on the caught-up replica", func() bool {
+		out, _ := post(t, sighted, "/notes/get", 1, with)
+		if !out.Found {
+			t.Fatalf("a read with the token missed the write: %+v", out)
+		}
+		return out.OnReplica
+	})
+}
+
 // When the tracker can't read the primary's position, though the pools
 // work, a replica that lags isn't taken for caught up.
 func TestAReplicaLagsWhenTheTrackerLosesThePrimary(t *testing.T) {
 	e := newReplicaEnv(t)
-	dsn := asRole(t, e.pool, e.db.DSN())
-	role := strings.SplitN(strings.TrimPrefix(dsn, "postgres://"), "@", 2)[0]
+	dsn, role := asRole(t, e.pool, e.db.DSN())
 	e.exec("GRANT ALL ON TABLE " + e.table + " TO " + role)
 	e.exec("INSERT INTO " + e.table + " (id) VALUES (100)")
 	e.rep.CatchUp()

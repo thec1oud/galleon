@@ -178,15 +178,25 @@ func addHeaders(dst, src http.Header) {
 }
 
 // reservedHeader reports whether an interceptor's response header k, in
-// canonical form, is the transport's: framing and hop-by-hop headers, and
-// gRPC's and Connect's own. HTTP and RPC refuse the same ones.
+// canonical form, is the transport's: framing, negotiation and hop-by-hop
+// headers, trailers, and gRPC's and Connect's own. HTTP and RPC refuse the
+// same ones. A key with "Trailer:" before it, in any case, is one net/http
+// sends as a trailer; it has no canonical form.
 func reservedHeader(k string) bool {
 	switch k {
 	case "Content-Length", "Content-Encoding", "Content-Type", "Transfer-Encoding", "Connection", "Keep-Alive",
-		"Upgrade", "Trailer", "Te":
+		"Upgrade", "Trailer", "Te", "Accept-Encoding":
 		return true
 	}
-	return strings.HasPrefix(k, "Proxy-") || strings.HasPrefix(k, "Grpc-") || strings.HasPrefix(k, "Connect-")
+	if len(k) >= len(http.TrailerPrefix) && strings.EqualFold(k[:len(http.TrailerPrefix)], http.TrailerPrefix) {
+		return true
+	}
+	for _, p := range []string{"Trailer-", "Proxy-", "Grpc-", "Connect-"} {
+		if strings.HasPrefix(k, p) {
+			return true
+		}
+	}
+	return false
 }
 
 var errUnsupportedMediaType = errs.New(errs.InvalidArgument, "galleon.unsupported_media_type", "the request body's media type is not supported")

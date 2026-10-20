@@ -37,13 +37,17 @@ type reading struct {
 	reason  string // why it isn't healthy
 	replay  uint64 // pg_last_wal_replay_lsn()
 	// lagBytes is how far its replay is behind the primary's latest
-	// reading, and lag how long ago, at the latest, the primary was where
-	// the replica is; unknownLag when neither can be told.
+	// reading, unknownBytes when the tracker has no fresh reading of the
+	// primary; lag is how long ago, at the latest, the primary was where
+	// the replica is, unknownLag when that can't be told.
 	lagBytes int64
 	lag      time.Duration
 }
 
-const unknownLag = time.Duration(math.MaxInt64)
+const (
+	unknownLag   = time.Duration(math.MaxInt64)
+	unknownBytes = int64(math.MaxInt64)
+)
 
 // Reasons a replica is out of rotation, as logs, spans and metrics give them.
 const (
@@ -118,24 +122,27 @@ func (h *history) latest() (sample, bool) {
 
 // lag is how far a replica that has replayed replay, read at at, is behind
 // the primary: in bytes against the latest sample, and in time since the
-// newest sample it has passed, or nothing when it has passed the latest.
-// Both are unknown without samples, and the time is when it has passed none
-// or when the latest is older than fresh: the tracker has stopped hearing
-// from the primary, which may have moved on since, so the history tells
-// nothing of the replica.
+// newest sample it has passed, so even a replica past the latest is as far
+// behind as that sample is old, up to a poll. Both are unknown without
+// samples or when the latest is older than fresh: the tracker has stopped
+// hearing from the primary, which may have moved on since, so the history
+// tells nothing of the replica. The time is unknown too when it has passed
+// no sample.
 func (h *history) lag(replay uint64, at time.Time, fresh time.Duration) (bytes int64, lag time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	n := len(h.samples)
 	if n == 0 {
-		return 0, unknownLag
+		return unknownBytes, unknownLag
 	}
 	latest := h.samples[n-1]
 	if at.Sub(latest.at) > fresh {
-		return 0, unknownLag
+		return unknownBytes, unknownLag
 	}
 	if replay >= latest.lsn {
-		return 0, 0
+		// Caught up with the latest sample, which is itself as old as it
+		// is: the primary may have written since.
+		return 0, max(at.Sub(latest.at), 0)
 	}
 	bytes = int64(min(latest.lsn-replay, math.MaxInt64))
 	for i := n - 1; i >= 0; i-- {
@@ -173,6 +180,10 @@ type candidate struct {
 // floor floor, from their latest readings alone.
 func (t *topology) candidates(l data.Level, floor uint64, now time.Time) []candidate {
 	if l.Kind() == data.PrimaryKind {
+		return nil
+	}
+	if l.Kind() == data.BoundedStalenessKind && l.Staleness() <= 0 {
+		// No replica can be known to be no lag behind.
 		return nil
 	}
 	var out []candidate
@@ -396,11 +407,14 @@ func (t *topology) pollReplica(ctx context.Context, m *Manager, r *replica) {
 			case in:
 				log.Info("replica joined rotation", "replica", r.src.name, "lag", rd.lag, "lag_bytes", rd.lagBytes)
 			default:
-				lag := any(rd.lag)
+				lag, bytes := any(rd.lag), any(rd.lagBytes)
 				if rd.lag == unknownLag {
 					lag = "unknown"
 				}
-				log.Warn("replica left rotation", "replica", r.src.name, "reason", why, "lag", lag, "lag_bytes", rd.lagBytes)
+				if rd.lagBytes == unknownBytes {
+					bytes = "unknown"
+				}
+				log.Warn("replica left rotation", "replica", r.src.name, "reason", why, "lag", lag, "lag_bytes", bytes)
 			}
 		}
 	})
@@ -437,8 +451,10 @@ func (t *topology) read(ctx context.Context, p *poller) *reading {
 // above, so it is the smaller of the two. Neither alone will do: xact
 // grows on a replica of an idle primary however caught up it is, which
 // the history sees, and the history knows nothing once the tracker stops
-// hearing from the primary, when only xact bounds it. When neither tells,
-// the lag is unknown, never zero.
+// hearing from the primary, when only xact bounds it. xact is the replica's
+// clock against the primary's commit timestamps, so skew between their
+// clocks moves it by as much. When neither tells, the lag is unknown, never
+// zero.
 func (t *topology) lagOf(replay uint64, at time.Time, xact time.Duration) (int64, time.Duration) {
 	bytes, hist := t.primary.lag(replay, at, t.staleAfter())
 	return bytes, min(hist, xact)

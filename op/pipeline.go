@@ -107,7 +107,9 @@ type Response struct {
 	// set themselves over these, and drop the ones that are theirs alone,
 	// over HTTP and RPC alike: Content-Type, Content-Length,
 	// Content-Encoding, Transfer-Encoding, Connection, Keep-Alive, Upgrade,
-	// Trailer, TE, and Proxy-*, Grpc-* and Connect-* headers.
+	// Trailer, TE, Accept-Encoding, Trailer-*, Proxy-*, Grpc-* and Connect-*
+	// headers, and keys net/http would send as trailers ("Trailer:" before
+	// them, in any case).
 	Header http.Header
 }
 

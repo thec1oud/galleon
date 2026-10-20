@@ -44,7 +44,9 @@ func (c *causal) raise(lsn uint64) {
 
 // unknownFloor is the floor of a request that committed a write whose
 // position couldn't be read: no replica qualifies for its ReadYourWrites
-// reads, which read the primary.
+// reads, which read the primary. Its token carries it too, and the next
+// request's clamp brings it down to the primary's position then, which is
+// past the write.
 const unknownFloor = math.MaxUint64
 
 type causalKey struct{}
@@ -73,7 +75,13 @@ func (m *Manager) floor(ctx context.Context) uint64 {
 	if c == nil {
 		return 0
 	}
-	if tok := c.pending.Load(); tok != 0 {
+	tok := c.pending.Load()
+	if tok == 0 {
+		return c.lsn.Load()
+	}
+	// A floor already unknown can't rise further: the clamp would only cost
+	// a query.
+	if c.lsn.Load() != unknownFloor {
 		clamped := tok
 		var latest sample
 		ok := false
@@ -81,16 +89,18 @@ func (m *Manager) floor(ctx context.Context) uint64 {
 			latest, ok = m.topo.primary.latest()
 		}
 		if !ok || tok > latest.lsn {
-			// Past what the tracker last saw: a token a moment old, or a
+			// Past what the tracker last saw: a token a moment old, one
+			// whose write's position was unknown (unknownFloor), or a
 			// forged one, which would otherwise hold reads off the
-			// replicas. If the primary can't be asked, the token stands.
+			// replicas. If the primary can't be asked, the token stands,
+			// and an unknown one sends the reads to the primary.
 			if cur, err := m.primaryLSN(ctx); err == nil {
 				clamped = min(tok, cur)
 			}
 		}
 		c.raise(clamped)
-		c.pending.CompareAndSwap(tok, 0)
 	}
+	c.pending.CompareAndSwap(tok, 0)
 	return c.lsn.Load()
 }
 
@@ -237,11 +247,9 @@ func (m *Manager) giveToken(call *op.Call, c *causal) {
 	if m.keys == nil || call.Response == nil || call.Response.Header == nil || !c.wrote.Load() {
 		return
 	}
-	lsn := c.lsn.Load()
-	if lsn == unknownFloor {
-		return // see commitWrite: there is no position to sign
-	}
-	call.Response.Header.Set(ConsistencyHeader, m.keys.sign(lsn, m.clock.Now()))
+	// unknownFloor is signed as it is (see commitWrite): the next request
+	// clamps it to the primary's position.
+	call.Response.Header.Set(ConsistencyHeader, m.keys.sign(c.lsn.Load(), m.clock.Now()))
 	if call.Response.Header.Get("Cache-Control") == "" {
 		call.Response.Header.Set("Cache-Control", "private, no-store")
 	}

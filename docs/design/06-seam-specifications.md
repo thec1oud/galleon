@@ -339,7 +339,7 @@ func From(ctx context.Context) ReadTx                    // the closure forms se
 7. `ReadYourWrites` MUST never return data older than the causal floor: the request's own commits, and the causal token it brought. If no replica qualifies within the wait budget, it MUST read from the primary or fail with `Unavailable` (`data.consistency_timeout`), as the policy says. With no replicas, every level MUST read the primary without failing. A read that joins or nests in a transaction MUST stay on it, whatever its level.
 8. A transaction open at the end of its owning request or job MUST be rolled back and reported (an error in dev and test).
 9. Two-phase commit across sources MUST be refused.
-10. A call that committed a write MUST send a causal token (`Galleon-Consistency`) when tokens are configured, and a call that didn't MUST NOT. A token that fails verification MUST be ignored, never fail the call.
+10. A call that committed a write MUST send a causal token (`Galleon-Consistency`) when tokens are configured, even when the write's WAL position couldn't be read after its commit, and a call that didn't MUST NOT. A token that fails verification MUST be ignored, never fail the call.
 
 **Conformance:** savepoint semantics; ownership (a nested `Commit` doesn't commit the root); commit hooks on commit, rollback and retry; retry on injected serialization failures; read-only enforcement; every level without replicas, and reads in write transactions staying there; causal tokens sent only after a commit and ignored when bad; read-your-writes, across requests and within one, with its wait and fail policies, against a real streaming replica whose replay the suite pauses; leak detection.
 

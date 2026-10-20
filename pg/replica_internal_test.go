@@ -3,10 +3,15 @@ package pg
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/data"
@@ -215,18 +220,19 @@ func TestTheCallsLevelWinsOverTheOperationsAndTheConfigs(t *testing.T) {
 	}
 }
 
-func TestLagIsZeroForACaughtUpReplicaOfAnIdlePrimary(t *testing.T) {
+func TestACaughtUpReplicaOfAnIdlePrimaryLagsOnlyByItsLatestSamplesAge(t *testing.T) {
 	var h history
 	t0 := time.Unix(0, 0)
-	if _, lag := h.lag(10, t0, time.Minute); lag != unknownLag {
-		t.Fatal("without samples the lag is known")
+	if b, lag := h.lag(10, t0, time.Minute); b != unknownBytes || lag != unknownLag {
+		t.Fatalf("without samples the lag is known: %d bytes, %v", b, lag)
 	}
 	// The primary sat at 100 for a minute: the replica at 100 is caught
-	// up, however long ago its last replayed commit was.
+	// up, however long ago its last replayed commit was, but for what the
+	// primary may have written since its latest sample, a second ago.
 	for i := range 60 {
 		h.add(sample{at: t0.Add(time.Duration(i) * time.Second), lsn: 100})
 	}
-	if b, lag := h.lag(100, t0.Add(time.Minute), time.Minute); b != 0 || lag != 0 {
+	if b, lag := h.lag(100, t0.Add(time.Minute), time.Minute); b != 0 || lag != time.Second {
 		t.Errorf("caught up: %d bytes, %v", b, lag)
 	}
 	// The primary moved to 200 at 60s and 300 at 61s; a replica at 250
@@ -491,8 +497,8 @@ func TestAStalePrimaryHistoryNeverReadsAsNoLag(t *testing.T) {
 	// A fresh history of an idle primary: caught up, however long ago the
 	// last commit was.
 	topo.primary.add(sample{at: f.now.Add(-10 * time.Millisecond), lsn: 500})
-	if _, lag := topo.lagOf(500, f.now, time.Hour); lag != 0 {
-		t.Errorf("caught up with an idle primary: lag %v", lag)
+	if _, lag := topo.lagOf(500, f.now, time.Hour); lag != 10*time.Millisecond {
+		t.Errorf("caught up with an idle primary sampled 10ms ago: lag %v", lag)
 	}
 	// Behind it, the smaller bound wins.
 	topo.primary.add(sample{at: f.now, lsn: 900})
@@ -506,7 +512,7 @@ func TestBoundedStalenessCountsTheReadingsAge(t *testing.T) {
 	f.set(0, 100, 50*time.Millisecond)
 	f.now = f.now.Add(60 * time.Millisecond)
 	if got, _ := f.where(context.Background(), data.BoundedStaleness(100*time.Millisecond)); got != "primary" {
-		t.Errorf("50ms of lag 60ms ago is within 100ms: read %s", got)
+		t.Errorf("50ms of lag in a reading 60ms old is past 100ms, yet it read %s", got)
 	}
 	if got, _ := f.where(context.Background(), data.BoundedStaleness(200*time.Millisecond)); got != "replica_1" {
 		t.Errorf("but within 200ms: read %s", got)
@@ -515,6 +521,59 @@ func TestBoundedStalenessCountsTheReadingsAge(t *testing.T) {
 
 // Stop clears the readings while reads choose by them; a read never
 // trips over a reading that went away after it was chosen.
+// A replica caught up with the primary's latest sample is behind by as
+// much as that sample is old: the primary may have written since.
+func TestAReplicaCaughtUpWithAnOldSampleIsAsFarBehindAsItsAge(t *testing.T) {
+	f := newFakeTracker(t, Config{MaxLag: time.Second}, "")
+	topo := f.m.topo
+	topo.primary.add(sample{at: f.now.Add(-400 * time.Millisecond), lsn: 1000})
+	bytes, lag := topo.lagOf(1000, f.now, unknownLag)
+	if bytes != 0 || lag != 400*time.Millisecond {
+		t.Fatalf("lag %d bytes, %v", bytes, lag)
+	}
+	topo.replicas[0].reading.Store(&reading{at: f.now, healthy: true, replay: 1000, lagBytes: bytes, lag: lag})
+	if got, _ := f.where(context.Background(), data.BoundedStaleness(100*time.Millisecond)); got != data.PrimarySource {
+		t.Errorf("a bound of 100ms read %s, at most 400ms behind", got)
+	}
+	if got, _ := f.where(context.Background(), data.BoundedStaleness(time.Second)); got != "replica_1" {
+		t.Errorf("a bound of 1s read %s", got)
+	}
+}
+
+func TestNoBoundedStalenessOfZeroReadsAReplica(t *testing.T) {
+	f := newFakeTracker(t, Config{MaxLag: time.Second}, "")
+	f.set(0, 1000, 0) // as caught up as a reading can say, taken now
+	for _, d := range []time.Duration{0, -time.Second} {
+		if got, _ := f.where(context.Background(), data.BoundedStaleness(d)); got != data.PrimarySource {
+			t.Errorf("BoundedStaleness(%v) read %s", d, got)
+		}
+	}
+}
+
+// Without a fresh reading of the primary, a replica's lag in bytes is
+// unknown, and MaxLagBytes keeps it out.
+func TestAStalePrimaryHistoryNeverReadsAsNoLagInBytes(t *testing.T) {
+	f := newFakeTracker(t, Config{MaxLag: time.Hour, MaxLagBytes: 1 << 10}, "")
+	topo := f.m.topo
+	if bytes, _ := topo.lagOf(1000, f.now, 500*time.Millisecond); bytes != unknownBytes {
+		t.Errorf("no history: %d bytes", bytes)
+	}
+	topo.primary.add(sample{at: f.now.Add(-time.Minute), lsn: 1 << 40})
+	bytes, lag := topo.lagOf(1000, f.now, 500*time.Millisecond)
+	if bytes != unknownBytes {
+		t.Errorf("a minute-old history: %d bytes", bytes)
+	}
+	topo.replicas[0].reading.Store(&reading{at: f.now, healthy: true, replay: 1000, lagBytes: bytes, lag: lag})
+	if got, _ := f.where(context.Background(), data.Any); got != data.PrimarySource {
+		t.Errorf("Any read %s, of unknown lag in bytes", got)
+	}
+	// Without MaxLagBytes, the time bound alone decides.
+	topo.maxBytes = 0
+	if got, _ := f.where(context.Background(), data.Any); got != "replica_1" {
+		t.Errorf("without MaxLagBytes, Any read %s", got)
+	}
+}
+
 func TestReadsRouteSafelyWhileTheTrackerStops(t *testing.T) {
 	for _, sel := range []Selection{LeastLag, Random, RoundRobin, Nearest} {
 		f := newFakeTracker(t, Config{Select: sel, Zone: "a"}, "a", "a", "b")
@@ -559,10 +618,61 @@ func TestAWriteWhosePositionIsUnknownSendsTheRequestsReadsToThePrimary(t *testin
 	if err != nil || rt.rep != nil {
 		t.Fatalf("routed to %v, %v; want the primary, without failing or waiting", rt.rep, err)
 	}
+
+	// It still sends a token, and the next request that brings it, when the
+	// primary can't be asked for its position, reads the primary too.
 	call := &op.Call{Response: &op.Response{Header: http.Header{}}}
 	f.m.giveToken(call, c)
-	if call.Response.Header.Get(ConsistencyHeader) != "" {
-		t.Fatal("a token was signed for an unknown position")
+	tok := call.Response.Header.Get(ConsistencyHeader)
+	if tok == "" {
+		t.Fatal("a call that committed a write of unknown position sent no token")
+	}
+	next := &causal{}
+	f.m.takeToken(context.Background(), &op.Call{Desc: &op.Descriptor{ID: "next"}, Request: &op.Request{Header: http.Header{ConsistencyHeader: {tok}}}}, next)
+	if next.pending.Load() != unknownFloor {
+		t.Fatalf("the next request's pending floor is %d", next.pending.Load())
+	}
+	rt, err = f.m.route(context.WithValue(context.Background(), causalKey{}, next), data.ReadYourWrites.Wait(time.Minute).OrFail())
+	if err != nil || rt.rep != nil {
+		t.Fatalf("the next request routed to %v, %v; want the primary", rt.rep, err)
+	}
+}
+
+// A floor that is already unknown can't rise, so a token is not worth a
+// query of the primary.
+func TestAnUnknownFloorAsksThePrimaryNothing(t *testing.T) {
+	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dials atomic.Int32
+	cfg := m.sources[data.PrimarySource].config.Copy()
+	cfg.BeforeConnect = func(context.Context, *pgx.ConnConfig) error {
+		dials.Add(1)
+		return errors.New("no primary here")
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	m.sources[data.PrimarySource].pool.Store(pool)
+
+	c := &causal{}
+	c.raise(unknownFloor)
+	c.pending.Store(42)
+	if got := m.floor(context.WithValue(context.Background(), causalKey{}, c)); got != unknownFloor || c.pending.Load() != 0 {
+		t.Fatalf("floor %d, pending %d", got, c.pending.Load())
+	}
+	if n := dials.Load(); n != 0 {
+		t.Fatalf("the primary was asked %d times", n)
+	}
+	// While a known floor's token is clamped by asking it.
+	c = &causal{}
+	c.pending.Store(42)
+	m.floor(context.WithValue(context.Background(), causalKey{}, c))
+	if dials.Load() == 0 {
+		t.Fatal("the test asks nothing of the primary either way")
 	}
 }
 

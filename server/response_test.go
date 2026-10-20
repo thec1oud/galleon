@@ -14,7 +14,8 @@ import (
 
 // reserved are headers that are the transport's alone.
 var reserved = []string{"Content-Type", "Content-Length", "Content-Encoding", "Transfer-Encoding", "Connection", "Keep-Alive",
-	"Upgrade", "Trailer", "Te", "Proxy-Authenticate", "Grpc-Status", "Grpc-Message", "Connect-Protocol-Version"}
+	"Upgrade", "Trailer", "Te", "Accept-Encoding", "Trailer-Evil", "Proxy-Authenticate", "Grpc-Status", "Grpc-Message",
+	"Connect-Protocol-Version"}
 
 // noneEvil fails the test if h has any header an interceptor set to "evil".
 func noneEvil(t *testing.T, what string, h http.Header) {
@@ -41,6 +42,9 @@ var stamp = galleon.ModuleFunc("stamp", func(r *galleon.Registry) error {
 					h.Set(k, "evil")
 				}
 				h["content-length"] = []string{"evil"} // not in canonical form
+				// Keys net/http sends as trailers, which have no canonical form.
+				h["Trailer:X-Evil"] = []string{"evil"}
+				h["trailer:x-evil-too"] = []string{"evil"}
 			}
 			return out, err
 		}
@@ -56,6 +60,7 @@ func TestInterceptorsSetHTTPResponseHeadersOnSuccessAndError(t *testing.T) {
 			t.Errorf("%s: %d, X-Stamp %q", target, w.Code, w.Header().Get("X-Stamp"))
 		}
 		noneEvil(t, target, w.Header())
+		noneEvil(t, target+" trailers", w.Result().Trailer)
 	}
 }
 

@@ -593,7 +593,8 @@ const commitSQL = "SELECT pg_current_xact_id_if_assigned() IS NOT NULL; COMMIT; 
 // connection breaks once COMMIT has answered, the write is committed all
 // the same and Commit succeeds: failing would have the caller retry a
 // committed write. The floor is then raised as far as it goes, so the
-// request's ReadYourWrites reads go to the primary, and no token is sent.
+// request's ReadYourWrites reads go to the primary; its token carries that
+// floor, and the next request clamps it to the primary's position then.
 func (r *root) commitWrite(ctx context.Context, tx pgx.Tx) error {
 	conn := tx.Conn()
 	if conn.PgConn().TxStatus() != 'T' {
@@ -627,7 +628,7 @@ func (r *root) commitWrite(ctx context.Context, tx pgx.Tx) error {
 		}
 	}
 	if perr != nil {
-		r.m.logger().DebugContext(ctx, "a write committed, but its WAL position couldn't be read; this request's ReadYourWrites reads go to the primary", "error", perr)
+		r.m.logger().DebugContext(ctx, "a write committed, but its WAL position couldn't be read; this request's ReadYourWrites reads go to the primary, and the next request clamps its token", "error", perr)
 		lsn = unknownFloor
 	}
 	r.causal.raise(lsn)
