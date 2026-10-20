@@ -35,6 +35,8 @@ func (m moduleFunc) Register(r *Registry) error { return m.register(r) }
 type Registry struct {
 	app    *App
 	module string
+
+	needsCounters bool // the counters capability is declared for a rate-limited operation
 }
 
 // Module returns the name of the module that owns this registry.

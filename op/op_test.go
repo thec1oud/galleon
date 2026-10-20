@@ -21,7 +21,7 @@ func TestBuilderDescribesWhatWasDeclared(t *testing.T) {
 	b := op.Unary[In, Out]("greet.hello").
 		HTTP("POST", "/hello").
 		RPC("greet.v1.Greeter", "Hello").
-		Authorize("greet:hello", op.Resource("org", "org_id")).
+		AuthorizeResource("greet:hello", op.Resource("org", "org_id")).
 		Contexts("org").
 		Timeout(time.Second).
 		BodyLimit(1<<10).
@@ -255,4 +255,22 @@ func TestBuilderChainsValidators(t *testing.T) {
 	if v := d.Shape(context.Background(), &In{Name: "bob"}); v != nil {
 		t.Fatalf("valid input: %+v", v)
 	}
+}
+
+func TestCheckRejectsPointerBindings(t *testing.T) {
+	d := op.Unary[In, Out]("orders.create").Public().Describe()
+	d.Bindings = append(d.Bindings, &op.HTTP{Method: "GET", Path: "/o"})
+	errs := d.Check()
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "not supported") {
+		t.Fatalf("got %v", errs)
+	}
+}
+
+func TestValidateNilPanicsAtDeclaration(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Validate(nil) must panic")
+		}
+	}()
+	op.Unary[In, Out]("orders.create").Validate(nil)
 }
