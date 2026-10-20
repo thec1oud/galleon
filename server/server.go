@@ -126,8 +126,8 @@ type options struct {
 // type already present replaces it.
 func Codecs(c ...codec.Codec) Option { return func(o *options) { o.codecs = append(o.codecs, c...) } }
 
-// Serve chooses which bindings New serves; it serves both by default. The
-// module sets it from the process's roles.
+// Serve chooses which bindings New serves; it serves both by default. Module
+// sets it from the process's roles, after any Serve passed to it.
 func Serve(http, rpc bool) Option {
 	return func(o *options) { o.http, o.rpc = http, rpc }
 }

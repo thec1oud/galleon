@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"reflect"
+	"runtime/debug"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -17,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/thec1oud/galleon"
@@ -39,9 +42,10 @@ type message struct {
 
 // rpcCodec is a connect-go codec for one operation and one payload format.
 type rpcCodec struct {
-	name string
-	dec  func(data []byte, into any) error
-	enc  func(v any) ([]byte, error)
+	name  string
+	limit int64 // the operation's body limit
+	dec   func(data []byte, into any) error
+	enc   func(v any) ([]byte, error)
 }
 
 func (c *rpcCodec) Name() string { return c.name }
@@ -55,6 +59,12 @@ func (c *rpcCodec) Unmarshal(data []byte, m any) error {
 			}
 			return proto.Unmarshal(data, pm)
 		})
+	}
+	if int64(len(data)) > c.limit {
+		err := errs.New(errs.InvalidArgument, "galleon.body_too_large", "the request body is too large",
+			errs.FieldViolations{{Path: "", Code: "body_too_large", Params: map[string]any{"limit": c.limit}, MsgKey: "validation.body_too_large"}})
+		msg.decode = func(any) error { return err }
+		return nil
 	}
 	b := bytes.Clone(data) // connect-go reuses its buffers
 	msg.decode = func(into any) error { return c.dec(b, into) }
@@ -97,7 +107,7 @@ var protoMessage = reflect.TypeFor[proto.Message]()
 // protobuf when the input and output are protobuf messages, in which case JSON
 // is protojson. Formats connect-go knows but the operation doesn't speak are
 // replaced by codecs that refuse them at the decode stage.
-func rpcCodecs(d *op.Descriptor, in, out *codec.Set) []connect.Codec {
+func rpcCodecs(d *op.Descriptor, in, out *codec.Set, limit int64) []connect.Codec {
 	unknown := d.Policies.UnknownFields
 	inProto := reflect.PointerTo(d.Input.Type).Implements(protoMessage)
 	outProto := reflect.PointerTo(d.Output.Type).Implements(protoMessage)
@@ -135,7 +145,9 @@ func rpcCodecs(d *op.Descriptor, in, out *codec.Set) []connect.Codec {
 			if outProto {
 				c.enc = func(v any) ([]byte, error) {
 					if v == nil {
-						return []byte("{}"), nil
+						// Well-known types such as wrappers aren't JSON
+						// objects, so encode the type's zero message.
+						v = d.Output.New()
 					}
 					return protojson.Marshal(v.(proto.Message))
 				}
@@ -148,7 +160,17 @@ func rpcCodecs(d *op.Descriptor, in, out *codec.Set) []connect.Codec {
 		speaks["proto"] = true
 		cs = append(cs, &rpcCodec{
 			name: "proto",
-			dec:  func(data []byte, into any) error { return protoError(proto.Unmarshal(data, into.(proto.Message))) },
+			dec: func(data []byte, into any) error {
+				m := into.(proto.Message)
+				if err := (proto.UnmarshalOptions{DiscardUnknown: unknown == op.IgnoreUnknown}).Unmarshal(data, m); err != nil {
+					return protoError(err)
+				}
+				if unknown == op.RejectUnknown && hasUnknown(m.ProtoReflect()) {
+					return errs.New(errs.InvalidArgument, "galleon.invalid_body", "the body has a field the operation doesn't accept",
+						errs.FieldViolations{{Path: "", Code: "unknown_field", MsgKey: "validation.unknown_field"}})
+				}
+				return nil
+			},
 			enc: func(v any) ([]byte, error) {
 				if v == nil {
 					return nil, nil
@@ -164,14 +186,18 @@ func rpcCodecs(d *op.Descriptor, in, out *codec.Set) []connect.Codec {
 				j := *c.(*rpcCodec)
 				j.name = "json; charset=utf-8"
 				cs = append(cs, &j)
+				speaks[j.name] = true
 				break
 			}
 		}
 	}
 	for _, name := range []string{"proto", "json", "json; charset=utf-8"} {
-		if !speaks[name] && !(name == "json; charset=utf-8" && speaks["json"]) {
+		if !speaks[name] {
 			cs = append(cs, refuse(name))
 		}
+	}
+	for _, c := range cs {
+		c.(*rpcCodec).limit = limit
 	}
 	return cs
 }
@@ -188,6 +214,36 @@ func refuse(name string) connect.Codec {
 	}
 }
 
+// hasUnknown reports whether m, or a message inside it, kept fields its type
+// doesn't declare.
+func hasUnknown(m protoreflect.Message) bool {
+	if len(m.GetUnknown()) > 0 {
+		return true
+	}
+	found := false
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		switch {
+		case fd.IsMap():
+			if fd.MapValue().Message() != nil {
+				v.Map().Range(func(_ protoreflect.MapKey, mv protoreflect.Value) bool {
+					found = hasUnknown(mv.Message())
+					return !found
+				})
+			}
+		case fd.IsList():
+			if fd.Message() != nil {
+				for i := 0; i < v.List().Len() && !found; i++ {
+					found = hasUnknown(v.List().Get(i).Message())
+				}
+			}
+		case fd.Message() != nil:
+			found = hasUnknown(v.Message())
+		}
+		return !found
+	})
+	return found
+}
+
 func protoError(err error) error {
 	if err == nil {
 		return nil
@@ -202,8 +258,12 @@ func (s *Server) rpcHandler(x *galleon.Operation, b op.RPC, in, out *codec.Set) 
 	if limit <= 0 {
 		limit = s.cfg.BodyLimit
 	}
-	opts := []connect.HandlerOption{connect.WithReadMaxBytes(int(min(limit, int64(maxInt))))}
-	for _, c := range rpcCodecs(x.Desc, in, out) {
+	// connect-go reads the whole message before the handler runs. Its own
+	// limit, at twice the operation's, bounds that read, compressed bodies
+	// included; the operation's limit itself is checked at the decode stage,
+	// after pre-authorization, with the same error as over HTTP.
+	opts := []connect.HandlerOption{connect.WithReadMaxBytes(int(min(max(2*limit, limit+64<<10), int64(math.MaxInt))))}
+	for _, c := range rpcCodecs(x.Desc, in, out, limit) {
 		opts = append(opts, connect.WithCodec(c))
 	}
 	method := b.Service + "/" + b.Method
@@ -228,10 +288,17 @@ func (s *Server) rpcHandler(x *galleon.Operation, b op.RPC, in, out *codec.Set) 
 				return req.Msg.decode(into)
 			},
 		}}
-		res, err := x.Invoke(ctx, call)
+		res, err := s.invokeRPC(ctx, x, call, method)
 		if err != nil {
 			ce := s.rpcError(ctx, method, err)
-			span.SetAttributes(semconv.RPCResponseStatusCode(strings.ToUpper(ce.Code().String())))
+			code := strings.ToUpper(ce.Code().String())
+			span.SetAttributes(semconv.RPCResponseStatusCode(code))
+			if serverFault(ce.Code()) {
+				// gRPC answers HTTP 200 even for errors, so the outer
+				// middleware can't tell; mark the span here.
+				span.SetAttributes(semconv.ErrorTypeKey.String(code))
+				span.SetStatus(codes.Error, code)
+			}
 			return nil, ce
 		}
 		span.SetAttributes(semconv.RPCResponseStatusCode("OK"))
@@ -239,7 +306,31 @@ func (s *Server) rpcHandler(x *galleon.Operation, b op.RPC, in, out *codec.Set) 
 	}, opts...)
 }
 
-const maxInt = int(^uint(0) >> 1)
+// invokeRPC runs the pipeline, turning a panic into an Internal error: an RPC
+// client must get an RPC error, not the HTTP 500 the outer middleware writes.
+func (s *Server) invokeRPC(ctx context.Context, x *galleon.Operation, call *op.Call, method string) (out any, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			if p == http.ErrAbortHandler {
+				panic(p)
+			}
+			s.log.ErrorContext(ctx, "panic while serving an rpc", "method", method, "panic", p, "stack", string(debug.Stack()))
+			out, err = nil, errs.New(errs.Internal, "galleon.panic", "")
+		}
+	}()
+	return x.Invoke(ctx, call)
+}
+
+// serverFault reports whether a code is the server's failure, as the RPC
+// semantic conventions count them.
+func serverFault(c connect.Code) bool {
+	switch c {
+	case connect.CodeUnknown, connect.CodeDeadlineExceeded, connect.CodeUnimplemented,
+		connect.CodeInternal, connect.CodeUnavailable, connect.CodeDataLoss:
+		return true
+	}
+	return false
+}
 
 func procedure(b op.RPC) string { return "/" + b.Service + "/" + b.Method }
 
