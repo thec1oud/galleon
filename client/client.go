@@ -267,15 +267,18 @@ func (c *Client) HTTP() *http.Client { return c.hc }
 // before the request is sent, so redirects resolve against where it went.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if req.URL != nil && !req.URL.IsAbs() {
+		var err error
 		switch {
-		case req.URL.Host != "":
+		case req.URL.Host != "" || req.URL.User != nil:
 			// "//host/path" names another host, which isn't relative to
 			// the base in any useful sense.
-			closeBody(req)
-			return nil, fmt.Errorf("client: %q has a host but no scheme", req.URL)
+			err = fmt.Errorf("client: %q has a host but no scheme", req.URL.Redacted())
 		case c.base == nil:
+			err = fmt.Errorf("client: %q is relative and the client has no BaseURL", req.URL.Redacted())
+		}
+		if err != nil {
 			closeBody(req)
-			return nil, fmt.Errorf("client: %q is relative and the client has no BaseURL", req.URL)
+			return nil, err
 		}
 		req = req.Clone(req.Context())
 		req.URL = resolve(c.base, req.URL)
@@ -297,7 +300,7 @@ type absolute struct {
 func (a *absolute) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !req.URL.IsAbs() {
 		closeBody(req)
-		return nil, fmt.Errorf("client: %q is not absolute; HTTP() needs absolute URLs, and only Client.Do resolves relative ones against a BaseURL", req.URL)
+		return nil, fmt.Errorf("client: %q is not absolute; HTTP() needs absolute URLs, and only Client.Do resolves relative paths against a BaseURL", req.URL.Redacted())
 	}
 	return a.next.RoundTrip(req)
 }

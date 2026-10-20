@@ -675,8 +675,10 @@ func TestRedirectsResolveAgainstTheRequestURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Do(must(http.NewRequest("GET", "//evil.example/x", nil))); err == nil {
-		t.Error("a URL with a host but no scheme must be refused")
+	for _, u := range []string{"//evil.example/x", "//user@/x"} {
+		if _, err := c.Do(must(http.NewRequest("GET", u, nil))); err == nil || !strings.Contains(err.Error(), "has a host but no scheme") {
+			t.Errorf("%s: a URL with a host but no scheme must be refused, got %v", u, err)
+		}
 	}
 	for path, want := range map[string]string{"/abs": "/login", "/a/rel": "/api/x", "a/sib": "/api/a/y"} {
 		seen.Clear()
