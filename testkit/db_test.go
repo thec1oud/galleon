@@ -278,3 +278,38 @@ func TestDBModuleUsesTheAppsTelemetry(t *testing.T) {
 		t.Fatalf("the leak wasn't logged to the app's logger:\n%s", h.Logs)
 	}
 }
+
+// Each app on one DB gets the spans sent while it runs, and none after it
+// stops.
+func TestDBModuleScopesTelemetryToTheRunningApp(t *testing.T) {
+	db := testkit.DB(t, notes)
+	m := db.Manager()
+	write := func() {
+		t.Helper()
+		if err := m.Write(context.Background(), func(ctx context.Context, w data.WriteTx) error {
+			_, err := w.Exec(ctx, "SELECT 1")
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writes := func(tp *datatest.Recorder) int {
+		return len(tp.Find(func(s *datatest.Span) bool { return s.Attr("galleon.data.access") == "write" }))
+	}
+	first, second := &datatest.Recorder{}, &datatest.Recorder{}
+	t.Run("first", func(t *testing.T) {
+		testkit.New(t, galleon.Modules(db.Module()), galleon.TracerProvider(first))
+		write()
+	})
+	t.Run("second", func(t *testing.T) {
+		testkit.New(t, galleon.Modules(db.Module()), galleon.TracerProvider(second))
+		write()
+	})
+	write()
+	if got := writes(first); got != 1 {
+		t.Errorf("the first app got %d write spans, want 1", got)
+	}
+	if got := writes(second); got != 1 {
+		t.Errorf("the second app got %d write spans, want 1", got)
+	}
+}

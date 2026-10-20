@@ -84,3 +84,18 @@ func TestRetryKeepsAnExplicitMaxBackoff(t *testing.T) {
 		t.Fatalf("%d runs took %v; the waits must stay under MaxBackoff", runs, time.Since(start))
 	}
 }
+
+func TestRetryWaitsHaveAFloor(t *testing.T) {
+	// Every wait is at least half its ceiling.
+	const ceiling = 40 * time.Millisecond
+	var calls []time.Time
+	_ = data.RetryPolicy{Attempts: 11, Backoff: ceiling, MaxBackoff: ceiling}.Run(context.Background(), func(context.Context) error {
+		calls = append(calls, time.Now())
+		return &pgconn.PgError{Code: "40001"}
+	})
+	for i := 1; i < len(calls); i++ {
+		if d := calls[i].Sub(calls[i-1]); d < ceiling/2 {
+			t.Fatalf("wait %d was %v, under half the %v ceiling", i, d, ceiling)
+		}
+	}
+}

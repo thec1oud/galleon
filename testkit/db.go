@@ -58,8 +58,12 @@ type Database struct {
 // database, which is rolled back when the test ends: Manager runs every
 // transaction inside it, so one test never sees another's writes.
 //
-// The package's database is left in place when the binary exits, and
-// replaced the next time the package is tested.
+// The package's database is named after the process too, so two runs of one
+// package at once don't share or drop each other's. Nothing runs when a test
+// binary exits, so it is left in place then, and dropped by a later run of
+// the package once no one is connected to it. Templates of schemas no longer
+// in use stay, since nothing ties them to a package: drop the databases
+// named galleon_tpl_* to reclaim them; the next run rebuilds what it needs.
 func DB(t testing.TB, opts ...DBOption) *Database {
 	t.Helper()
 	admin := os.Getenv(PostgresEnv)
@@ -191,20 +195,16 @@ var packageDBs struct {
 // packageDB returns the DSN of this binary's database for schema, creating
 // the template and the clone the first time.
 func packageDB(admin string, schema []string) (string, error) {
-	h := sha256.Sum256([]byte(strings.Join(schema, "\x00")))
-	key := hex.EncodeToString(h[:6])
+	key, tpl, base, err := dbNames(schema)
+	if err != nil {
+		return "", err
+	}
 	packageDBs.mu.Lock()
 	defer packageDBs.mu.Unlock()
 	if dsn, ok := packageDBs.dsns[key]; ok {
 		return dsn, nil
 	}
-	wd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	w := sha256.Sum256([]byte(wd))
-	tpl := "galleon_tpl_" + key
-	name := "galleon_pkg_" + hex.EncodeToString(w[:6]) + "_" + key
+	name := fmt.Sprintf("%s_%d", base, os.Getpid())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -229,7 +229,11 @@ func packageDB(admin string, schema []string) (string, error) {
 			return "", err
 		}
 	}
+	if err := dropStale(ctx, conn, base); err != nil {
+		return "", err
+	}
 	ident := pgx.Identifier{name}.Sanitize()
+	// A database of this name is from a process with this pid that is gone.
 	if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+ident+" WITH (FORCE)"); err != nil {
 		return "", err
 	}
@@ -245,6 +249,44 @@ func packageDB(admin string, schema []string) (string, error) {
 	}
 	packageDBs.dsns[key] = dsn
 	return dsn, nil
+}
+
+// dbNames returns the schema's key, its template's name, and the prefix of
+// this package's databases for it.
+func dbNames(schema []string) (key, tpl, base string, err error) {
+	h := sha256.Sum256([]byte(strings.Join(schema, "\x00")))
+	key = hex.EncodeToString(h[:6])
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", "", "", err
+	}
+	w := sha256.Sum256([]byte(wd))
+	return key, "galleon_tpl_" + key, "galleon_pkg_" + hex.EncodeToString(w[:6]) + "_" + key, nil
+}
+
+// dropStale drops this package's databases for the schema that earlier
+// runs left. One that a run still going is connected to can't be dropped,
+// and is kept.
+func dropStale(ctx context.Context, conn *pgx.Conn, base string) error {
+	// Asking first spares DROP's wait of several seconds for the users of
+	// one in use to leave; DROP still refuses one a run connects to since.
+	rows, err := conn.Query(ctx, `SELECT datname FROM pg_database d WHERE starts_with(datname, $1)
+		AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)`, base)
+	if err != nil {
+		return err
+	}
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		_, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize())
+		var pe *pgconn.PgError
+		if err != nil && !(errors.As(err, &pe) && pe.Code == "55006") { // object_in_use
+			return err
+		}
+	}
+	return nil
 }
 
 // createTemplate builds the template under a temporary name and renames

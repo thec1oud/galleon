@@ -314,14 +314,6 @@ func (s readOnlySavepoint) Commit(ctx context.Context) error { return s.Tx.Rollb
 
 // joinable checks that a transaction with o may join or nest in h.
 func (h *handle) joinable(ctx context.Context, src *source, write bool, o data.Options) error {
-	if h.state == open && o.Isolation != "" && h.root.iso == "" {
-		// Begun at the database's default: learn which level that is.
-		var level string
-		if err := h.tx.QueryRow(h.root.stmtCtx(ctx), "SHOW transaction_isolation").Scan(&level); err != nil {
-			return classify(ctx, err)
-		}
-		h.root.iso = data.IsolationLevel(level)
-	}
 	switch {
 	case h.state != open:
 		return misuse(data.CodeTxEnded, "the transaction in ctx has ended")
@@ -329,7 +321,22 @@ func (h *handle) joinable(ctx context.Context, src *source, write bool, o data.O
 		return misuse(data.CodeCrossSource, fmt.Sprintf("a transaction on source %q can't join one on %q: there is no two-phase commit", src.name, h.root.src.name))
 	case write && !h.write:
 		return misuse(data.CodePropagation, "a write transaction can't join or nest in a read transaction; use data.Independent for a separate one")
-	case o.Isolation != "" && o.Isolation != h.root.iso:
+	case o.Isolation == "":
+		return nil
+	}
+	if h.root.iso == "" {
+		// Begun at the database's default: learn which level that is, once.
+		var level string
+		if err := h.tx.QueryRow(h.root.stmtCtx(ctx), "SHOW transaction_isolation").Scan(&level); err != nil {
+			// Rows still open, or a statement already failed (25P02).
+			if c := classify(ctx, err); errs.KindOf(c) != errs.Internal {
+				return c
+			}
+			return errs.Wrap(err, errs.Internal, data.CodePropagation, "the isolation level of the transaction in ctx can't be read, so a transaction with an explicit one can't join it")
+		}
+		h.root.iso = data.IsolationLevel(level)
+	}
+	if o.Isolation != h.root.iso {
 		return misuse(data.CodePropagation, fmt.Sprintf("a %s transaction can't join one begun with isolation %q", o.Isolation, h.root.iso))
 	}
 	return nil

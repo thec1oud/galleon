@@ -52,6 +52,8 @@ type Manager struct {
 	sources map[string]*source
 	names   []string // sorted, the primary first
 	tel     atomic.Pointer[telemetry]
+	life    sync.Mutex // serializes Start and Stop
+	started bool
 	retry   data.RetryPolicy
 	leaks   string
 	within  *within
@@ -148,10 +150,17 @@ func sortedNames(cfg Config) []string {
 	return names
 }
 
-// Start opens every pool and checks that its database answers.
+// Start opens every pool and checks that its database answers. Starting a
+// Manager that is already started is an error; one that was stopped can be
+// started again.
 func (m *Manager) Start(ctx context.Context) error {
 	if m.within != nil {
 		return nil
+	}
+	m.life.Lock()
+	defer m.life.Unlock()
+	if m.started {
+		return errors.New("pg: the Manager is already started")
 	}
 	for _, name := range m.names {
 		src := m.sources[name]
@@ -165,12 +174,18 @@ func (m *Manager) Start(ctx context.Context) error {
 			return errors.Join(fmt.Errorf("pg: source %q: %w", name, classify(ctx, err)), cerr)
 		}
 	}
+	m.started = true
 	return nil
 }
 
 // Stop closes the pools. A pool's Close waits for every connection to be
 // returned, so Stop gives up when ctx ends.
-func (m *Manager) Stop(ctx context.Context) error { return m.closePools(ctx) }
+func (m *Manager) Stop(ctx context.Context) error {
+	m.life.Lock()
+	defer m.life.Unlock()
+	m.started = false
+	return m.closePools(ctx)
+}
 
 func (m *Manager) closePools(ctx context.Context) error {
 	var errs []error
@@ -287,6 +302,26 @@ func (w *within) ping(ctx context.Context) error {
 	return classify(ctx, w.tx.Conn().Ping(ctx))
 }
 
+// appTelemetry points a Use'd Manager at one app's tracer provider and
+// logger while that app runs.
+type appTelemetry struct {
+	m    *Manager
+	tel  *telemetry
+	prev *telemetry
+}
+
+func (a *appTelemetry) Start(context.Context) error {
+	a.prev = a.m.tel.Swap(a.tel)
+	return nil
+}
+
+// Stop restores what the Manager used before, unless another app has
+// pointed it elsewhere since.
+func (a *appTelemetry) Stop(context.Context) error {
+	a.m.tel.CompareAndSwap(a.tel, a.prev)
+	return nil
+}
+
 // managerView is the Manager as a data.Manager alone, so the kernel doesn't
 // start and stop it a second time.
 type managerView struct{ data.Manager }
@@ -299,7 +334,11 @@ type moduleSettings struct {
 }
 
 // Use makes the module provide m, as built, instead of one from the config
-// section; the caller starts and stops it. testkit.DB uses it.
+// section. The app never starts or stops m: its caller does. While the app
+// runs, from its start to its stop, m sends spans and logs to the app's
+// tracer provider and logger; when the app stops, m goes back to what it
+// used before. With two apps on one Manager at once, the one started last
+// gets them. testkit.DB uses it.
 func Use(m *Manager) ModuleOption { return func(s *moduleSettings) { s.use = m } }
 
 // Module returns the data module: it provides *pg.Manager and data.Manager
@@ -313,14 +352,12 @@ func Module(opts ...ModuleOption) galleon.Module {
 	return galleon.ModuleFunc("pg", func(r *galleon.Registry) error {
 		if s.use != nil {
 			m := s.use
-			// Provided rather than supplied, so it takes the app's tracer
-			// provider and logger. Its Start and Stop leave a Within
-			// manager's connection alone.
-			galleon.Provide[*Manager](r, func(tp trace.TracerProvider, log *slog.Logger) *Manager {
-				m.setTelemetry(tp, log)
-				return m
+			// Supplied, so the kernel doesn't start or stop it.
+			galleon.Supply[*Manager](r, m)
+			galleon.Supply[data.Manager](r, managerView{m})
+			galleon.Provide[*appTelemetry](r, func(tp trace.TracerProvider, log *slog.Logger) *appTelemetry {
+				return &appTelemetry{m: m, tel: &telemetry{tracer: tp.Tracer(tracerName), log: log}}
 			})
-			galleon.Provide[data.Manager](r, func(m *Manager) data.Manager { return managerView{m} })
 			r.Intercept(op.Before(op.StageRoute), func(next op.Invoker) op.Invoker {
 				return func(ctx context.Context, call *op.Call) (any, error) { return m.track(ctx, call, next) }
 			})

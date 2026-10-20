@@ -21,8 +21,9 @@ type RetryPolicy struct {
 	// included. 1 turns retries off.
 	Attempts int
 	// Backoff is the first wait's ceiling; each later one doubles it, up to
-	// MaxBackoff. The wait is a random fraction of the ceiling, so
-	// transactions that conflicted once don't collide again in step.
+	// MaxBackoff. The wait is between half the ceiling and all of it, at
+	// random, so transactions that conflicted once don't collide again in
+	// step, and none retries at once.
 	Backoff    time.Duration
 	MaxBackoff time.Duration
 }
@@ -58,7 +59,7 @@ func (p RetryPolicy) Run(ctx context.Context, fn func(ctx context.Context) error
 		if err == nil || attempt >= p.Attempts || !Retryable(err) {
 			return err
 		}
-		t := time.NewTimer(rand.N(ceiling) + 1)
+		t := time.NewTimer(ceiling/2 + rand.N(ceiling-ceiling/2+1))
 		select {
 		case <-t.C:
 		case <-ctx.Done():
@@ -69,14 +70,10 @@ func (p RetryPolicy) Run(ctx context.Context, fn func(ctx context.Context) error
 	}
 }
 
-// ctxError is ctx's error, classified as errs.From classifies it, after
-// last failed.
+// ctxError is ctx's error as errs.From classifies it, with the attempt
+// that failed last only described in its cause, so it isn't Retryable.
 func ctxError(ctx context.Context, last error) error {
-	cause := fmt.Errorf("%w while waiting to retry after: %v", ctx.Err(), last)
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return errs.Wrap(cause, errs.DeadlineExceeded, "galleon.deadline_exceeded", "the request took too long")
-	}
-	return errs.Wrap(cause, errs.Canceled, "galleon.canceled", "the request was canceled")
+	return errs.From(fmt.Errorf("%w while waiting to retry after: %v", ctx.Err(), last))
 }
 
 // Retrier is a retry policy as an option, and as a way to rerun code.

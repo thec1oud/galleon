@@ -57,8 +57,14 @@ func classify(ctx context.Context, err error) error {
 		return errs.Wrap(err, errs.Canceled, "galleon.canceled", "the request was canceled")
 	}
 	if pe != nil && pe.Code == "57014" {
-		// Canceled with the caller's ctx still live: statement_timeout.
-		return errs.Wrap(err, errs.DeadlineExceeded, data.CodeStatementTimeout, "the request took too long")
+		// Canceled with the caller's ctx still live: by statement_timeout,
+		// or by someone else, such as pg_cancel_backend. Only the message
+		// tells them apart, and only in English (lc_messages); any other
+		// is taken for the database's doing.
+		if strings.Contains(pe.Message, "statement timeout") {
+			return errs.Wrap(err, errs.DeadlineExceeded, data.CodeStatementTimeout, "the request took too long")
+		}
+		return errs.Wrap(err, errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
 	}
 	if pe == nil && (unreachable(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return errs.Wrap(err, errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
@@ -74,7 +80,7 @@ func sqlstate(code string) (k errs.Kind, c, msg string, ok bool) {
 	case "40P01":
 		return errs.Conflict, data.CodeDeadlock, "the change conflicted with another one; retry it", true
 	case "55P03":
-		return errs.Conflict, data.CodeLockNotAvailable, "the data is locked by another change; retry it", true
+		return errs.Conflict, data.CodeLockNotAvailable, "the data is locked by another change", true
 	case "23505":
 		return errs.Conflict, data.CodeUniqueViolation, "the data already exists", true
 	case "23P01":

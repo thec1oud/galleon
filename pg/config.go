@@ -67,8 +67,10 @@ func (s Source) String() string {
 
 var (
 	passwordKV = regexp.MustCompile(`(?i)(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)`)
-	// userinfo is a URL's user:password@, for a URL url.Parse refuses.
-	userinfo = regexp.MustCompile(`(://[^:/@]*:)[^@]*@`)
+	// userinfo is a URL's user:password@, for a URL url.Parse refuses. The
+	// password runs to the last '@' before the host's path, since a
+	// malformed one can hold '@' itself.
+	userinfo = regexp.MustCompile(`^([A-Za-z]+://[^:/@]*:)[^/]*@`)
 	// passwordQuery is a password parameter in a URL's query.
 	passwordQuery = regexp.MustCompile(`(?i)([?&]password=)[^&]*`)
 )
@@ -82,7 +84,7 @@ func redactDSN(dsn string) string {
 		}
 		return u.Redacted()
 	}
-	if strings.Contains(dsn, "://") {
+	if lower := strings.ToLower(dsn); strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
 		dsn = userinfo.ReplaceAllString(dsn, "${1}xxxxx@")
 		return passwordQuery.ReplaceAllString(dsn, "${1}xxxxx")
 	}

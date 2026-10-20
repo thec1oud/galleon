@@ -908,6 +908,30 @@ func readOnlyAndIsolation(t *testing.T, f Factory) {
 		t.Fatal(err)
 	}
 
+	// When the level can't be read, the join fails with the data plane's
+	// error, not the driver's.
+	err = e.m.Write(c, func(ctx context.Context, w data.WriteTx) error {
+		rows, err := w.Query(ctx, "SELECT 1")
+		if err != nil {
+			return err
+		}
+		err = e.m.Read(ctx, func(context.Context, data.ReadTx) error { return nil }, data.Isolation(data.IsolationLevel(def)))
+		wantCode(t, err, errs.Internal, data.CodePropagation)
+		rows.Close()
+		if _, err := w.Exec(ctx, "SELECT 1/0"); err == nil {
+			t.Error("dividing by zero worked")
+		}
+		err = e.m.Read(ctx, func(context.Context, data.ReadTx) error { return nil }, data.Isolation(data.IsolationLevel(def)))
+		wantCode(t, err, errs.Internal, data.CodePropagation)
+		// Misuse is reported before the level is looked at.
+		_, err = e.m.BeginWrite(ctx, data.Source("other"), data.Isolation(data.IsolationLevel(def)))
+		wantCode(t, err, errs.Internal, data.CodeCrossSource)
+		return errUndo
+	})
+	if !errors.Is(err, errUndo) {
+		t.Fatal(err)
+	}
+
 	if err := e.m.Read(c, func(ctx context.Context, r data.ReadTx) error {
 		_, err := e.m.BeginWrite(ctx)
 		wantCode(t, err, errs.Internal, data.CodePropagation)
@@ -1076,6 +1100,22 @@ func errorKinds(t *testing.T, f Factory) {
 		return r.QueryRow(ctx, "SELECT pg_sleep(5)::text").Scan(&x)
 	})
 	wantCode(t, err, errs.DeadlineExceeded, data.CodeStatementTimeout)
+
+	// Canceled from outside, such as by pg_cancel_backend, is the database's
+	// doing, not a timeout.
+	err = e.m.Read(c, func(ctx context.Context, r data.ReadTx) error {
+		var pid int
+		if err := r.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
+			return err
+		}
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			_, _ = e.pool.Exec(context.Background(), "SELECT pg_cancel_backend($1)", pid)
+		}()
+		var x string
+		return r.QueryRow(ctx, "SELECT pg_sleep(5)::text").Scan(&x)
+	})
+	wantCode(t, err, errs.Unavailable, data.CodeUnavailable)
 
 	// A lock not granted within lock_timeout.
 	holder, err := e.pool.Begin(c)

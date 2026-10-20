@@ -52,12 +52,16 @@ func TestSourcesHideTheirPasswords(t *testing.T) {
 		"host=db user=app password=hunter2 dbname=orders",
 		"host=db password='hunter2 x' dbname=orders",
 		"postgres://app:hunter2%zz@db/orders",
+		"postgres://app:hun@ter2%zz@db/orders",
+		"postgres://app:hun@ter2%zz@db",
+		"host=db user=app password=hunter2 application_name=http://x",
 		"postgres://app:hunter2@db/orders?sslmode=%zz&password=hunter2",
 	} {
-		if s := fmt.Sprint(pg.Source{DSN: dsn}); strings.Contains(s, "hunter2") || !strings.Contains(s, "db") {
+		// "ter2" is the end of every password here, '@' or not.
+		if s := fmt.Sprint(pg.Source{DSN: dsn}); strings.Contains(s, "ter2") || !strings.Contains(s, "db") {
 			t.Errorf("%q prints as %s", dsn, s)
 		}
-		if s := fmt.Sprint(map[string]pg.Source{"x": {DSN: dsn}}); strings.Contains(s, "hunter2") {
+		if s := fmt.Sprint(map[string]pg.Source{"x": {DSN: dsn}}); strings.Contains(s, "ter2") {
 			t.Errorf("in a map, %q prints as %s", dsn, s)
 		}
 	}
