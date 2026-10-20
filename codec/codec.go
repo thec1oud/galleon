@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -41,18 +42,24 @@ func (jsonCodec) Decode(r io.Reader, v any, unknown op.UnknownFields) error {
 		if errors.Is(err, io.EOF) {
 			return nil // an empty body leaves the input at its zero value
 		}
-		return jsonError(err)
+		return jsonError(err, reflect.TypeOf(v))
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			return jsonError(err, nil)
+		}
 		return invalid("", "trailing_data", nil, "the body has data after the JSON value")
 	}
 	return nil
 }
 
 // jsonError turns an encoding/json error into an InvalidArgument error with a
-// violation pointing at the field, so clients see the same shape as for
-// validation errors.
-func jsonError(err error) error {
+// violation, so clients see the same shape as for validation errors. The
+// violation points at the field where encoding/json says enough to know it,
+// and at the deepest place it can be sure of otherwise: an array, since
+// encoding/json doesn't report indices, or the whole body.
+func jsonError(err error, into reflect.Type) error {
 	var (
 		typ    *json.UnmarshalTypeError
 		syntax *json.SyntaxError
@@ -64,8 +71,8 @@ func jsonError(err error) error {
 			errs.FieldViolations{{Path: "", Code: "body_too_large", Params: map[string]any{"limit": tooBig.Limit}, MsgKey: "validation.body_too_large"}})
 	case errors.As(err, &typ):
 		path := ""
-		if typ.Field != "" {
-			path = "/" + strings.ReplaceAll(typ.Field, ".", "/")
+		if typ.Field != "" && into != nil {
+			path = wirePath(into, typ.Field)
 		}
 		return invalid(path, "type", map[string]any{"got": typ.Value, "want": jsonKind(typ.Type.Kind().String())}, "a field has the wrong type")
 	case errors.As(err, &syntax):
@@ -77,9 +84,85 @@ func jsonError(err error) error {
 		if n, err := strconv.Unquote(name); err == nil {
 			name = n
 		}
-		return invalid("/"+name, "unknown_field", nil, "the body has a field the operation doesn't accept")
+		// encoding/json names the field but not where it is.
+		return invalid("", "unknown_field", map[string]any{"field": name}, "the body has a field the operation doesn't accept")
 	}
-	return errs.Wrap(err, errs.InvalidArgument, "galleon.invalid_body", "the body could not be read")
+	// A type's own UnmarshalJSON failed, such as time.Time on a bad date.
+	return errs.Wrap(err, errs.InvalidArgument, "galleon.invalid_body", "the body has a value that could not be read",
+		errs.FieldViolations{{Path: "", Code: "invalid_value", MsgKey: "validation.invalid_value"}})
+}
+
+// wirePath turns the dotted field path encoding/json reports into a JSON
+// Pointer, walking t so that embedded struct names (which encoding/json
+// includes) are dropped and names containing dots stay whole. It stops at
+// arrays and maps, whose indices and keys encoding/json doesn't report, and at
+// anything it can't match.
+func wirePath(t reflect.Type, field string) string {
+	segs := strings.Split(field, ".")
+	path := ""
+	for i := 0; i < len(segs); {
+		for t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		switch t.Kind() {
+		case reflect.Struct:
+			name, ft, n, embedded := matchField(t, segs[i:])
+			if n == 0 {
+				return path
+			}
+			if !embedded {
+				path += "/" + escapePointer(name)
+			}
+			t, i = ft, i+n
+		default: // arrays and maps: encoding/json reports no index or key
+			return path
+		}
+	}
+	return path
+}
+
+// matchField finds the field of struct t that segs starts with. It prefers the
+// longest match, so a JSON name containing dots isn't split, and it recognises
+// an embedded struct's Go name, which encoding/json puts in the path although
+// the wire has no level for it. It returns how many segments matched.
+func matchField(t reflect.Type, segs []string) (name string, ft reflect.Type, n int, embedded bool) {
+	for k := len(segs); k > 0; k-- {
+		want := strings.Join(segs[:k], ".")
+		for i := 0; i < t.NumField(); i++ {
+			sf := t.Field(i)
+			if sf.Anonymous && k == 1 && sf.Name == want && jsonTagName(sf) == "" {
+				return "", sf.Type, 1, true
+			}
+			if !sf.IsExported() {
+				continue
+			}
+			if jn := jsonFieldName(sf); jn != "" && jn == want {
+				return jn, sf.Type, k, false
+			}
+		}
+	}
+	return "", nil, 0, false
+}
+
+func jsonTagName(sf reflect.StructField) string {
+	n, _, _ := strings.Cut(sf.Tag.Get("json"), ",")
+	return n
+}
+
+// jsonFieldName is the name encoding/json uses for sf, or "" if it skips it.
+func jsonFieldName(sf reflect.StructField) string {
+	tag := sf.Tag.Get("json")
+	if tag == "-" {
+		return ""
+	}
+	if n := jsonTagName(sf); n != "" {
+		return n
+	}
+	return sf.Name
+}
+
+func escapePointer(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "~", "~0"), "/", "~1")
 }
 
 func jsonKind(goKind string) string {
@@ -160,24 +243,35 @@ func (s *Set) ForContentType(header string) Codec {
 	return s.byType(mt)
 }
 
+// byType returns the codec for mt. An exact match wins; a type with a +json
+// suffix, such as application/problem+json, falls back to the JSON codec.
 func (s *Set) byType(mt string) Codec {
 	for _, c := range s.codecs {
-		if c.MediaType() == mt || (strings.HasSuffix(mt, "+json") && c.MediaType() == "application/json") {
+		if c.MediaType() == mt {
 			return c
 		}
+	}
+	if strings.HasSuffix(mt, "+json") {
+		return s.byType("application/json")
 	}
 	return nil
 }
 
-// Negotiate picks the codec for an Accept header value: the highest-weighted
-// acceptable type the set has, preferring the set's order between equal
-// weights. An empty header or */* picks the first codec. It returns nil when
-// nothing acceptable is in the set.
+// Negotiate picks the codec for an Accept header value, following RFC 9110:
+// each codec's weight comes from the most specific range that matches it
+// (type/subtype over type/* over */*), a weight of 0 refuses it, and the
+// highest weight wins, with the set's order breaking ties. An empty header
+// picks the first codec. It returns nil when nothing acceptable is in the set.
 func (s *Set) Negotiate(accept string) Codec {
 	if strings.TrimSpace(accept) == "" {
 		return s.codecs[0]
 	}
-	best, bestQ, bestRank := Codec(nil), 0.0, 0
+	type rng struct {
+		mt          string
+		q           float64
+		specificity int // 2 exact, 1 type/*, 0 */*
+	}
+	var ranges []rng
 	for _, part := range strings.Split(accept, ",") {
 		mt, params, err := mime.ParseMediaType(strings.TrimSpace(part))
 		if err != nil {
@@ -189,19 +283,26 @@ func (s *Set) Negotiate(accept string) Codec {
 				continue
 			}
 		}
-		if q == 0 {
-			continue
+		spec := 2
+		switch {
+		case mt == "*/*":
+			spec = 0
+		case strings.HasSuffix(mt, "/*"):
+			spec = 1
 		}
-		for rank, c := range s.codecs {
-			if !matches(mt, c.MediaType()) {
-				continue
+		ranges = append(ranges, rng{mt, q, spec})
+	}
+	var best Codec
+	bestQ := 0.0
+	for _, c := range s.codecs {
+		q, spec := 0.0, -1
+		for _, r := range ranges {
+			if matches(r.mt, c.MediaType()) && r.specificity > spec {
+				q, spec = r.q, r.specificity
 			}
-			// Exact types beat wildcards at the same weight.
-			specificity := strings.Count(mt, "*")
-			r := rank + specificity*len(s.codecs)
-			if q > bestQ || (q == bestQ && r < bestRank) {
-				best, bestQ, bestRank = c, q, r
-			}
+		}
+		if q > bestQ {
+			best, bestQ = c, q
 		}
 	}
 	return best

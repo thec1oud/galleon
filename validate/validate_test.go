@@ -265,3 +265,19 @@ func TestEmbeddedStructsShareTheirParentsPaths(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestRulesSkipEmptyStrings(t *testing.T) {
+	type In struct {
+		Status string `json:"status,omitempty" validate:"oneof=new paid"`
+		Code   string `json:"code" pattern:"^[A-Z]+$" validate:"min=2"`
+		Dash   string `json:"-," validate:"required"`
+	}
+	check, err := validate.Plan(reflect.TypeFor[In]())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := violations(t, check(&In{}))
+	if !reflect.DeepEqual(got, map[string]string{"/-": "required"}) {
+		t.Fatalf("an empty optional string passes every rule but required, and json:\"-,\" names a field \"-\": %v", got)
+	}
+}

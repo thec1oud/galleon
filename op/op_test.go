@@ -124,6 +124,7 @@ func TestCheckReportsProblems(t *testing.T) {
 		"upper-case method and":   op.Unary[In, Out]("orders.create").Public().HTTP("POST", "orders").Describe(),
 		"needs a service":         op.Unary[In, Out]("orders.create").Public().RPC("", "Create").Describe(),
 		"positive limit":          op.Unary[In, Out]("orders.create").Public().RateLimit(0, time.Second).Describe(),
+		"must be a struct":        {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[[]string](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
 		"no handler adapter":      {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}},
 		"input and output types":  {ID: "orders.create", Kind: op.KindUnary, Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
 		"not supported yet":       {ID: "orders.create", Kind: op.KindServerStream, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thec1oud/galleon/codec"
 	"github.com/thec1oud/galleon/errs"
@@ -17,9 +18,23 @@ import (
 type Item struct {
 	Quantity int `json:"quantity"`
 }
+type Base struct {
+	Base int `json:"base"`
+}
+
+type PtrBase struct {
+	Inner int `json:"inner"`
+}
+
 type Order struct {
-	Customer string `json:"customer"`
-	Items    []Item `json:"items"`
+	Base
+	*PtrBase
+	When     time.Time       `json:"when"`
+	Dotted   int             `json:"a.b"`
+	Slashed  int             `json:"a/b"`
+	M        map[string]Item `json:"m"`
+	Customer string          `json:"customer"`
+	Items    []Item          `json:"items"`
 	Ship     struct {
 		Express bool `json:"express"`
 	} `json:"ship"`
@@ -52,15 +67,30 @@ func TestJSONErrorsPointAtTheField(t *testing.T) {
 	}{
 		{`{"customer":1}`, "/customer", "type", op.RejectUnknown},
 		{`{"ship":{"express":"yes"}}`, "/ship/express", "type", op.RejectUnknown},
-		{`{"items":[{"quantity":"x"}]}`, "/items/quantity", "type", op.RejectUnknown},
-		{`{"customer":"a","extra":1}`, "/extra", "unknown_field", op.RejectUnknown},
+		// encoding/json doesn't report array indices, so the path stops at
+		// the array rather than inventing one.
+		{`{"items":[{},{"quantity":"x"}]}`, "/items", "type", op.RejectUnknown},
+		// It names an unknown field but not where it is.
+		{`{"customer":"a","extra":1}`, "", "unknown_field", op.RejectUnknown},
+		{`{"items":[{"qty":1}]}`, "", "unknown_field", op.RejectUnknown},
+		{`{"when":"yesterday"}`, "", "invalid_value", op.IgnoreUnknown},
+		{`{"base":"x"}`, "/base", "type", op.IgnoreUnknown},
+		{`{"inner":"x"}`, "/inner", "type", op.IgnoreUnknown},
+		{`{"a.b":"x"}`, "/a.b", "type", op.IgnoreUnknown},
+		{`{"a/b":"x"}`, "/a~1b", "type", op.IgnoreUnknown},
+		{`{"m":{"k":{"quantity":"x"}}}`, "/m", "type", op.IgnoreUnknown},
 		{`{"customer":`, "", "syntax", op.RejectUnknown},
 		{`{"customer" "a"}`, "", "syntax", op.RejectUnknown},
 		{`{} {}`, "", "trailing_data", op.RejectUnknown},
 	}
 	for _, c := range cases {
 		var o Order
-		v := violation(t, codec.JSON.Decode(strings.NewReader(c.body), &o, c.unknown))
+		err := codec.JSON.Decode(strings.NewReader(c.body), &o, c.unknown)
+		if err == nil {
+			t.Errorf("%s: no error", c.body)
+			continue
+		}
+		v := violation(t, err)
 		if v.Path != c.path || v.Code != c.code {
 			t.Errorf("%s: got %s %s, want %s %s", c.body, v.Path, v.Code, c.path, c.code)
 		}
@@ -136,11 +166,12 @@ func TestNegotiate(t *testing.T) {
 }
 
 func TestForContentType(t *testing.T) {
-	set := codec.NewSet(fakeCodec{"application/xml"})
+	set := codec.NewSet(fakeCodec{"application/xml"}, fakeCodec{"application/merge-patch+json"})
 	cases := map[string]string{
 		"":                                "application/json",
 		"application/json; charset=utf-8": "application/json",
 		"application/problem+json":        "application/json",
+		"application/merge-patch+json":    "application/merge-patch+json",
 		"application/xml":                 "application/xml",
 		"text/plain":                      "",
 		"not a type;;":                    "",
@@ -187,5 +218,14 @@ func TestWithPrefersTypeCodecsWithoutChangingTheSet(t *testing.T) {
 	}
 	if app.With() != app {
 		t.Fatal("With nothing returns the same set")
+	}
+}
+
+func TestTrailingSpaceOverTheLimitIsTooLarge(t *testing.T) {
+	r := httptest.NewRequest("POST", "/", strings.NewReader(`{}`+strings.Repeat(" ", 4096)))
+	body := http.MaxBytesReader(httptest.NewRecorder(), r.Body, 1024)
+	var o Order
+	if e := errs.From(codec.JSON.Decode(body, &o, op.RejectUnknown)); e.Code != "galleon.body_too_large" {
+		t.Fatalf("got %v", e)
 	}
 }

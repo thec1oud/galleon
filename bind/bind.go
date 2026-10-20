@@ -17,6 +17,7 @@ import (
 	"encoding"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"time"
 
@@ -40,14 +41,60 @@ func Plan(t reflect.Type) (Func, error) {
 	if t.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("bind: %v is not a struct", t)
 	}
+	fields, err := planFields(t, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	return func(into any, src Source) *op.ValidationError {
+		v := reflect.ValueOf(into).Elem()
+		var ve *op.ValidationError
+		for _, f := range fields {
+			var vals []string
+			switch f.from {
+			case fromPath:
+				vals = []string{src.PathValue(f.name)}
+			case fromQuery:
+				vals = src.Query(f.name)
+			case fromHeader:
+				vals = src.Header(f.name)
+			}
+			if !f.takesEmpty {
+				// "?limit=" means no limit was given, not a bad number.
+				vals = slices.DeleteFunc(slices.Clone(vals), func(s string) bool { return s == "" })
+			}
+			if len(vals) == 0 || (f.from == fromPath && vals[0] == "") {
+				continue
+			}
+			if err := f.set(v.FieldByIndex(f.index), vals); err != nil {
+				ve = ve.Add("/"+f.name, "type", map[string]any{"in": f.from.tag(), "error": err.Error()})
+			}
+		}
+		return ve
+	}, nil
+}
+
+// planFields plans the parameter fields of t, and of structs embedded in it,
+// whose fields Go promotes. index is the path to t from the planned type.
+func planFields(t reflect.Type, index []int) ([]field, error) {
 	var fields []field
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
+		if sf.Anonymous && sf.Type.Kind() == reflect.Struct {
+			inner, err := planFields(sf.Type, append(slices.Clone(index), i))
+			if err != nil {
+				return nil, err
+			}
+			fields = append(fields, inner...)
+			continue
+		}
 		var f field
 		n := 0
 		for _, k := range []kind{fromPath, fromQuery, fromHeader} {
 			if name := sf.Tag.Get(k.tag()); name != "" {
-				f = field{index: i, from: k, name: name}
+				f = field{from: k, name: name}
 				n++
 			}
 		}
@@ -68,35 +115,20 @@ func Plan(t reflect.Type) (Func, error) {
 			return nil, fmt.Errorf("bind: %v.%s: a path segment holds one value, not a slice", t, sf.Name)
 		}
 		f.set = set
+		f.index = append(slices.Clone(index), i)
+		f.takesEmpty = takesString(sf.Type)
 		fields = append(fields, f)
 	}
-	if len(fields) == 0 {
-		return nil, nil
+	return fields, nil
+}
+
+// takesString reports whether an empty value is meaningful for t: a string,
+// or a slice of strings.
+func takesString(t reflect.Type) bool {
+	if t.Kind() == reflect.Slice || t.Kind() == reflect.Pointer {
+		t = t.Elem()
 	}
-	return func(into any, src Source) *op.ValidationError {
-		v := reflect.ValueOf(into).Elem()
-		var ve *op.ValidationError
-		for _, f := range fields {
-			var vals []string
-			switch f.from {
-			case fromPath:
-				if s := src.PathValue(f.name); s != "" {
-					vals = []string{s}
-				}
-			case fromQuery:
-				vals = src.Query(f.name)
-			case fromHeader:
-				vals = src.Header(f.name)
-			}
-			if len(vals) == 0 {
-				continue
-			}
-			if err := f.set(v.Field(f.index), vals); err != nil {
-				ve = ve.Add("/"+f.name, "type", map[string]any{"in": f.from.tag(), "error": err.Error()})
-			}
-		}
-		return ve
-	}, nil
+	return t.Kind() == reflect.String
 }
 
 type kind uint8
@@ -112,10 +144,11 @@ func (k kind) tag() string {
 }
 
 type field struct {
-	index int
-	from  kind
-	name  string
-	set   func(v reflect.Value, vals []string) error
+	index      []int
+	from       kind
+	name       string
+	takesEmpty bool
+	set        func(v reflect.Value, vals []string) error
 }
 
 var (

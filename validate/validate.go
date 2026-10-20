@@ -6,6 +6,10 @@
 // Rules, separated by commas:
 //
 //	required        not the zero value; for pointers, slices and maps, not nil or empty
+//
+// The other rules skip a string field that is empty, since that is how a value
+// left out of the body arrives; only required rejects it.
+//
 //	min=N, max=N    numbers: the value; strings: the length in characters; slices and maps: the length
 //	len=N           exact length, as for min and max
 //	oneof=a b c     one of the space-separated values (strings and integers)
@@ -155,8 +159,11 @@ func (sp *structPlan) run(v reflect.Value, path string, ve **op.ValidationError)
 			fpath = path
 		}
 		isNil := fv.Kind() == reflect.Pointer && fv.IsNil()
+		// An empty string field means the value was left out, so only
+		// required applies to it. A pointer to "" was sent, and is checked.
+		absent := isNil || (fv.Kind() == reflect.String && fv.Len() == 0)
 		for _, c := range f.checks {
-			if isNil && !c.onNil {
+			if absent && !c.onNil {
 				continue
 			}
 			target := fv
@@ -268,8 +275,10 @@ func inlined(sf reflect.StructField) bool {
 	if !sf.Anonymous {
 		return false
 	}
-	if n, _, _ := strings.Cut(sf.Tag.Get("json"), ","); n != "" {
-		return false // tagged with a name, or skipped with "-"
+	if tag := sf.Tag.Get("json"); tag == "-" {
+		return false
+	} else if n, _, _ := strings.Cut(tag, ","); n != "" {
+		return false // tagged with a name
 	}
 	t := sf.Type
 	if t.Kind() == reflect.Pointer {
@@ -284,10 +293,10 @@ func jsonName(sf reflect.StructField) (string, bool) {
 	if !ok {
 		return sf.Name, false
 	}
-	n, _, _ := strings.Cut(tag, ",")
-	if n == "-" {
+	if tag == "-" {
 		return "", true
 	}
+	n, _, _ := strings.Cut(tag, ",") // `json:"-,"` names the field "-"
 	if n == "" {
 		return sf.Name, false
 	}

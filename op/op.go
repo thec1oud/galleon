@@ -219,6 +219,9 @@ func (d *Descriptor) Check() []error {
 	if d.Input.Type == nil || d.Input.New == nil || d.Output.Type == nil || d.Output.New == nil {
 		errs = append(errs, fmt.Errorf("operation %q: input and output types must be set (use op.TypeOf)", d.ID))
 	}
+	if d.Input.Type != nil && d.Input.Type.Kind() != reflect.Struct {
+		errs = append(errs, fmt.Errorf("operation %q: the input type must be a struct, not %v", d.ID, d.Input.Type))
+	}
 	if d.Adapt == nil {
 		errs = append(errs, fmt.Errorf("operation %q has no handler adapter: build it with op.Unary, or set Adapt to op.Adapter[In, Out]()", d.ID))
 	}

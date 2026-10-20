@@ -103,3 +103,38 @@ func TestPlanRejectsBadFields(t *testing.T) {
 		}
 	}
 }
+
+type Pagination struct {
+	Page  int `query:"page" json:"-"`
+	Limit int `query:"limit" json:"-"`
+}
+
+type ListIn struct {
+	Pagination
+	Q string `query:"q" json:"-"`
+}
+
+func TestBindFillsEmbeddedStructs(t *testing.T) {
+	b, err := bind.Plan(reflect.TypeFor[ListIn]())
+	if err != nil || b == nil {
+		t.Fatal(err)
+	}
+	var in ListIn
+	if ve := b(&in, src{query: url.Values{"page": {"2"}, "limit": {"10"}, "q": {"x"}}}); ve != nil {
+		t.Fatal(ve.Violations)
+	}
+	if in.Page != 2 || in.Limit != 10 || in.Q != "x" {
+		t.Fatalf("bound: %+v", in)
+	}
+}
+
+func TestEmptyValuesAreAbsentExceptForStrings(t *testing.T) {
+	b, _ := bind.Plan(reflect.TypeFor[ListIn]())
+	in := ListIn{Pagination: Pagination{Limit: 7}, Q: "keep"}
+	if ve := b(&in, src{query: url.Values{"limit": {""}, "q": {""}}}); ve != nil {
+		t.Fatalf("an empty number is absent, not invalid: %+v", ve.Violations)
+	}
+	if in.Limit != 7 || in.Q != "" {
+		t.Fatalf("got %+v", in)
+	}
+}
