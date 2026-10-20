@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,6 +19,8 @@ func TestClassify(t *testing.T) {
 	bg := context.Background()
 	canceled, cancel := context.WithCancel(bg)
 	cancel()
+	expired, cancel2 := context.WithDeadline(bg, time.Unix(0, 0))
+	defer cancel2()
 	for _, tc := range []struct {
 		name string
 		ctx  context.Context
@@ -39,8 +42,10 @@ func TestClassify(t *testing.T) {
 		{"closed pool", bg, puddle.ErrClosedPool, errs.Unavailable, data.CodeUnavailable},
 		{"lock not available", bg, &pgconn.PgError{Code: "55P03"}, errs.Conflict, data.CodeLockNotAvailable},
 		{"statement timeout", bg, &pgconn.PgError{Code: "57014"}, errs.DeadlineExceeded, data.CodeStatementTimeout},
-		{"canceled", bg, context.Canceled, errs.Canceled, "galleon.canceled"},
-		{"deadline", bg, context.DeadlineExceeded, errs.DeadlineExceeded, "galleon.deadline_exceeded"},
+		{"canceled", canceled, context.Canceled, errs.Canceled, "galleon.canceled"},
+		{"deadline", expired, context.DeadlineExceeded, errs.DeadlineExceeded, "galleon.deadline_exceeded"},
+		// The pool cancels its own dials as it closes: not the caller's doing.
+		{"canceled from inside", bg, context.Canceled, errs.Unavailable, data.CodeUnavailable},
 		{"query canceled by ctx", canceled, &pgconn.PgError{Code: "57014"}, errs.Canceled, "galleon.canceled"},
 		{"broken by ctx", canceled, &net.OpError{Op: "read", Err: errors.New("closed")}, errs.Canceled, "galleon.canceled"},
 	} {

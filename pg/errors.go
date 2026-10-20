@@ -43,14 +43,14 @@ func classify(ctx context.Context, err error) error {
 		}
 	}
 	ctxErr := ctx.Err()
-	byContext := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+	// Only the caller's own context makes a failure Canceled or
+	// DeadlineExceeded. A context error while it is live comes from inside,
+	// such as the pool cancelling its dials as it closes.
+	byContext := ctxErr != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		// The driver reports a cancelled or expired context in its own
 		// words: a cancelled query, a timeout, a broken connection.
-		ctxErr != nil && ((pe != nil && pe.Code == "57014") || pgconn.Timeout(err) || unreachable(err))
+		(pe != nil && pe.Code == "57014") || pgconn.Timeout(err) || unreachable(err))
 	if byContext {
-		if ctxErr == nil {
-			ctxErr = err
-		}
 		if errors.Is(ctxErr, context.DeadlineExceeded) {
 			return errs.Wrap(err, errs.DeadlineExceeded, "galleon.deadline_exceeded", "the request took too long")
 		}
@@ -60,7 +60,7 @@ func classify(ctx context.Context, err error) error {
 		// Canceled with the caller's ctx still live: statement_timeout.
 		return errs.Wrap(err, errs.DeadlineExceeded, data.CodeStatementTimeout, "the request took too long")
 	}
-	if pe == nil && unreachable(err) {
+	if pe == nil && (unreachable(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return errs.Wrap(err, errs.Unavailable, data.CodeUnavailable, "the database is unavailable")
 	}
 	return err
