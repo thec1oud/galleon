@@ -57,9 +57,9 @@ The same layers as a table, from top to bottom:
 
 | Go module | Contains | May depend on |
 |---|---|---|
-| `github.com/thec1oud/galleon` | Kernel, all plane **interfaces**, the operation model, the error model, HTTP and Connect transport, `local` coordination, in-memory defaults that are safe for single-node | stdlib, OpenTelemetry API, `connectrpc.com/connect` |
+| `github.com/thec1oud/galleon` | Kernel, all plane **interfaces**, the operation model, the error model, HTTP and Connect transport, `local` coordination, in-memory defaults that are safe for single-node, and the pgx data plane in package `pg` | stdlib, OpenTelemetry API, `connectrpc.com/connect`, pgx |
 | `github.com/thec1oud/galleon/testkit` | Fakes for every seam, the cluster harness, conformance suite runners | core |
-| `github.com/thec1oud/galleon/pg` | pgx-native data plane: sources, transactions, consistency tokens, replica tracking, Postgres outbox and inbox | core, pgx |
+| `github.com/thec1oud/galleon/pg` (a package of the core module) | pgx-native data plane: sources, transactions, consistency tokens, replica tracking, Postgres outbox and inbox | core, pgx |
 | `github.com/thec1oud/galleon/coord-{pg,redis,nats,etcd}` | Coordination backends | core, each driver |
 | `github.com/thec1oud/galleon/jobs` | The job system and scheduler (backend-pluggable, Postgres first) | core |
 | `github.com/thec1oud/galleon/web` | templ integration, fragments, forms, flash, Vite manifest and dev proxy | core, templ |
@@ -352,7 +352,7 @@ type Error struct {
 
 ## 7. Data plane (J1–J15, P9, D8, D10)
 
-The interfaces live in core. The default implementation (`github.com/thec1oud/galleon/pg`) is pgx-native, since your ORM and dpg are Postgres-only (D3, D4). A service without a database simply doesn't install a data module.
+The interfaces live in core (package `data`), and use pgx's own shapes for rows, batches and command tags. The default implementation (package `github.com/thec1oud/galleon/pg`) is pgx-native, since your ORM and dpg are Postgres-only (D3, D4). Both are packages of the core module, which therefore depends on pgx; a service without a database simply doesn't install the data module, and doesn't link pgx unless it imports one of them.
 
 ### 7.1 Sources and topology
 
@@ -371,10 +371,11 @@ A background tracker polls each replica's replay position (`pg_last_wal_replay_l
 ### 7.2 Typed handles
 
 ```go
-type Querier interface { /* Exec, Query, QueryRow, CopyFrom, SendBatch (pgx shapes) */ }
+type Reader interface { /* Query, QueryRow, SendBatch (pgx shapes) */ }
+type Querier interface { Reader /* + Exec, CopyFrom */ }
 
 type ReadTx interface {
-    Querier
+    Reader
     Begin(ctx context.Context) (ReadTx, error)  // nested → savepoint
     Commit(ctx context.Context) error
     Rollback(ctx context.Context) error          // no-op after Commit
@@ -382,43 +383,44 @@ type ReadTx interface {
 
 type WriteTx interface {
     ReadTx
+    Exec(…); CopyFrom(…)                         // a WriteTx is a Querier
     BeginWrite(ctx context.Context) (WriteTx, error)
     AfterCommit(func(ctx context.Context))       // outbox flush, cache invalidation, events
 }
 ```
 
-`ReadTx` has no write path, so writing on a replica transaction doesn't compile. At runtime Galleon also sets `SET TRANSACTION READ ONLY` as a backstop.
+`ReadTx` has no `Exec` or `CopyFrom`, so writing through a read handle doesn't compile, and a read handle can't be asserted to a `WriteTx`. At runtime Galleon also sets `SET TRANSACTION READ ONLY` as a backstop.
 
 ### 7.3 Both forms: pairs and closures (D10)
 
 ```go
 // begin/commit pairs: for nested calls that accept transactions, middleware-owned
 // transactions, streaming, and multi-step flows
-tx, err := data.BeginWrite(ctx)          // joins an enclosing tx as a savepoint if there is one
+tx, err := m.BeginWrite(ctx)             // m is the data.Manager; joins the tx in ctx, if any
 if err != nil { return err }
 defer tx.Rollback(ctx)
-if err := repo.Save(ctx, tx, order); err != nil { return err }
+if err := repo.Save(data.With(ctx, tx), tx, order); err != nil { return err } // data.With: callees join tx
 return tx.Commit(ctx)
 
-// closures: the same machinery, plus automatic retry on 40001/40P01
-err := data.Write(ctx, func(ctx context.Context, tx data.WriteTx) error { … })
-err := data.Read(ctx, func(ctx context.Context, tx data.ReadTx) error { … },
+// closures: the same machinery, plus automatic retry on 40001/40P01; fn's ctx carries tx
+err := m.Write(ctx, func(ctx context.Context, tx data.WriteTx) error { … })
+err := m.Read(ctx, func(ctx context.Context, tx data.ReadTx) error { … },
     data.Consistency(data.ReadYourWrites))
 ```
 
 The rules:
-- **Ownership:** only the owner of the root transaction commits it. A nested handle's `Commit` releases its savepoint.
+- **Ownership:** only the owner of the root transaction commits it. A nested handle's `Commit` releases its savepoint; a joined handle's only ends the handle. A joined write handle that rolls back marks the transaction it joined rollback-only, whose `Commit` then rolls back and fails, so half of a unit of work is never committed.
 - **`Rollback` after `Commit` is a no-op**, so `defer tx.Rollback(ctx)` is always safe.
-- **Leaks:** a transaction still open when its request or job ends is an error in dev and tests, reported with the stack trace of where it began. In production it is rolled back and logged.
-- **Retry** is only automatic in the closure form, and that's documented. With pairs, Galleon offers `data.Retry(ctx, fn)` for code that can be re-run.
+- **Leaks:** a transaction still open when its request or job ends is rolled back. In dev and tests (`pg` config `leaks: "error"`, the default) the call also fails with an error carrying the stack trace of where it began; in production (`leaks: "log"`) it is only logged. `pg` tracks this with an interceptor at the outermost pipeline position, so the operation plane knows nothing of it.
+- **Retry** is only automatic in the closure form, and only when the closure owns the root transaction; that's documented. `data.Retry(policy)` sets a closure's policy, and with pairs `data.Retry(policy).Do(ctx, fn)` reruns code that can be re-run.
 
 ### 7.4 Propagation and consistency (D8)
 
 | Propagation | Behaviour |
 |---|---|
 | `Join` (**default**) | Reuse the enclosing transaction. Reads inside a write see its uncommitted writes. |
-| `Independent` | A separate transaction, possibly on a replica, that **doesn't** see the enclosing writes. Opt-in only, and flagged in dev. |
-| `Nested` | A savepoint in the enclosing transaction. |
+| `Independent` | A separate transaction, possibly on a replica, that **doesn't** see the enclosing writes. Opt-in only. |
+| `Nested` | A savepoint in the enclosing transaction, or a new transaction when there is none. A nested read in a write transaction is `READ ONLY` too. |
 | `Mandatory` / `Never` | Assert that a transaction is or isn't present. |
 
 | Read consistency | Mechanism |
