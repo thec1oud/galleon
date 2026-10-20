@@ -620,3 +620,69 @@ func TestUnixSocketInUseIsLeftAlone(t *testing.T) {
 	}
 	c.Close()
 }
+
+// serveRecovering serves r and returns what the server panicked with, if
+// anything; a real server would cut the connection.
+func serveRecovering(h http.Handler, r *http.Request) (p any) {
+	defer func() { p = recover() }()
+	h.ServeHTTP(httptest.NewRecorder(), r)
+	return nil
+}
+
+func TestAbortBeforeAnyWriteHasNoStatus(t *testing.T) {
+	mw := galleon.ModuleFunc("abort", func(r *galleon.Registry) error {
+		r.Middleware(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { panic(http.ErrAbortHandler) })
+		})
+		return nil
+	})
+	e := boot(t, accessLog, mw)
+	if p := serveRecovering(e.h, httptest.NewRequest("GET", "/orders", nil)); p != http.ErrAbortHandler {
+		t.Fatalf("panicked with %v", p)
+	}
+	if l := e.logs.String(); !strings.Contains(l, "status=0") || !strings.Contains(l, "aborted=true") {
+		t.Fatalf("an aborted request must not log as a success: %s", l)
+	}
+}
+
+func TestSwitchingProtocolsIsAFinalStatus(t *testing.T) {
+	mw := galleon.ModuleFunc("upgrade", func(r *galleon.Registry) error {
+		r.Middleware(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusSwitchingProtocols)
+				panic("boom")
+			})
+		})
+		return nil
+	})
+	e := boot(t, accessLog, mw)
+	if p := serveRecovering(e.h, httptest.NewRequest("GET", "/orders", nil)); p != http.ErrAbortHandler {
+		t.Fatalf("a panic after 101 must cut the connection, got %v", p)
+	}
+	if l := e.logs.String(); !strings.Contains(l, "status=101") {
+		t.Fatalf("got %s", l)
+	}
+}
+
+func TestClientLeavingMidBodyIsNotABadRequest(t *testing.T) {
+	e := boot(t, accessLog)
+	c, err := net.Dial("tcp", listening(t, e))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(c, "POST /orgs/a/orders HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"customer\":")
+	time.Sleep(50 * time.Millisecond)
+	c.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(e.logs.String(), "http request") {
+		if time.Now().After(deadline) {
+			t.Fatal("the request was never logged")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if l := e.logs.String(); !strings.Contains(l, "status=499") {
+		t.Fatalf("a client that left is not a 400: %s", l)
+	}
+}
+
+const accessLog = `{"http":{"addr":"127.0.0.1:0","access_log":true}}`
