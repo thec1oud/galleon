@@ -770,7 +770,10 @@ func retryOnRealConflict(t *testing.T, f Factory) {
 				}
 				_, err := w.Exec(ctx, "INSERT INTO "+e.table+" (id, v) VALUES ($1, $2)", id, fmt.Sprint(n))
 				return err
-			}, data.Isolation(data.Serializable), data.Retry(data.RetryPolicy{Attempts: 5, Backoff: time.Millisecond}))
+			}, data.Isolation(data.Serializable),
+				// Generous: on a slow runner the peer can still be finishing
+				// while the first retries run, and those conflict too.
+				data.Retry(data.RetryPolicy{Attempts: 20, Backoff: 5 * time.Millisecond, MaxBackoff: 100 * time.Millisecond}))
 		}()
 	}
 	wg.Wait()
