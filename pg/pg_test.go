@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,14 +106,12 @@ func TestSourcesNeverShowTheirPasswords(t *testing.T) {
 	}
 }
 
-// A source prints as a summary of what pgx reads from its DSN, never the
-// DSN's text.
 // cleanPGEnv clears the PG* variables pgconn reads, so what a DSN parses
 // to doesn't depend on where the test runs.
 func cleanPGEnv(t *testing.T) {
 	t.Helper()
 	for _, v := range []string{"PGAPPNAME", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGSSLMODE",
-		"PGCONNECT_TIMEOUT", "PGPASSWORD", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE", "PGTARGETSESSIONATTRS",
+		"PGCONNECT_TIMEOUT", "PGPASSWORD", "PGSERVICE", "PGSERVICEFILE", "PGTARGETSESSIONATTRS",
 		"PGSSLCERT", "PGSSLKEY", "PGSSLROOTCERT", "PGSSLPASSWORD", "PGSSLSNI", "PGSSLNEGOTIATION", "PGOPTIONS"} {
 		t.Setenv(v, "")
 	}
@@ -140,6 +139,8 @@ func rootCert(t *testing.T) string {
 	return path
 }
 
+// A source prints as a summary of what pgx reads from its DSN, never the
+// DSN's text.
 func TestSourcesPrintASummaryOfTheirDSN(t *testing.T) {
 	cleanPGEnv(t)
 	root := rootCert(t)
@@ -149,7 +150,7 @@ func TestSourcesPrintASummaryOfTheirDSN(t *testing.T) {
 		"postgres://app@db/orders?sslmode=verify-full&sslrootcert=" + root:                                    "postgres://app@db:5432/orders?tls=verified",
 		"postgres://app@db/orders?sslmode=disable&sslpassword=s3cret&application_name=s3cret-api":             "postgres://app@db:5432/orders?tls=off",
 		"host=db user=app dbname=orders sslmode=disable sslpassword='s3 cret' application_name='s3 cret-api'": "postgres://app@db:5432/orders?tls=off",
-		"host=db user=app dbname=orders sslmode=disable sslpassword=other application_name=api":               "postgres://app@db:5432/orders?application_name=api&tls=off",
+		"host=db user=app dbname=orders sslmode=disable sslpassword=other application_name=api":               "postgres://app@db:5432/orders?tls=off",
 		"postgres://app:hunter2@db/orders":                                                                    "postgres://app@db:5432/orders?tls=preferred",
 		"host=db port=5433 user=app dbname=orders sslmode=disable application_name=api connect_timeout=5":     "postgres://app@db:5433/orders?application_name=api&connect_timeout=5s&tls=off",
 		// The password is also the user's and the database's name, which
@@ -274,4 +275,69 @@ func TestRetryPolicyIsBounded(t *testing.T) {
 	if runs != 1 {
 		t.Fatalf("retried %d times after ctx ended", runs-1)
 	}
+}
+
+// Any sslpassword, in the DSN or the environment, keeps application_name
+// out of the summary.
+func TestAnSSLPasswordHidesTheApplicationName(t *testing.T) {
+	cleanPGEnv(t)
+	plain := "postgres://app@db/orders?sslmode=disable&application_name=api"
+	if s := (pg.Source{DSN: plain}).String(); !strings.Contains(s, "application_name=api") {
+		t.Fatalf("without an sslpassword: %s", s)
+	}
+	for _, dsn := range []string{plain + "&ss%6Cpassword=x", plain + "&SSLPASSWORD=x"} {
+		if s := (pg.Source{DSN: dsn}).String(); strings.Contains(s, "application_name") {
+			t.Errorf("%q prints as %s", dsn, s)
+		}
+	}
+	t.Setenv("PGSSLPASSWORD", "x")
+	if s := (pg.Source{DSN: plain}).String(); strings.Contains(s, "application_name") {
+		t.Errorf("with PGSSLPASSWORD set: %s", s)
+	}
+}
+
+// Validating a source again after its DSN changed never keeps the old
+// summary, even when the new DSN is refused.
+func TestRevalidatingASourceRebuildsItsSummary(t *testing.T) {
+	cleanPGEnv(t)
+	c := pg.Config{Primary: pg.Source{DSN: "postgres://app@db/first?sslmode=disable"}, Leaks: "error"}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.Primary.DSN = "postgres://app@db/second?sslmode=disable"
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if s := c.Primary.String(); !strings.Contains(s, "/second?") {
+		t.Errorf("after the DSN changed: %s", s)
+	}
+	c.Primary.DSN = "host=db port=notaport"
+	if c.Validate() == nil {
+		t.Fatal("a bad DSN was accepted")
+	}
+	if s := c.Primary.String(); !strings.Contains(s, "<invalid DSN>") {
+		t.Errorf("after a bad DSN: %s", s)
+	}
+}
+
+// New works on its own copy of the config, so one Config can be shared.
+func TestNewDoesNotWriteToItsConfig(t *testing.T) {
+	cfg := pg.Config{
+		Primary: pg.Source{DSN: "postgres://app@db/orders"},
+		Named: map[string]pg.Source{
+			"one": {DSN: "postgres://app@db/one"},
+			"two": {DSN: "postgres://app@db/two"},
+		},
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := pg.New(cfg); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
 }

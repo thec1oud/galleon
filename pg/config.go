@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -15,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
-	"github.com/thec1oud/galleon/internal/dsn"
 )
 
 // Config is the "pg" config section.
@@ -94,37 +94,23 @@ func (s Source) dsnSummary() string {
 	return summarize(c, s.DSN)
 }
 
-// holdsSecret reports whether v contains any of the non-empty secrets.
-func holdsSecret(v string, secrets ...string) bool {
-	for _, s := range secrets {
-		if s != "" && strings.Contains(v, s) {
+// setsSSLPassword reports whether s, or the environment, sets any
+// sslpassword, which pgx doesn't expose. Its key is looked for in s as
+// written and as unescaped.
+func setsSSLPassword(s string) bool {
+	if os.Getenv("PGSSLPASSWORD") != "" {
+		return true
+	}
+	forms := []string{s}
+	if u, err := url.PathUnescape(s); err == nil {
+		forms = append(forms, u)
+	}
+	for _, f := range forms {
+		if strings.Contains(strings.ToLower(f), "sslpassword") {
 			return true
 		}
 	}
 	return false
-}
-
-// sslPasswordKV is a keyword/value sslpassword setting, quoted or not.
-var sslPasswordKV = regexp.MustCompile(`(?:^|\s)sslpassword\s*=\s*(?:'((?:[^'\\]|\\.)*)'|(\S+))`)
-
-// sslPassword is the sslpassword s sets, which pgx doesn't expose: a
-// simple lookup, good enough to keep it out of the summary.
-func sslPassword(s string) string {
-	if dsn.IsURL(s) {
-		if u, err := url.Parse(strings.TrimSpace(s)); err == nil {
-			return u.Query().Get("sslpassword")
-		}
-		return ""
-	}
-	m := sslPasswordKV.FindStringSubmatch(s)
-	switch {
-	case m == nil:
-		return ""
-	case m[2] != "":
-		return m[2]
-	default:
-		return strings.NewReplacer(`\'`, `'`, `\\`, `\`).Replace(m[1])
-	}
 }
 
 // summarize describes c, parsed from s, as what pgconn.ParseConfig reads
@@ -133,7 +119,7 @@ func sslPassword(s string) string {
 // allowlist: application_name, connect_timeout, and tls, which says how
 // TLS is used (off, allowed, preferred, required, verified-ca or verified)
 // since pgx keeps sslmode itself only as its effect. An application_name
-// that holds the password or the sslpassword is left out. The
+// is left out if it holds the password, or if an sslpassword is set at all. The
 // hosts are the others pgx would try.
 func summarize(c *pgconn.Config, s string) string {
 	// An '@' in what pgx reads as the user, host or database is most
@@ -161,7 +147,7 @@ func summarize(c *pgconn.Config, s string) string {
 		}
 	}
 	params := url.Values{}
-	if v := c.RuntimeParams["application_name"]; v != "" && !holdsSecret(v, c.Password, sslPassword(s)) {
+	if v := c.RuntimeParams["application_name"]; v != "" && (c.Password == "" || !strings.Contains(v, c.Password)) && !setsSSLPassword(s) {
 		params.Set("application_name", v)
 	}
 	if c.ConnectTimeout > 0 {
@@ -241,6 +227,7 @@ func (c *Config) Validate() error {
 }
 
 func (s *Source) validate() error {
+	s.summary = "" // whatever an earlier validation found no longer holds
 	if strings.TrimSpace(s.DSN) == "" {
 		return errors.New(`dsn must be set ("postgres://" takes everything from the PG* environment variables)`)
 	}
@@ -250,30 +237,35 @@ func (s *Source) validate() error {
 	if s.ConnectTimeout < 0 || s.MaxConnLifetime < 0 || s.MaxConnIdleTime < 0 {
 		return errors.New("timeouts must not be negative")
 	}
-	_, summary, err := s.parse()
+	pc, err := s.parseDSN()
 	if err != nil {
 		return err
 	}
-	s.summary = summary
-	return nil
+	s.summary = summarize(&pc.ConnConfig.Config, s.DSN)
+	return s.apply(pc)
 }
 
 // poolConfig parses the DSN and applies the source's settings.
 func (s Source) poolConfig() (*pgxpool.Config, error) {
-	pc, _, err := s.parse()
-	return pc, err
+	pc, err := s.parseDSN()
+	if err != nil {
+		return nil, err
+	}
+	return pc, s.apply(pc)
 }
 
-// parse parses the DSN and applies the source's settings, and summarizes
-// the DSN as parsed, before those settings.
-func (s Source) parse() (*pgxpool.Config, string, error) {
+func (s Source) parseDSN() (*pgxpool.Config, error) {
 	pc, err := pgxpool.ParseConfig(s.DSN)
 	if err != nil {
 		// pgx masks passwords in its message only on a best-effort basis
 		// for malformed input, so none of it is repeated.
-		return nil, "", errors.New("dsn can't be parsed: check its syntax")
+		return nil, errors.New("dsn can't be parsed: check its syntax")
 	}
-	summary := summarize(&pc.ConnConfig.Config, s.DSN)
+	return pc, nil
+}
+
+// apply applies the source's settings to pc.
+func (s Source) apply(pc *pgxpool.Config) error {
 	if s.MaxConns > 0 {
 		pc.MaxConns = s.MaxConns
 	}
@@ -290,9 +282,9 @@ func (s Source) parse() (*pgxpool.Config, string, error) {
 		pc.MaxConnIdleTime = s.MaxConnIdleTime
 	}
 	if pc.MinConns > pc.MaxConns {
-		return nil, "", fmt.Errorf("min_conns (%d) exceeds the pool's max_conns (%d)", pc.MinConns, pc.MaxConns)
+		return fmt.Errorf("min_conns (%d) exceeds the pool's max_conns (%d)", pc.MinConns, pc.MaxConns)
 	}
-	return pc, summary, nil
+	return nil
 }
 
 func (c *Config) retryPolicy() data.RetryPolicy {

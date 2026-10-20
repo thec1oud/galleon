@@ -232,7 +232,7 @@ func packageDB(admin string, schema []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if d, ok := packageDBs.dbs[key]; ok {
-		if packageDBs.live != nil && time.Since(packageDBs.checked) < liveCheckEvery || liveAlive(ctx) {
+		if (packageDBs.live != nil && time.Since(packageDBs.checked) < liveCheckEvery) || liveAlive(ctx) {
 			return d.dsn, nil
 		}
 	}

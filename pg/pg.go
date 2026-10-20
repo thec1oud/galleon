@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"runtime"
 	"slices"
 	"sort"
@@ -147,6 +148,9 @@ func New(cfg Config, opts ...Option) (*Manager, error) {
 	if cfg.Leaks == "" {
 		cfg.Leaks = leaksError
 	}
+	// Validate writes the validated sources back, and the map is the
+	// caller's, perhaps shared.
+	cfg.Named = maps.Clone(cfg.Named)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("pg: %w", err)
 	}
