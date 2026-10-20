@@ -281,28 +281,56 @@ func (c *Client) Name() string { return c.name }
 var sensitiveHeaders = []string{"Authorization", "Www-Authenticate", "Cookie", "Cookie2", "Proxy-Authorization", "Proxy-Authenticate"}
 
 // checkRedirect is http.Client's default policy, plus a fix for a request
-// sent through HTTP() with a relative URL: http.Client resolves the first
+// sent through HTTP() with a relative URL. http.Client resolves the first
 // redirect's Location against that relative URL, which resolving would then
 // put under the base path, so it is resolved against the absolute URL instead.
-// Later hops resolve against an absolute URL already.
+// And http.Client decides which hops keep the sensitive headers by comparing
+// them with a URL that has no host, so that decision is made here too.
 func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
 	}
-	if len(via) != 1 || via[0].URL.IsAbs() || c.base == nil {
+	if via[0].URL.IsAbs() || c.base == nil {
 		return nil
 	}
-	u, err := resolve(c.base, via[0].URL).Parse(req.Response.Header.Get("Location"))
-	if err != nil {
-		return err
+	first := resolve(c.base, via[0].URL)
+	if len(via) == 1 {
+		u, err := first.Parse(req.Response.Header.Get("Location"))
+		if err != nil {
+			return err
+		}
+		req.URL = u
 	}
-	req.URL = u
-	if u.Host != c.base.Host {
-		for _, h := range sensitiveHeaders {
+	// As http.Client does, once a hop leaves the first host's domain, the
+	// headers stay stripped even if a later hop comes back.
+	keep := sameDomain(first, req.URL)
+	for _, r := range via[1:] {
+		keep = keep && sameDomain(first, r.URL)
+	}
+	for _, h := range sensitiveHeaders {
+		if v := via[0].Header.Values(h); keep && len(v) > 0 {
+			req.Header[http.CanonicalHeaderKey(h)] = slices.Clone(v)
+		} else if !keep {
 			req.Header.Del(h)
 		}
 	}
 	return nil
+}
+
+// sameDomain reports whether u's host is first's or, for a name, one of its
+// subdomains: the hosts http.Client keeps sensitive headers for.
+func sameDomain(first, u *url.URL) bool {
+	a, b := strings.ToLower(first.Hostname()), strings.ToLower(u.Hostname())
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if _, err := netip.ParseAddr(a); err == nil {
+		return false
+	}
+	return strings.HasSuffix(b, "."+a)
 }
 
 // resolving resolves relative URLs against the base URL, for requests sent

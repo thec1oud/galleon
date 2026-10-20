@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -92,6 +93,9 @@ func parseOrigin(h string) (origin, error) {
 			return origin{}, fmt.Errorf("client: credentials host %q must be a host, host:port or an http(s) URL with no path", h)
 		}
 		o.scheme, h = u.Scheme, u.Host
+	}
+	if a, err := netip.ParseAddr(h); err == nil && a.Is6() {
+		h = "[" + h + "]" // a bare IPv6 address, which has no port
 	}
 	u := &url.URL{Host: h}
 	if u.Hostname() == "" || strings.ContainsAny(h, "/?#@") {

@@ -722,7 +722,8 @@ func TestCredentialsAreBoundToSchemeAndPort(t *testing.T) {
 	c, err := client.New("test", client.BaseURL("https://api.example.com"), client.Transport(fake),
 		client.WithCredentials(client.Bearer("base")),
 		client.WithCredentials(client.Bearer("files"), "files.example.com"),
-		client.WithCredentials(client.Bearer("legacy"), "http://legacy.example.com:8080"))
+		client.WithCredentials(client.Bearer("legacy"), "http://legacy.example.com:8080"),
+		client.WithCredentials(client.Bearer("v6"), "2001:db8::10"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -737,6 +738,7 @@ func TestCredentialsAreBoundToSchemeAndPort(t *testing.T) {
 		"http://legacy.example.com:8080/x":  "Bearer legacy",
 		"http://legacy.example.com:8081/x":  "",
 		"https://legacy.example.com:8080/x": "",
+		"https://[2001:db8::10]/x":          "Bearer v6",
 	} {
 		res, err := c.Do(must(http.NewRequest("GET", u, nil)))
 		if err != nil {
@@ -765,5 +767,52 @@ func TestMaxResponseBytesMustBePositive(t *testing.T) {
 	_, err := client.New("test", client.Configure(func(c *client.Config) { c.MaxResponseBytes = 0 }))
 	if err == nil || !strings.Contains(err.Error(), "max_response_bytes") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestRedirectChainsThroughHTTPKeepHeadersOnlyOnTheSameDomain(t *testing.T) {
+	var mu sync.Mutex
+	got := map[string]string{}
+	next := map[string]string{
+		"/api/evil1": "/api/evil2", "/api/evil2": "https://evil.com./steal",
+		"/api/same1": "/api/same2", "/api/same2": "/api/same3",
+		"/api/away1": "https://other.example.org/x", "/x": "https://api.example.com/api/back",
+	}
+	fake := rtFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		got[r.URL.Host+r.URL.Path] = r.Header.Get("Authorization") + "|" + r.Header.Get("Cookie")
+		mu.Unlock()
+		res := &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody, Request: r}
+		if to, ok := next[r.URL.Path]; ok {
+			res.StatusCode = http.StatusFound
+			res.Header.Set("Location", to)
+		}
+		return res, nil
+	})
+	c, err := client.New("test", client.BaseURL("https://api.example.com/api"), client.Transport(fake))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/evil1", "/same1", "/away1"} {
+		req := must(http.NewRequest("GET", path, nil))
+		req.Header.Set("Authorization", "Bearer caller")
+		req.Header.Set("Cookie", "s=1")
+		res, err := c.HTTP().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for at, want := range map[string]string{
+		"evil.com./steal":           "|",
+		"api.example.com/api/same3": "Bearer caller|s=1",
+		"other.example.org/x":       "|",
+		"api.example.com/api/back":  "|", // once stripped, stays stripped
+	} {
+		if v, ok := got[at]; !ok || v != want {
+			t.Errorf("%s: got %q (reached: %v), want %q", at, v, ok, want)
+		}
 	}
 }
