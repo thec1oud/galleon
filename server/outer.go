@@ -52,9 +52,24 @@ func (s *Server) outer(h http.Handler) http.Handler {
 		hdr.Set("Referrer-Policy", "no-referrer")
 		r = r.WithContext(ctx)
 
+		// finish records the request's outcome in the span and the access log.
+		finish := func(aborted bool) {
+			status := sw.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			span.SetAttributes(semconv.HTTPResponseStatusCode(status))
+			if status >= 500 || aborted {
+				span.SetStatus(codes.Error, http.StatusText(status))
+			}
+			if s.cfg.AccessLog {
+				s.log.InfoContext(ctx, "http request", "method", r.Method, "path", r.URL.Path, "status", status, "duration", time.Since(start), "peer", s.peer(r), "aborted", aborted)
+			}
+		}
 		defer func() {
 			if p := recover(); p != nil {
 				if p == http.ErrAbortHandler {
+					finish(true)
 					panic(p)
 				}
 				s.log.ErrorContext(ctx, "panic while serving a request", "method", r.Method, "path", r.URL.Path, "panic", p, "stack", string(debug.Stack()))
@@ -63,11 +78,13 @@ func (s *Server) outer(h http.Handler) http.Handler {
 					// The response has started, so it can't become an error.
 					// Cut the connection, so the client can't mistake a
 					// truncated response for a whole one.
-					span.SetAttributes(semconv.HTTPResponseStatusCode(sw.status))
+					finish(true)
 					panic(http.ErrAbortHandler)
 				}
 				// Drop whatever the handler set, such as Content-Encoding or
-				// Set-Cookie, keeping only the headers set above.
+				// Set-Cookie, keeping only the headers set above. Module
+				// middleware's headers, CORS ones included, go too, since a
+				// panic may have left them half set.
 				for k := range hdr {
 					if k != "X-Request-Id" && k != "X-Content-Type-Options" && k != "X-Frame-Options" && k != "Referrer-Policy" {
 						delete(hdr, k)
@@ -75,17 +92,7 @@ func (s *Server) outer(h http.Handler) http.Handler {
 				}
 				s.writeError(sw, r, errs.New(errs.Internal, "galleon.panic", ""), 0)
 			}
-			status := sw.status
-			if status == 0 {
-				status = http.StatusOK
-			}
-			span.SetAttributes(semconv.HTTPResponseStatusCode(status))
-			if status >= 500 {
-				span.SetStatus(codes.Error, http.StatusText(status))
-			}
-			if s.cfg.AccessLog {
-				s.log.InfoContext(ctx, "http request", "method", r.Method, "path", r.URL.Path, "status", status, "duration", time.Since(start), "peer", s.peer(r))
-			}
+			finish(false)
 		}()
 		h.ServeHTTP(sw, r)
 	})
@@ -169,7 +176,9 @@ type statusWriter struct {
 }
 
 func (w *statusWriter) WriteHeader(code int) {
-	if !w.wrote {
+	// An informational response, such as 103 Early Hints, isn't the final
+	// status, and the response can still become an error after it.
+	if !w.wrote && (code < 100 || code >= 200) {
 		w.status, w.wrote = code, true
 	}
 	w.ResponseWriter.WriteHeader(code)
