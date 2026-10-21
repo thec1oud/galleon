@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -236,14 +235,23 @@ func TestAStaleLeaseIsRefusedWithTheAdaptersCodes(t *testing.T) {
 	if _, err := newMigrator(t, "base", pool).Apply(ctx, under(lease{"e1", 10})); err != nil {
 		t.Fatal(err)
 	}
-	_, err := newMigrator(t, "next", pool).Apply(ctx, under(lease{"e1", 5}))
+	opts := under(lease{"e1", 5})
+	rec := &recorder{}
+	opts.Observer = rec
+	_, err := newMigrator(t, "next", pool).Apply(ctx, opts)
 	if code(err) != dpg.CodeStaleToken || !strings.Contains(err.Error(), "token 5 is stale") {
 		t.Fatalf("a lower token: %v", err)
 	}
-	// The fence refused DPG's first record, whose SQL isn't quoted.
-	for _, sql := range []string{"$dpg$", `"dpg".`, "INSERT", "CREATE"} {
-		if strings.Contains(err.Error(), sql) {
-			t.Errorf("the stale lease's error quotes SQL (%s): %v", sql, err)
+	if len(rec.ended) != 1 || code(rec.ended[0]) != dpg.CodeStaleToken {
+		t.Fatalf("observed %v", rec.ended)
+	}
+	// The fence refused DPG's first record, whose SQL isn't quoted, to
+	// the caller or to the observer.
+	for _, e := range []error{err, rec.ended[0]} {
+		for _, sql := range []string{"$dpg$", `"dpg".`, "INSERT", "CREATE"} {
+			if strings.Contains(e.Error(), sql) {
+				t.Errorf("the stale lease's error quotes SQL (%s): %v", sql, e)
+			}
 		}
 	}
 	if exists(t, pool, "public.c") {
@@ -442,18 +450,21 @@ func (r *tracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData
 // record statements' text, and DPG's statements can hold secrets.
 func TestConnectionsRunBeforeConnectButNotAfterConnectOrTheTracer(t *testing.T) {
 	ctx := context.Background()
-	dsn, err := url.Parse(database(t))
+	cfg, err := pgxpool.ParseConfig(database(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := dsn.Port()
-	// The configured port is wrong; BeforeConnect puts the right one in,
-	// as a hook that looks the server up would.
-	dsn.Host = dsn.Hostname() + ":1"
-	cfg, err := pgxpool.ParseConfig(dsn.String())
-	if err != nil {
-		t.Fatal(err)
+	// The configured port is wrong, on every host pgx would try (sslmode
+	// prefer tries each twice); BeforeConnect puts the right one in, as a
+	// hook that looks the server up would.
+	port := cfg.ConnConfig.Port
+	setPort := func(cc *pgx.ConnConfig, p uint16) {
+		cc.Port = p
+		for _, f := range cc.Fallbacks {
+			f.Port = p
+		}
 	}
+	setPort(cfg.ConnConfig, 1)
 	rec := &tracer{}
 	cfg.ConnConfig.Tracer = rec
 	var before, after atomic.Int32
@@ -462,9 +473,8 @@ func TestConnectionsRunBeforeConnectButNotAfterConnectOrTheTracer(t *testing.T) 
 		if cc.Tracer != nil {
 			t.Error("BeforeConnect was given a configuration with the tracer")
 		}
-		p, err := strconv.ParseUint(port, 10, 16)
-		cc.Port = uint16(p)
-		return err
+		setPort(cc, port)
+		return nil
 	}
 	cfg.AfterConnect = func(context.Context, *pgx.Conn) error {
 		after.Add(1)
@@ -522,9 +532,24 @@ func TestDPGsWarningsAreInTheStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := m.Status(context.Background())
+	ctx := context.Background()
+	st, err := m.Status(ctx)
 	if err != nil || st.State != migrate.Pending || !strings.Contains(st.Detail, "warning: ") || !strings.Contains(st.Detail, "format 9.0.0") {
 		t.Fatalf("%+v, %v", st, err)
+	}
+	// Its path is the project's own, not where the app runs from.
+	rel := filepath.Join(".dpg", "snapshots", "c", "app.json")
+	if !strings.Contains(st.Detail, "warning: "+rel+": ") || strings.Contains(st.Detail, root) {
+		t.Errorf("the warning's path: %s", st.Detail)
+	}
+	// In a result too: of a refusal, of an apply, of one with nothing to do.
+	refused := under(lease{"e", 1})
+	refused.Fingerprint = "sha256:none"
+	for i, opts := range []migrate.ApplyOptions{refused, under(lease{"e", 1}), under(lease{"e", 2})} {
+		res, err := m.Apply(ctx, opts)
+		if (err != nil) != (i == 0) || !strings.Contains(res.Detail, "warning: "+rel+": ") || strings.Contains(res.Detail, root) {
+			t.Errorf("apply %d: %+v, %v", i, res, err)
+		}
 	}
 }
 
@@ -661,6 +686,32 @@ func TestFinishingAMigrationThenTheNextOnTheSameTable(t *testing.T) {
 	ctx := context.Background()
 	dsn := database(t)
 	pool := poolOf(t, dsn)
+	committedOnly(t, dsn, pool)
+	m := newMigrator(t, "noted", pool)
+	if st, err := m.Status(ctx); err != nil || st.State != migrate.Pending {
+		t.Fatalf("%+v, %v", st, err)
+	}
+	res, err := m.Apply(ctx, under(lease{"e", 2}))
+	if err != nil || len(res.Applied) != 2 {
+		t.Fatalf("finishing, then the next migration: %+v, %v", res, err)
+	}
+	if st, err := m.Status(ctx); err != nil || st.State != migrate.UpToDate {
+		t.Errorf("%+v, %v", st, err)
+	}
+	if !exists(t, pool, "public.a_id_desc") {
+		t.Error("the index wasn't built")
+	}
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_name = 'a' AND column_name = 'note'").Scan(&n); err != nil || n != 1 {
+		t.Errorf("column note: %d, %v", n, err)
+	}
+}
+
+// committedOnly applies the base build, then the indexed build's migration
+// up to its transaction's commit: its index is still to be built.
+func committedOnly(t *testing.T, dsn string, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
 	if _, err := newMigrator(t, "base", pool).Apply(ctx, under(lease{"e", 1})); err != nil {
 		t.Fatal(err)
 	}
@@ -685,22 +736,28 @@ func TestFinishingAMigrationThenTheNextOnTheSameTable(t *testing.T) {
 	if !errors.Is(err, afterCommit) {
 		t.Fatalf("the engine's apply: %v", err)
 	}
+}
+
+// A valid index of the name a migration being finished builds, but made by
+// hand with another definition, is neither taken as built nor dropped.
+func TestAnIndexDefinedOtherwiseIsntTakenAsBuilt(t *testing.T) {
+	ctx := context.Background()
+	dsn := database(t)
+	pool := poolOf(t, dsn)
+	committedOnly(t, dsn, pool)
+	if _, err := pool.Exec(ctx, "CREATE INDEX a_id_desc ON a (id)"); err != nil {
+		t.Fatal(err)
+	}
 	m := newMigrator(t, "noted", pool)
+	_, err := m.Apply(ctx, under(lease{"e", 2}))
+	if err == nil || !strings.Contains(err.Error(), "DPG-E058: ") || strings.Contains(err.Error(), "CREATE") {
+		t.Fatalf("finishing: %v", err)
+	}
+	var def string
+	if err := pool.QueryRow(ctx, "SELECT pg_get_indexdef('public.a_id_desc'::regclass)").Scan(&def); err != nil || !strings.HasSuffix(def, "(id)") {
+		t.Errorf("a_id_desc is %s, %v", def, err)
+	}
 	if st, err := m.Status(ctx); err != nil || st.State != migrate.Pending {
-		t.Fatalf("%+v, %v", st, err)
-	}
-	res, err := m.Apply(ctx, under(lease{"e", 2}))
-	if err != nil || len(res.Applied) != 2 {
-		t.Fatalf("finishing, then the next migration: %+v, %v", res, err)
-	}
-	if st, err := m.Status(ctx); err != nil || st.State != migrate.UpToDate {
 		t.Errorf("%+v, %v", st, err)
-	}
-	if !exists(t, pool, "public.a_id_desc") {
-		t.Error("the index wasn't built")
-	}
-	var n int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_name = 'a' AND column_name = 'note'").Scan(&n); err != nil || n != 1 {
-		t.Errorf("column note: %d, %v", n, err)
 	}
 }

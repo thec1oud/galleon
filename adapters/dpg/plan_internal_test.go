@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -139,8 +140,7 @@ func TestMaxSafetyIsTheMostTheOptionsAllow(t *testing.T) {
 func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 	create := `CREATE INDEX CONCURRENTLY "a_x" ON "public"."a" ("x");`
 	m := &Migrator{name: "schema"}
-	m.statements = []engine.Step{{ID: "m1/2", SQL: create}, {ID: "m1/1", SQL: `CREATE TABLE "a" ("x" int);`}, {ID: "m1/3", SQL: `CREATE TABLE "a" ("x" int);` + " -- longer"}}
-	m.byLength = []engine.Step{m.statements[2], m.statements[0], m.statements[1]}
+	r := redactorOf([]engine.Step{{ID: "m1/1", SQL: `CREATE TABLE "a" ("x" int);`}, {ID: "m1/2", SQL: create}, {ID: "m1/3", SQL: `CREATE TABLE "a" ("x" int);` + " -- longer"}, {ID: "m1/4", SQL: " "}})
 	pgErr := &pgconn.PgError{Severity: "ERROR", Code: "42P07", Message: `relation "a_x" already exists`}
 	stale := errs.New(errs.FailedPrecondition, CodeStaleToken, `dpg: migrator "schema": the lease's fencing token 1 is stale`)
 	for _, c := range []struct {
@@ -148,7 +148,7 @@ func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 		want string
 	}{
 		{
-			fmt.Errorf("engine: c/app: finishing migration m1: %w", &engine.StatementError{SQL: create, Err: pgErr}),
+			fmt.Errorf("engine: c/app: finishing migration m1: %w", &engine.StatementError{Step: "m1/2", SQL: create, Err: pgErr}),
 			`dpg: migrator "schema": engine: c/app: finishing migration m1: executor: statement m1/2: ERROR: relation "a_x" already exists (SQLSTATE 42P07)`,
 		},
 		{
@@ -162,13 +162,24 @@ func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 			`dpg: migrator "schema": engine: c/app: finishing migration m1: executor: a statement of DPG's: context canceled`,
 		},
 		{
+			// Named by the step the engine says it is, not by its SQL,
+			// which a later step may repeat.
+			fmt.Errorf("engine: c/app: migration m9: %w", &engine.StatementError{Step: "m9/1", SQL: `CREATE TABLE "a" ("x" int);`, Err: pgErr}),
+			`dpg: migrator "schema": engine: c/app: migration m9: executor: statement m9/1: ERROR: relation "a_x" already exists (SQLSTATE 42P07)`,
+		},
+		{
+			// Refused by DPG's own check of safety.
+			fmt.Errorf("engine: c/app: %w", &engine.GateError{Reason: "DPG-E025: migration m1 contains destructive operations; re-run with --allow-destructive to proceed", Step: "m1/9", SQL: `DROP TABLE "secret";`}),
+			`dpg: migrator "schema": engine: c/app: DPG-E025: migration m1 contains destructive operations; re-run with --allow-destructive to proceed; first: statement m1/9`,
+		},
+		{
 			// Quoted outside a StatementError: the longer statement is
 			// replaced whole.
 			fmt.Errorf(`engine: c/app: DPG-E053: CREATE TABLE "a" ("x" int); -- longer`),
 			`dpg: migrator "schema": engine: c/app: DPG-E053: statement m1/3`,
 		},
 	} {
-		got := m.wrap(c.err)
+		got := m.wrap(r, c.err)
 		if got.Error() != c.want {
 			t.Errorf("%v\n got  %s\n want %s", c.err, got, c.want)
 		}
@@ -178,12 +189,19 @@ func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 	}
 	// The adapter's own refusal is returned as it is; one the engine
 	// wrapped keeps the engine's context and its code.
-	if m.wrap(stale) != error(stale) {
+	if m.wrap(r, stale) != error(stale) {
 		t.Error("the adapter's own error was wrapped")
 	}
-	got := m.wrap(fmt.Errorf("engine: c/app: migration m1: %w", stale))
+	if m.wrap(r, nil) != nil {
+		t.Error("no error was wrapped")
+	}
+	got := m.wrap(r, fmt.Errorf("engine: c/app: migration m1: %w", stale))
 	if e := errs.From(got); e == nil || e.Code != CodeStaleToken || !strings.Contains(got.Error(), "engine: c/app: migration m1: ") {
 		t.Errorf("%v", got)
+	}
+	// An error wrapped already, for an observer, isn't wrapped again.
+	if m.wrap(r, got) != got {
+		t.Error("a wrapped error was wrapped again")
 	}
 }
 
@@ -196,5 +214,21 @@ func TestWarningsAreAddedToTheDetail(t *testing.T) {
 	}
 	if got := withWarnings("d", nil); got != "d" {
 		t.Errorf("%q", got)
+	}
+}
+
+func TestWarningsNameNoAbsolutePath(t *testing.T) {
+	dir := filepath.Join(string(filepath.Separator)+"srv", "app", "schema")
+	other := filepath.Join(string(filepath.Separator)+"home", "x", "snap.json")
+	inside := filepath.Join(dir, ".dpg", "snapshots", "c", "app.json")
+	for msg, want := range map[string]string{
+		inside + ": written by dpg 9.0.0, format 9.0.0": filepath.Join(".dpg", "snapshots", "c", "app.json") + ": written by dpg 9.0.0, format 9.0.0",
+		"reading " + other + " (skipped)":               "reading snap.json (skipped)",
+		"a/b and c:d stay":                              "a/b and c:d stay",
+		`"` + inside + `"`:                              `"` + filepath.Join(".dpg", "snapshots", "c", "app.json") + `"`,
+	} {
+		if got := relative(msg, []string{dir}); got != want {
+			t.Errorf("relative(%q) = %q, want %q", msg, got, want)
+		}
 	}
 }
