@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/thec1oud/galleon/coord"
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/migrate"
 )
@@ -17,7 +18,7 @@ import (
 type MigrationStore struct {
 	mu       sync.Mutex
 	applied  map[string][]FakeStep // per migrator, in the order applied
-	fence    map[string]uint64
+	fence    map[string]fence
 	progress map[string]int // per migrator/task, units done
 	calls    map[string]int
 	changes  map[string]int
@@ -25,7 +26,23 @@ type MigrationStore struct {
 
 // NewMigrationStore returns an empty store.
 func NewMigrationStore() *MigrationStore {
-	return &MigrationStore{applied: map[string][]FakeStep{}, fence: map[string]uint64{}, progress: map[string]int{}, calls: map[string]int{}, changes: map[string]int{}}
+	return &MigrationStore{applied: map[string][]FakeStep{}, fence: map[string]fence{}, progress: map[string]int{}, calls: map[string]int{}, changes: map[string]int{}}
+}
+
+// fence is a migrator's fencing record: tokens compare within an epoch, and
+// another epoch takes over.
+type fence struct {
+	epoch string
+	token uint64
+}
+
+// staleLocked reports why lease l can't apply, or nil.
+func (s *MigrationStore) staleLocked(name string, l coord.Lease) error {
+	f := s.fence[name]
+	if f.epoch == l.Epoch() && l.Token() < f.token {
+		return errs.New(errs.FailedPrecondition, "testkit.stale_token", fmt.Sprintf("fencing token %d is below %d in epoch %q", l.Token(), f.token, f.epoch))
+	}
+	return nil
 }
 
 // FakeStep is one change of a fake migrator's build.
@@ -110,11 +127,21 @@ func (m *FakeMigrator) compareLocked() (pending []FakeStep, drift, ahead []strin
 	for _, a := range m.store.applied[m.name] {
 		applied[a.ID] = a
 	}
+	// A pending step before the build's last applied one would apply out
+	// of order: it has drifted.
+	last := -1
+	for i, s := range m.steps {
+		if _, ok := applied[s.ID]; ok {
+			last = i
+		}
+	}
 	inBuild := map[string]bool{}
-	for _, s := range m.steps {
+	for i, s := range m.steps {
 		inBuild[s.ID] = true
 		a, ok := applied[s.ID]
 		switch {
+		case !ok && i < last:
+			drift = append(drift, fmt.Sprintf("%s is older than applied %s", s.ID, m.steps[last].ID))
 		case !ok:
 			pending = append(pending, s)
 		case a.Content != s.Content:
@@ -219,9 +246,9 @@ func (m *FakeMigrator) Apply(ctx context.Context, opts migrate.ApplyOptions) (mi
 	pending, drift, ahead := m.compareLocked()
 	pl := m.planLocked()
 	var err error
-	switch tok := opts.Lock.Token(); {
-	case tok < s.fence[m.name]:
-		err = errs.New(errs.FailedPrecondition, "testkit.stale_token", fmt.Sprintf("fencing token %d is below %d", tok, s.fence[m.name]))
+	switch stale := s.staleLocked(m.name, opts.Lock); {
+	case stale != nil:
+		err = stale
 	case len(drift) > 0 || len(ahead) > 0:
 		err = errs.New(errs.FailedPrecondition, "testkit.not_pending", "the store has drifted or is ahead")
 	case opts.Fingerprint != "" && opts.Fingerprint != pl.Fingerprint():
@@ -234,7 +261,7 @@ func (m *FakeMigrator) Apply(ctx context.Context, opts migrate.ApplyOptions) (mi
 			}
 		}
 		if err == nil {
-			s.fence[m.name] = tok
+			s.fence[m.name] = fence{epoch: opts.Lock.Epoch(), token: opts.Lock.Token()}
 		}
 	}
 	s.mu.Unlock()
@@ -253,8 +280,8 @@ func (m *FakeMigrator) Apply(ctx context.Context, opts migrate.ApplyOptions) (mi
 		}
 		if err == nil {
 			s.mu.Lock()
-			if tok := opts.Lock.Token(); tok < s.fence[m.name] {
-				err = errs.New(errs.FailedPrecondition, "testkit.stale_token", fmt.Sprintf("fencing token %d is below %d", tok, s.fence[m.name]))
+			if stale := s.staleLocked(m.name, opts.Lock); stale != nil {
+				err = stale
 			} else if !m.appliedLocked(st.ID) {
 				s.applied[m.name] = append(s.applied[m.name], st)
 				res.Applied = append(res.Applied, info(st))

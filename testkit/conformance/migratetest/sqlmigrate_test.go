@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/coord"
 	"github.com/thec1oud/galleon/coord/local"
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/migrate"
@@ -179,7 +180,7 @@ func TestPlansReportDeclaredRisksAndUnknownOtherwise(t *testing.T) {
 	pool := schemaPool(t)
 	files := fstest.MapFS{
 		"1_a.sql": {Data: []byte("-- galleon:risk safe\nCREATE TABLE a (id int);")},
-		"2_b.sql": {Data: []byte("-- a comment first\n-- galleon:risk Destructive\nDROP TABLE a;")},
+		"2_b.sql": {Data: []byte("-- a comment first\n-- galleon:risk destructive\nDROP TABLE a;")},
 		"3_c.sql": {Data: []byte("CREATE TABLE c (id int);\n-- galleon:risk safe")},
 	}
 	pl, err := newSQL(t, "schema", files, pool).Plan(ctx)
@@ -260,6 +261,7 @@ type pastLease struct{}
 
 func (pastLease) Key() string                   { return "" }
 func (pastLease) Token() uint64                 { return 1 }
+func (pastLease) Epoch() string                 { return "past" }
 func (pastLease) Renew(context.Context) error   { return nil }
 func (pastLease) Release(context.Context) error { return nil }
 func (pastLease) Lost() <-chan struct{}         { return nil }
@@ -412,5 +414,94 @@ func TestTwoAppsMigrateOnePostgresDatabaseOnce(t *testing.T) {
 		if s.Contains("CREATE") {
 			t.Errorf("span %s holds SQL text", s.Name())
 		}
+	}
+}
+
+// The fence outlives the in-process backend's token counter: a new
+// process's backend starts at token 1 again, under a new epoch.
+func TestARestartedProcessAppliesAfterAHigherTokenWasRecorded(t *testing.T) {
+	ctx := context.Background()
+	pool := schemaPool(t)
+	files := fstest.MapFS{
+		"0001_a.sql": {Data: []byte("-- galleon:risk safe\nCREATE TABLE a (id int);")},
+		"0002_b.sql": {Data: []byte("-- galleon:risk safe\nCREATE TABLE b (id int); SELECT no_such_function();")},
+	}
+	b1 := local.New().Locks()
+	apply := func(locks interface {
+		Acquire(context.Context, string, time.Duration) (coord.Lease, error)
+	}, files fstest.MapFS) error {
+		l, err := locks.Acquire(ctx, migrate.LockKey("schema"), time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Release(ctx)
+		_, err = newSQL(t, "schema", files, pool).Apply(ctx, migrate.ApplyOptions{Lock: l, MaxRisk: migrate.Manual})
+		return err
+	}
+	if err := apply(b1, files); err == nil {
+		t.Fatal("the broken 0002 applied")
+	}
+	files["0002_b.sql"] = &fstest.MapFile{Data: []byte("-- galleon:risk safe\nCREATE TABLE b (id int);")}
+	if err := apply(b1, files); err != nil {
+		t.Fatalf("the retry under token 2: %v", err)
+	}
+	files["0003_c.sql"] = &fstest.MapFile{Data: []byte("-- galleon:risk safe\nCREATE TABLE c (id int);")}
+	if err := apply(local.New().Locks(), files); err != nil {
+		t.Fatalf("the next process, under token 1 of a new epoch: %v", err)
+	}
+	if !exists(t, pool, "c") {
+		t.Error("0003 wasn't applied")
+	}
+}
+
+func TestAGapBelowTheLatestAppliedVersionIsDriftNotPending(t *testing.T) {
+	ctx := context.Background()
+	pool := schemaPool(t)
+	files := fstest.MapFS{
+		"0001_a.sql": {Data: []byte("CREATE TABLE a (id int);")},
+		"0003_c.sql": {Data: []byte("CREATE TABLE c (id int);")},
+	}
+	if _, err := newSQL(t, "schema", files, pool).Apply(ctx, held(t, local.New(), "schema")); err != nil {
+		t.Fatal(err)
+	}
+	// A branch merged later brings 0002.
+	files["0002_b.sql"] = &fstest.MapFile{Data: []byte("CREATE TABLE b (id int);")}
+	m := newSQL(t, "schema", files, pool)
+	st, err := m.Status(ctx)
+	if err != nil || st.State != migrate.Drifted || !strings.Contains(st.Detail, "0002_b.sql is older than applied 0003_c") {
+		t.Fatalf("%+v, %v", st, err)
+	}
+	if _, err := m.Apply(ctx, held(t, local.New(), "schema")); !hasCode(err, sqlmigrate.CodeNotPending) || exists(t, pool, "b") {
+		t.Fatalf("the gap was applied: %v", err)
+	}
+	ooo := newSQL(t, "schema", files, pool, sqlmigrate.AllowOutOfOrder())
+	if st, err := ooo.Status(ctx); err != nil || st.State != migrate.Pending {
+		t.Fatalf("with AllowOutOfOrder: %+v, %v", st, err)
+	}
+	if _, err := ooo.Apply(ctx, held(t, local.New(), "schema")); err != nil || !exists(t, pool, "b") {
+		t.Fatalf("with AllowOutOfOrder the gap isn't applied: %v", err)
+	}
+}
+
+func TestADirectApplyWithNoMaxRiskRefusesAManualFileAndCreatesNothing(t *testing.T) {
+	ctx := context.Background()
+	pool := schemaPool(t)
+	files := fstest.MapFS{
+		"1_a.sql":      {Data: []byte("-- galleon:risk safe\nCREATE TABLE a (id int);")},
+		"2_manual.sql": {Data: []byte("-- galleon:risk manual\nCREATE TABLE m (id int);")},
+	}
+	opts := held(t, local.New(), "schema")
+	opts.MaxRisk = 0
+	_, err := newSQL(t, "schema", files, pool).Apply(ctx, opts)
+	if !hasCode(err, migrate.CodeRiskRefused) || !strings.Contains(err.Error(), "max safe") {
+		t.Fatalf("%v", err)
+	}
+	if exists(t, pool, "a") || exists(t, pool, "galleon_migrations") {
+		t.Error("a refused apply created something")
+	}
+	opts.Fingerprint = "not-the-plan"
+	opts.MaxRisk = migrate.Manual
+	if _, err := newSQL(t, "schema", files, pool).Apply(ctx, opts); !hasCode(err, migrate.CodeFingerprintMismatch) || exists(t, pool, "galleon_migrations") {
+		t.Fatalf("a plan other than the approved one: %v", err)
 	}
 }

@@ -5,6 +5,8 @@ package local
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -14,9 +16,13 @@ import (
 	"github.com/thec1oud/galleon/coord"
 )
 
-// Backend implements coord.Backend in memory.
+// Backend implements coord.Backend in memory. Its fencing tokens start
+// again at 1 in every Backend, so each has an epoch of its own, random, that
+// its leases report: a resource that recorded a token from an earlier
+// process tells the two counters apart.
 type Backend struct {
-	node coord.NodeID
+	node  coord.NodeID
+	epoch string
 
 	mu      sync.Mutex
 	locks   map[string]*lease
@@ -41,8 +47,11 @@ func WithNodeID(id coord.NodeID) Option { return func(b *Backend) { b.node = id 
 // New returns an empty in-process backend.
 func New(opts ...Option) *Backend {
 	host, _ := os.Hostname()
+	var e [8]byte
+	_, _ = rand.Read(e[:])
 	b := &Backend{
 		node:     coord.NodeID(fmt.Sprintf("%s-%d", host, os.Getpid())),
+		epoch:    "local-" + hex.EncodeToString(e[:]),
 		locks:    map[string]*lease{},
 		tokens:   map[string]uint64{},
 		changed:  make(chan struct{}),
@@ -103,6 +112,7 @@ type lease struct {
 
 func (l *lease) Key() string           { return l.key }
 func (l *lease) Token() uint64         { return l.token }
+func (l *lease) Epoch() string         { return l.b.epoch }
 func (l *lease) Lost() <-chan struct{} { return l.lost }
 
 func (l *lease) Renew(context.Context) error {

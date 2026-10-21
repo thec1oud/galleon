@@ -1,5 +1,5 @@
 // Package sqlmigrate is Galleon's built-in migrator: numbered SQL files,
-// applied in order, on PostgreSQL through pgx.
+// applied in version order, on PostgreSQL through pgx.
 //
 //	//go:embed migrations/*.sql
 //	var files embed.FS
@@ -14,10 +14,15 @@
 // migrator. Other files are ignored, but a .sql file that isn't named so is
 // an error, so a typo can't skip one.
 //
-// Comment lines at the top of a file may hold directives:
+// Comment lines at the top of a file, before its first line of SQL, may
+// hold directives, written exactly so: "--", any spaces, "galleon:", the
+// directive, and for risk one space and the value.
 //
 //	-- galleon:risk caution
 //	-- galleon:no-transaction
+//
+// A directive given twice, an unknown directive or value, and a near miss
+// (Galleon:, galleon: risk, a tab) are errors, never silently ignored.
 //
 // "risk" declares the file's risk (safe, caution, destructive or manual),
 // which plans report and the deploy policy checks. Without it a file is of
@@ -27,25 +32,39 @@
 // statement: PostgreSQL runs several sent at once as one implicit
 // transaction anyway. If it fails half way, or the node dies before it is
 // recorded, what it did stays and it is pending again, so write it to be
-// safe to repeat (IF NOT EXISTS).
+// safe to repeat (IF NOT EXISTS). Its statement runs outside the fence: the
+// fence is checked in a transaction just before it, and again when it is
+// recorded, but a holder that pauses between that check and the statement
+// can run it after its lease has passed to another node, which may be
+// running it too. Its record then fails, and the statement, being safe to
+// repeat, does no harm.
 //
 // Applied versions are recorded, with each file's SHA-256, in a table
 // (galleon_migrations by default, see Table), per migrator. A recorded file
 // whose content has changed since makes the status Drifted, as does a
 // recorded version this build lacks below its latest; recorded versions
-// above its latest make it Ahead.
+// above its latest make it Ahead. A pending file older than the latest
+// applied version (0002 when 0003 is applied, as when branches merge) makes
+// it Drifted too, and isn't applied, unless the migrator is made with
+// AllowOutOfOrder.
 //
 // Each file is applied in its own transaction, together with its record.
 // The transaction first raises the migrator's fencing row (the table name
-// with "_fence" appended) to the lease's token, and fails if the row
-// already holds a higher one: a node that paused past its lease, while
-// another took the lock, can't apply anything once it resumes.
+// with "_fence" appended) to the lease's epoch and token, and fails if the
+// row holds the same epoch with a higher token: a node that paused past its
+// lease, while another took the lock, can't apply anything once it resumes.
+// Tokens compare only within one coordination epoch (coord.Lease.Epoch). A
+// lease of another epoch, such as one from a new process on the in-process
+// backend, whose tokens start again at 1, takes the row over. So fencing
+// protects within one epoch: a cluster backend keeps one for good, and the
+// in-process backend, whose epoch is per process, serves a single node,
+// which the kernel's multi-node check enforces.
 //
-// The migrator is a migrate.Planner and a migrate.Verifier.
+// The migrator is a migrate.Planner, OfflinePlanner and Verifier.
 package sqlmigrate
 
 import (
-	"bufio"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -90,18 +109,48 @@ type Option func(*Migrator)
 
 // Table sets the table applied versions are recorded in, optionally
 // schema-qualified ("ops.migrations"). The default is galleon_migrations.
-// Several migrators can share a table: rows are per migrator.
+// Several migrators can share a table: rows are per migrator. The table's
+// name, with "_fence" appended for the fencing table, must fit PostgreSQL's
+// 63 bytes, so it is at most 57.
 func Table(name string) Option {
 	return func(m *Migrator) { m.table = pgx.Identifier(strings.Split(name, ".")) }
 }
 
+// AllowOutOfOrder applies a pending file older than the latest applied
+// version, rather than calling the database Drifted.
+func AllowOutOfOrder() Option { return func(m *Migrator) { m.outOfOrder = true } }
+
 // Migrator applies a directory of numbered SQL files.
 type Migrator struct {
-	name  string
-	db    DB
-	files []file
-	table pgx.Identifier
+	name       string
+	db         DB
+	files      []file
+	table      pgx.Identifier
+	outOfOrder bool
 }
+
+// maxName is PostgreSQL's longest identifier, in bytes.
+const maxName = 63
+
+func (m *Migrator) checkTable() error {
+	if len(m.table) == 0 || len(m.table) > 2 {
+		return fmt.Errorf("table %q must be a name, or schema.name", strings.Join(m.table, "."))
+	}
+	for _, part := range m.table {
+		if part == "" {
+			return fmt.Errorf("table %q has an empty part", strings.Join(m.table, "."))
+		}
+		if len(part) > maxName {
+			return fmt.Errorf("table %q: %q is longer than %d bytes", strings.Join(m.table, "."), part, maxName)
+		}
+	}
+	if last := m.table[len(m.table)-1]; len(last)+len(fenceSuffix) > maxName {
+		return fmt.Errorf("table %q: the name must be at most %d bytes, so that %q fits", strings.Join(m.table, "."), maxName-len(fenceSuffix), last+fenceSuffix)
+	}
+	return nil
+}
+
+const fenceSuffix = "_fence"
 
 type file struct {
 	version  int64
@@ -123,12 +172,17 @@ func (f file) step() migrate.StepInfo {
 }
 
 var (
-	_ migrate.Migrator = (*Migrator)(nil)
-	_ migrate.Planner  = (*Migrator)(nil)
-	_ migrate.Verifier = (*Migrator)(nil)
+	_ migrate.Migrator       = (*Migrator)(nil)
+	_ migrate.Planner        = (*Migrator)(nil)
+	_ migrate.Verifier       = (*Migrator)(nil)
+	_ migrate.OfflinePlanner = (*Migrator)(nil)
 )
 
 var fileName = regexp.MustCompile(`^([0-9]+)_[^/]+\.sql$`)
+
+// nearMiss is a comment that was meant as a directive: "galleon:" in
+// another case, or with space before the colon.
+var nearMiss = regexp.MustCompile(`(?i)^galleon\s*:`)
 
 // New reads every migration in fsys now, so a bad file fails at boot, and
 // returns the migrator named name, on db.
@@ -139,6 +193,9 @@ func New(name string, fsys fs.FS, db DB, opts ...Option) (*Migrator, error) {
 	m := &Migrator{name: name, db: db, table: pgx.Identifier{"galleon_migrations"}}
 	for _, o := range opts {
 		o(m)
+	}
+	if err := m.checkTable(); err != nil {
+		return nil, fmt.Errorf("sqlmigrate: migrator %q: %w", name, err)
 	}
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
@@ -182,52 +239,64 @@ func New(name string, fsys fs.FS, db DB, opts ...Option) (*Migrator, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, fmt.Errorf("sqlmigrate: migrator %q: %w", name, err)
 	}
-	slices.SortFunc(m.files, func(a, b file) int { return cmpInt(a.version, b.version) })
+	slices.SortFunc(m.files, func(a, b file) int { return cmp.Compare(a.version, b.version) })
 	return m, nil
 }
 
-func cmpInt(a, b int64) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-	return 0
-}
-
-// directives reads the galleon: comment lines at the top of the file.
+// directives reads the galleon: comment lines at the top of the file. It
+// stops at the first line that isn't a comment, without reading further,
+// however long that line is.
 func (f *file) directives() error {
 	f.risk = migrate.Unknown
-	sc := bufio.NewScanner(strings.NewReader(f.sql))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+	seen := map[string]bool{}
+	rest := f.sql
+	for rest != "" {
+		var line string
+		line, rest, _ = strings.Cut(rest, "\n")
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		comment, ok := strings.CutPrefix(line, "--")
 		if !ok {
-			break // the SQL has begun
+			return nil // the SQL has begun
 		}
-		d, ok := strings.CutPrefix(strings.TrimSpace(comment), "galleon:")
+		comment = strings.TrimLeft(comment, " \t")
+		d, ok := strings.CutPrefix(comment, "galleon:")
 		if !ok {
+			if nearMiss.MatchString(comment) {
+				return fmt.Errorf("%q looks like a directive, but directives are written \"-- galleon:<directive>\", in lower case", line)
+			}
 			continue
 		}
-		key, value, _ := strings.Cut(strings.TrimSpace(d), " ")
+		if strings.ContainsAny(d, "\t\r") || strings.HasPrefix(d, " ") || strings.Contains(d, "  ") {
+			return fmt.Errorf("%q: separate a directive and its value with one space, no tabs", line)
+		}
+		key, value, _ := strings.Cut(d, " ")
+		if seen[key] {
+			return fmt.Errorf("directive galleon:%s is given twice", key)
+		}
+		seen[key] = true
 		switch key {
 		case "risk":
+			if value == "" {
+				return errors.New("directive galleon:risk needs a value: safe, caution, destructive or manual")
+			}
 			r, err := migrate.ParseRisk(value)
-			if err != nil {
-				return err
+			if err != nil || r.String() != value {
+				return fmt.Errorf("directive galleon:risk %s: want safe, caution, destructive or manual, in lower case", value)
 			}
 			f.risk = r
 		case "no-transaction":
+			if value != "" {
+				return fmt.Errorf("directive galleon:no-transaction takes no value, not %q", value)
+			}
 			f.noTx = true
 		default:
 			return fmt.Errorf("unknown directive galleon:%s (want risk or no-transaction)", key)
 		}
 	}
-	return sc.Err()
+	return nil
 }
 
 func (m *Migrator) Name() string { return m.name }
@@ -284,6 +353,8 @@ func (m *Migrator) compare(recs []record) compare {
 		inBuild[f.version] = true
 		r, ok := byVersion[f.version]
 		switch {
+		case !ok && f.version < c.current && !m.outOfOrder:
+			c.drift = append(c.drift, fmt.Sprintf("%s is older than applied %s, so it would apply out of order (allow it with AllowOutOfOrder)", f.name, nameOf(byVersion[c.current])))
 		case !ok:
 			c.pending = append(c.pending, f)
 		case r.checksum != f.checksum:
@@ -302,6 +373,8 @@ func (m *Migrator) compare(recs []record) compare {
 	}
 	return c
 }
+
+func nameOf(r record) string { return strings.TrimSuffix(r.name, ".sql") }
 
 func short(sum string) string {
 	if len(sum) > 12 {
@@ -377,6 +450,13 @@ func (m *Migrator) Plan(ctx context.Context) (migrate.Plan, error) {
 	return planOf(m.compare(recs).pending), nil
 }
 
+// PlanOffline plans every file, as if the database were empty, without
+// connecting: what CI reviews. Its fingerprint isn't the online plan's,
+// which covers only the pending files; approve the online one.
+func (m *Migrator) PlanOffline(context.Context) (migrate.Plan, error) {
+	return planOf(m.files), nil
+}
+
 func planOf(files []file) migrate.Plan {
 	steps := make([]migrate.StepInfo, len(files))
 	content := make([][]byte, len(files))
@@ -394,9 +474,7 @@ func (m *Migrator) Apply(ctx context.Context, opts migrate.ApplyOptions) (migrat
 	if opts.Lock == nil {
 		return migrate.Result{}, errs.New(errs.FailedPrecondition, CodeNoLock, fmt.Sprintf("sqlmigrate: migrator %q never applies without a lease", m.name))
 	}
-	if err := m.ensureTables(ctx); err != nil {
-		return migrate.Result{}, err
-	}
+	// Everything that can refuse does so before anything is created.
 	recs, err := m.applied(ctx, m.db)
 	if err != nil {
 		return migrate.Result{}, fmt.Errorf("sqlmigrate: reading %s: %w", m.table.Sanitize(), err)
@@ -411,14 +489,20 @@ func (m *Migrator) Apply(ctx context.Context, opts migrate.ApplyOptions) (migrat
 	}
 	for _, f := range c.pending {
 		if !opts.Allows(f.risk) {
-			return migrate.Result{}, errs.New(errs.FailedPrecondition, migrate.CodeRiskRefused, fmt.Sprintf("sqlmigrate: migrator %q: %s is of %s risk, which isn't allowed (max %s); nothing was applied", m.name, f.name, f.risk, opts.MaxRisk))
+			return migrate.Result{}, errs.New(errs.FailedPrecondition, migrate.CodeRiskRefused, fmt.Sprintf("sqlmigrate: migrator %q: %s is of %s risk, which isn't allowed (max %s, unknown %s); nothing was applied", m.name, f.name, f.risk, migrate.Ceiling(opts.MaxRisk), allowed(opts.AllowUnknown)))
 		}
 	}
+	if len(c.pending) == 0 {
+		return migrate.Result{}, nil
+	}
+	if err := m.ensureTables(ctx); err != nil {
+		return migrate.Result{}, err
+	}
 	var res migrate.Result
-	token := int64(opts.Lock.Token())
+	fence := fencing{epoch: opts.Lock.Epoch(), token: int64(opts.Lock.Token())}
 	for _, f := range c.pending {
 		sctx, done := opts.Step(ctx, f.step())
-		applied, err := m.applyFile(sctx, f, token)
+		applied, err := m.applyFile(sctx, f, fence)
 		done(err)
 		if err != nil {
 			return res, err
@@ -430,9 +514,22 @@ func (m *Migrator) Apply(ctx context.Context, opts migrate.ApplyOptions) (migrat
 	return res, nil
 }
 
+func allowed(b bool) string {
+	if b {
+		return "allowed"
+	}
+	return "refused"
+}
+
+// fencing is the lease a file is applied under.
+type fencing struct {
+	epoch string
+	token int64
+}
+
 func (m *Migrator) fence() pgx.Identifier {
 	t := slices.Clone(m.table)
-	t[len(t)-1] += "_fence"
+	t[len(t)-1] += fenceSuffix
 	return t
 }
 
@@ -454,6 +551,7 @@ func (m *Migrator) ensureTables(ctx context.Context) error {
 );
 CREATE TABLE IF NOT EXISTS `+m.fence().Sanitize()+` (
 	migrator text   PRIMARY KEY,
+	epoch    text   NOT NULL,
 	token    bigint NOT NULL
 )`)
 		return err
@@ -464,13 +562,15 @@ CREATE TABLE IF NOT EXISTS `+m.fence().Sanitize()+` (
 	return nil
 }
 
-// raiseFence moves the fencing row up to token, and fails if it already
-// holds a higher one. The row stays locked until tx ends, so the files of
-// two holders never interleave.
-func (m *Migrator) raiseFence(ctx context.Context, tx pgx.Tx, token int64) error {
-	rows, err := tx.Query(ctx, `INSERT INTO `+m.fence().Sanitize()+` AS f (migrator, token) VALUES ($1, $2)
-ON CONFLICT (migrator) DO UPDATE SET token = EXCLUDED.token WHERE f.token <= EXCLUDED.token
-RETURNING token`, m.name, token)
+// raiseFence moves the fencing row to the lease's epoch and token, and
+// fails if the row holds the same epoch with a higher token. Another epoch
+// takes the row over: its tokens come from another counter. The row stays
+// locked until tx ends, so the files of two holders never interleave.
+func (m *Migrator) raiseFence(ctx context.Context, tx pgx.Tx, l fencing) error {
+	rows, err := tx.Query(ctx, `INSERT INTO `+m.fence().Sanitize()+` AS f (migrator, epoch, token) VALUES ($1, $2, $3)
+ON CONFLICT (migrator) DO UPDATE SET epoch = EXCLUDED.epoch, token = EXCLUDED.token
+	WHERE f.epoch <> EXCLUDED.epoch OR f.token <= EXCLUDED.token
+RETURNING token`, m.name, l.epoch, l.token)
 	if err != nil {
 		return err
 	}
@@ -479,14 +579,14 @@ RETURNING token`, m.name, token)
 		return err
 	}
 	if len(got) == 0 {
-		return errs.New(errs.FailedPrecondition, CodeStaleToken, fmt.Sprintf("sqlmigrate: migrator %q: the lease's fencing token %d is stale: a later holder has applied since", m.name, token))
+		return errs.New(errs.FailedPrecondition, CodeStaleToken, fmt.Sprintf("sqlmigrate: migrator %q: the lease's fencing token %d is stale: a later holder of its epoch has applied since", m.name, l.token))
 	}
 	return nil
 }
 
 // applyFile applies f, unless it has been recorded since the status was
 // read, and reports whether it did.
-func (m *Migrator) applyFile(ctx context.Context, f file, token int64) (bool, error) {
+func (m *Migrator) applyFile(ctx context.Context, f file, fence fencing) (bool, error) {
 	wrap := func(err error) error {
 		if e := (*errs.Error)(nil); errors.As(err, &e) {
 			return err
@@ -495,7 +595,7 @@ func (m *Migrator) applyFile(ctx context.Context, f file, token int64) (bool, er
 	}
 	var applied bool
 	record := func(tx pgx.Tx) error {
-		if err := m.raiseFence(ctx, tx, token); err != nil {
+		if err := m.raiseFence(ctx, tx, fence); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, "SELECT EXISTS (SELECT 1 FROM "+m.table.Sanitize()+" WHERE migrator = $1 AND version = $2)", m.name, f.version)
@@ -511,7 +611,7 @@ func (m *Migrator) applyFile(ctx context.Context, f file, token int64) (bool, er
 				return err
 			}
 		}
-		_, err = tx.Exec(ctx, "INSERT INTO "+m.table.Sanitize()+" (migrator, version, name, checksum, token) VALUES ($1, $2, $3, $4, $5)", m.name, f.version, f.name, f.checksum, token)
+		_, err = tx.Exec(ctx, "INSERT INTO "+m.table.Sanitize()+" (migrator, version, name, checksum, token) VALUES ($1, $2, $3, $4, $5)", m.name, f.version, f.name, f.checksum, fence.token)
 		applied = err == nil
 		return err
 	}
@@ -521,7 +621,7 @@ func (m *Migrator) applyFile(ctx context.Context, f file, token int64) (bool, er
 		// again.
 		var pending bool
 		err := pgx.BeginFunc(ctx, m.db, func(tx pgx.Tx) error {
-			if err := m.raiseFence(ctx, tx, token); err != nil {
+			if err := m.raiseFence(ctx, tx, fence); err != nil {
 				return err
 			}
 			rows, err := tx.Query(ctx, "SELECT NOT EXISTS (SELECT 1 FROM "+m.table.Sanitize()+" WHERE migrator = $1 AND version = $2)", m.name, f.version)

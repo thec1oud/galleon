@@ -219,3 +219,12 @@ func TestTheKernelTracesMigrationsWithTheAppsProvider(t *testing.T) {
 		t.Fatalf("spans %v", tp.Names())
 	}
 }
+
+func TestTheFakeCallsAGapBelowItsLatestAppliedStepDrift(t *testing.T) {
+	store := testkit.NewMigrationStore()
+	testkit.New(t, galleon.Modules(schemaModule(store, stepA, stepC)))
+	st, err := store.Migrator("schema", stepA, stepB, stepC).Status(context.Background())
+	if err != nil || st.State != migrate.Drifted || !strings.Contains(st.Detail, "2_b is older than applied 3_c") {
+		t.Fatalf("%+v, %v", st, err)
+	}
+}

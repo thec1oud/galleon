@@ -31,7 +31,7 @@ func TestBadFilesFailNewTogether(t *testing.T) {
 		"version 1 is also 0001_a.sql",
 		"create_users.sql: a migration must be named <version>_<name>.sql",
 		"0_zero.sql: the version must be a positive number",
-		`2_risk.sql: unknown risk "huge"`,
+		"2_risk.sql: directive galleon:risk huge: want safe, caution, destructive or manual",
 		"3_directive.sql: unknown directive galleon:transaction-please",
 	} {
 		if !strings.Contains(err.Error(), want) {
@@ -65,7 +65,63 @@ func TestTheMigratorHasThePlannerAndVerifierCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(migrate.Capabilities(m), ","); got != "plan,verify" {
+	if got := strings.Join(migrate.Capabilities(m), ","); got != "plan,plan_offline,verify" {
 		t.Errorf("capabilities %s", got)
+	}
+}
+
+func TestDirectivesStopAtTheFirstLineOfSQLHoweverLong(t *testing.T) {
+	long := "INSERT INTO t VALUES ('" + strings.Repeat("x", 200_000) + "');\n-- galleon:risk huge"
+	m, err := sqlmigrate.New("schema", fstest.MapFS{
+		"1_long.sql":  {Data: []byte(long)},
+		"2_risky.sql": {Data: []byte("-- Galleons sail; this comment isn't a directive\n-- galleon:risk caution\n" + long)},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl, err := m.PlanOffline(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := pl.Steps(); s[0].Risk != migrate.Unknown || s[1].Risk != migrate.Caution {
+		t.Errorf("risks %s and %s", s[0].Risk, s[1].Risk)
+	}
+}
+
+func TestBadDirectivesAreErrorsNotIgnored(t *testing.T) {
+	for body, says := range map[string]string{
+		"-- galleon:risk safe\n-- galleon:risk caution\nSELECT 1;": "directive galleon:risk is given twice",
+		"-- galleon:no-transaction false\nSELECT 1;":               `galleon:no-transaction takes no value, not "false"`,
+		"-- Galleon:risk safe\nSELECT 1;":                          "directives are written",
+		"-- galleon :risk safe\nSELECT 1;":                         "directives are written",
+		"-- galleon:risk\tsafe\nSELECT 1;":                         "one space, no tabs",
+		"-- galleon: risk safe\nSELECT 1;":                         "one space, no tabs",
+		"-- galleon:risk  safe\nSELECT 1;":                         "one space, no tabs",
+		"-- galleon:risk\nSELECT 1;":                               "galleon:risk needs a value",
+		"-- galleon:risk Safe\nSELECT 1;":                          "in lower case",
+		"-- galleon:no-transactions\nSELECT 1;":                    "unknown directive galleon:no-transactions",
+	} {
+		_, err := sqlmigrate.New("schema", fstest.MapFS{"1_a.sql": {Data: []byte(body)}}, nil)
+		if err == nil || !strings.Contains(err.Error(), says) {
+			t.Errorf("%q: want %q, got %v", body, says, err)
+		}
+	}
+}
+
+func TestTheTableNameMustFit(t *testing.T) {
+	for name, ok := range map[string]bool{
+		"galleon_migrations":           true,
+		"ops.migrations":               true,
+		strings.Repeat("t", 57):        true,
+		strings.Repeat("t", 58):        false,
+		"":                             false,
+		"ops.":                         false,
+		"a.b.c":                        false,
+		strings.Repeat("s", 64) + ".t": false,
+	} {
+		_, err := sqlmigrate.New("schema", fstest.MapFS{}, nil, sqlmigrate.Table(name))
+		if (err == nil) != ok {
+			t.Errorf("table %q: %v", name, err)
+		}
 	}
 }

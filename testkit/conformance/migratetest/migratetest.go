@@ -61,7 +61,8 @@ type Factory struct {
 	// newer build migrated, and Drifted, for an edited change.
 	Ahead, Drift bool
 	// Fencing claims that Apply refuses a lease whose token is below one
-	// it has already applied under.
+	// it has already applied under in the same epoch, and lets a lease of
+	// another epoch take over.
 	Fencing bool
 }
 
@@ -79,6 +80,12 @@ func Run(t *testing.T, f Factory) {
 			t.Skip("the adapter doesn't claim fencing")
 		}
 		staleLease(t, f)
+	})
+	t.Run("ANewCoordinationEpochTakesTheFenceOver", func(t *testing.T) {
+		if !f.Fencing {
+			t.Skip("the adapter doesn't claim fencing")
+		}
+		newEpoch(t, f)
 	})
 	t.Run("AheadIsDetected", func(t *testing.T) {
 		if !f.Ahead {
@@ -162,16 +169,24 @@ func apply(t *testing.T, ctx context.Context, m migrate.Migrator) migrate.ApplyR
 	return reps[0]
 }
 
-// lease is a lease with a chosen token, for calling Apply directly.
+// lease is a lease with a chosen epoch and token, for calling Apply
+// directly.
 type lease struct {
+	epoch string
 	token uint64
 	lost  chan struct{}
 }
 
-func newLease(token uint64) *lease { return &lease{token: token, lost: make(chan struct{})} }
+// newLease returns a lease of the suite's own epoch.
+func newLease(token uint64) *lease { return epochLease("suite", token) }
+
+func epochLease(epoch string, token uint64) *lease {
+	return &lease{epoch: epoch, token: token, lost: make(chan struct{})}
+}
 
 func (l *lease) Key() string                   { return migrate.LockKey(Name) }
 func (l *lease) Token() uint64                 { return l.token }
+func (l *lease) Epoch() string                 { return l.epoch }
 func (l *lease) Renew(context.Context) error   { return nil }
 func (l *lease) Release(context.Context) error { return nil }
 func (l *lease) Lost() <-chan struct{}         { return l.lost }
@@ -305,6 +320,11 @@ func riskRefused(t *testing.T, f Factory) {
 		t.Errorf("Apply refused, but applied %v", res.Applied)
 	}
 	want(t, ctx, build(Base), migrate.Pending, "after the migrator refused")
+	// Options with no MaxRisk are the most restrictive, not the least.
+	if _, err := build(Risky).Apply(ctx, migrate.ApplyOptions{Lock: newLease(1 << 40), AllowUnknown: true}); err == nil {
+		t.Fatalf("Apply ran a Destructive step with MaxRisk unset")
+	}
+	want(t, ctx, build(Base), migrate.Pending, "after the migrator refused with MaxRisk unset")
 }
 
 func needsLease(t *testing.T, f Factory) {
@@ -335,6 +355,40 @@ func staleLease(t *testing.T, f Factory) {
 		t.Fatalf("the next lease can't apply: %v", err)
 	}
 	want(t, ctx, build(Next), migrate.UpToDate, "after the next lease applied")
+}
+
+// A new coordination epoch, such as a restarted in-process backend whose
+// tokens start again at 1, takes the fence over rather than being stale for
+// ever.
+func newEpoch(t *testing.T, f Factory) {
+	ctx := ctxFor(t)
+	build := open(t, f)
+	all := migrate.ApplyOptions{MaxRisk: migrate.Manual, AllowUnknown: true, Lock: epochLease("first", 10)}
+	if _, err := build(Base).Apply(ctx, all); err != nil {
+		t.Fatal(err)
+	}
+	all.Lock = epochLease("second", 1)
+	if _, err := build(Next).Apply(ctx, all); err != nil {
+		t.Fatalf("a lease of a new epoch can't apply: %v", err)
+	}
+	want(t, ctx, build(Next), migrate.UpToDate, "after the new epoch applied")
+
+	// The same through real backends: a process applies under token 2,
+	// and the next process's backend starts at 1 again.
+	build = open(t, f)
+	first := local.New().Locks()
+	bump, err := first.Acquire(ctx, migrate.LockKey(Name), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = bump.Release(ctx)
+	if _, err := runner(t, first, policy, build(Base)).Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner(t, local.New().Locks(), policy, build(Next)).Apply(ctx); err != nil {
+		t.Fatalf("a restarted process can't apply: %v", err)
+	}
+	want(t, ctx, build(Next), migrate.UpToDate, "after the restarted process applied")
 }
 
 func ahead(t *testing.T, f Factory) {

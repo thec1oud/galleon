@@ -99,9 +99,16 @@ type Locker interface {
 // Lease is a held lock.
 type Lease interface {
 	Key() string
-	// Token is a fencing token, strictly increasing per key. Anything a lease
-	// protects should reject tokens lower than one it has already seen.
+	// Token is a fencing token, strictly increasing per key within its
+	// Epoch. Anything a lease protects should reject tokens lower than one
+	// it has already seen from the same epoch.
 	Token() uint64
+	// Epoch identifies the counter Token comes from. Tokens compare only
+	// within one epoch: a backend whose counter can restart, such as the
+	// in-process one, gets a new epoch each time, and a protected resource
+	// that sees a new epoch lets it take over. A cluster backend keeps its
+	// counter, and so its epoch, durably, so its epoch never changes.
+	Epoch() string
 	Renew(ctx context.Context) error
 	Release(ctx context.Context) error
 	// Lost is closed when the lease ends for any reason (release, expiry, partition).

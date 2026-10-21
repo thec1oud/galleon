@@ -201,6 +201,7 @@ func mutualExclusion(t *testing.T, f Factory) {
 func fencing(t *testing.T, f Factory) {
 	ns := nodes(t, f)
 	var last uint64
+	epoch := ""
 	for i := range 6 {
 		l, err := ns[i%len(ns)].Locks().Acquire(ctx(t), "conformance/fence", 5*time.Second)
 		if err != nil {
@@ -209,6 +210,12 @@ func fencing(t *testing.T, f Factory) {
 		if l.Token() <= last {
 			t.Fatalf("token %d is not greater than %d", l.Token(), last)
 		}
+		// Tokens compare within an epoch, so every node's leases on one
+		// store share it.
+		if l.Epoch() == "" || (epoch != "" && l.Epoch() != epoch) {
+			t.Fatalf("epoch %q after %q: one store's tokens must share a non-empty epoch", l.Epoch(), epoch)
+		}
+		epoch = l.Epoch()
 		if l.Key() != "conformance/fence" {
 			t.Fatalf("Key() = %q", l.Key())
 		}
