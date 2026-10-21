@@ -31,22 +31,28 @@
 // after it, is checked against the fence in a transaction of its own just
 // before it runs, and so is each of DPG's own records around it. A holder
 // that pauses between that check and the statement can still run it after
-// its lease has passed to another node. Nothing is applied twice even
-// then, but not every such statement is safe to repeat: the enum values
-// are ADD VALUE IF NOT EXISTS, and grants repeat harmlessly, but DPG writes
-// CREATE INDEX CONCURRENTLY without IF NOT EXISTS, so a second run fails
-// ("already exists"). The migration's transaction has committed by then,
-// and DPG runs the statements after it again until they all succeed, so a
-// person must drop the index for the next apply to finish the migration;
-// the same goes for an index whose build failed part way, which PostgreSQL
-// leaves behind, invalid. See README.md.
+// its lease has passed to another node, and an apply cancelled while such
+// a statement runs (a lost lease, a shutdown) leaves the migration's
+// transaction committed and the statements after it to run again. They
+// are safe to run again: an enum value is ADD VALUE IF NOT EXISTS, a grant
+// repeats harmlessly, and before running a CREATE INDEX CONCURRENTLY again
+// DPG drops an index of that name that a cancelled or failed build left
+// invalid, and takes a valid one as built. Two statements DPG may run
+// after a transaction still aren't: CREATE SUBSCRIPTION, and ALTER TABLE
+// ... DETACH PARTITION ... CONCURRENTLY, which a cancel leaves pending; a
+// person finishes those. See README.md.
 //
 // Status, Plan and Verify only read. Each call opens a connection of its
-// own from the pool's configuration, and closes it, rather than borrowing
-// one of the pool's: a migration may change session state (SET ROLE, to
-// create an object as its owner), which must not reach the app's
-// connections. The pool's AfterConnect and BeforeAcquire hooks don't run
-// on it.
+// own, and closes it, rather than borrowing one of the pool's: a migration
+// may change session state (SET ROLE, to create an object as its owner),
+// which must not reach the app's connections. The connection is made as
+// the pool makes its own, through its BeforeConnect hook (which may rotate
+// credentials) and its AfterConnect hook, but without its tracer, which
+// may record statements' text: DPG resolves secrets into some statements
+// (user mappings, subscriptions). For the same reason the adapter's errors
+// name statements by their step IDs, not their SQL.
+//
+// The database's owner is role enough: the adapter needs no superuser.
 //
 // The migrator is a migrate.Planner, OfflinePlanner and Verifier. It isn't
 // a Backgrounder: DPG has no work that continues after a migration.
@@ -61,6 +67,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/dpg/pkg/dpg/engine"
@@ -104,6 +111,9 @@ type Migrator struct {
 	cluster, database string
 	pool              *pgxpool.Pool
 	offline           migrate.Plan
+	// statements are every statement of the log, which errors name by
+	// their step IDs instead of their SQL.
+	statements []engine.Step
 }
 
 var (
@@ -120,6 +130,9 @@ func New(name, dir string, pool *pgxpool.Pool, opts ...Option) (*Migrator, error
 	if err := migrate.ValidName(name); err != nil {
 		return nil, fmt.Errorf("dpg: %w", err)
 	}
+	if pool == nil {
+		return nil, fmt.Errorf("dpg: migrator %q: no pool", name)
+	}
 	m := &Migrator{name: name, dir: dir, pool: pool}
 	for _, o := range opts {
 		o(m)
@@ -128,7 +141,9 @@ func New(name, dir string, pool *pgxpool.Pool, opts ...Option) (*Migrator, error
 	if err != nil {
 		return nil, err
 	}
-	m.offline = planOf(e.PlanOffline().Steps)
+	all := e.PlanOffline().Steps
+	m.offline = planOf(all)
+	m.statements = all
 	return m, nil
 }
 
@@ -143,9 +158,37 @@ func (m *Migrator) engine(conn *pgx.Conn) (*engine.Engine, error) {
 	return e, nil
 }
 
+// connect opens a connection of its own, as the pool would open one: its
+// BeforeConnect hook (which may rotate credentials) sees the copied
+// configuration first, and its AfterConnect hook the connection. The
+// copy has no tracer: the pool's may record statements' text, and DPG
+// resolves secrets into some of its statements (user mappings,
+// subscriptions).
+func (m *Migrator) connect(ctx context.Context) (*pgx.Conn, error) {
+	pc := m.pool.Config()
+	cfg := pc.ConnConfig.Copy()
+	cfg.Tracer = nil
+	if pc.BeforeConnect != nil {
+		if err := pc.BeforeConnect(ctx, cfg); err != nil {
+			return nil, err
+		}
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if pc.AfterConnect != nil {
+		if err := pc.AfterConnect(ctx, conn); err != nil {
+			conn.Close(context.WithoutCancel(ctx))
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
 // session runs f on an engine over a connection of its own.
 func (m *Migrator) session(ctx context.Context, f func(*engine.Engine, *pgx.Conn) error) error {
-	conn, err := pgx.ConnectConfig(ctx, m.pool.Config().ConnConfig.Copy())
+	conn, err := m.connect(ctx)
 	if err != nil {
 		return fmt.Errorf("dpg: migrator %q: connecting: %w", m.name, err)
 	}
@@ -245,8 +288,12 @@ func (m *Migrator) PlanOffline(context.Context) (migrate.Plan, error) {
 
 // riskOf maps a DPG statement to the seam's risk.
 func riskOf(s engine.Step) migrate.Risk {
-	if s.Mode == engine.Instruction {
+	switch s.Mode {
+	case engine.InTransaction, engine.BeforeTransaction, engine.AfterTransaction:
+	case engine.Instruction:
 		return migrate.Manual
+	default:
+		return migrate.Unknown // a mode this adapter doesn't know
 	}
 	switch s.Safety {
 	case engine.Safe:
@@ -265,6 +312,7 @@ func planOf(statements []engine.Step) migrate.Plan {
 		steps   []migrate.StepInfo
 		content [][]byte
 		counts  []map[engine.Mode]int
+		todo    [][]string
 	)
 	for _, s := range statements {
 		if n := len(steps); n == 0 || steps[n-1].ID != s.Migration {
@@ -273,22 +321,39 @@ func planOf(statements []engine.Step) migrate.Plan {
 			steps = append(steps, migrate.StepInfo{ID: s.Migration, Risk: migrate.Safe})
 			content = append(content, nil)
 			counts = append(counts, map[engine.Mode]int{})
+			todo = append(todo, nil)
 		}
 		i := len(steps) - 1
 		if r := riskOf(s); r.Above(steps[i].Risk) {
 			steps[i].Risk = r
 		}
 		counts[i][s.Mode]++
+		if s.Mode == engine.Instruction {
+			todo[i] = append(todo[i], instruction(s.SQL))
+		}
 		content[i] = fmt.Appendf(content[i], "%s\x00%s\x00%s\x00", s.Mode, s.Safety, s.SQL)
 	}
 	for i := range steps {
-		steps[i].Description = describe(steps[i].ID, counts[i])
+		steps[i].Description = describe(steps[i].ID, counts[i], todo[i])
 	}
 	return migrate.NewPlan(migrate.Fingerprint(steps, content), steps)
 }
 
-// describe says what a migration runs, without its SQL.
-func describe(id string, n map[engine.Mode]int) string {
+// instruction is the text of a step DPG leaves for a person, which DPG
+// writes as an SQL comment.
+func instruction(sql string) string {
+	var lines []string
+	for _, l := range strings.Split(sql, "\n") {
+		if l = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(l), "--")); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, " ")
+}
+
+// describe says what a migration runs, without its SQL, but with what a
+// person must do.
+func describe(id string, n map[engine.Mode]int, todo []string) string {
 	var parts []string
 	for _, k := range []struct {
 		mode engine.Mode
@@ -298,12 +363,17 @@ func describe(id string, n map[engine.Mode]int) string {
 		{engine.InTransaction, "in its transaction"},
 		{engine.AfterTransaction, "after its transaction"},
 		{engine.Instruction, "for a person to do"},
+		{engine.UnknownMode, "of an unknown stage"},
 	} {
 		if n[k.mode] > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", n[k.mode], k.what))
 		}
 	}
-	return fmt.Sprintf("dpg migration %s (statements: %s)", id, strings.Join(parts, ", "))
+	d := fmt.Sprintf("dpg migration %s (statements: %s)", id, strings.Join(parts, ", "))
+	if len(todo) > 0 {
+		d += "; for a person to do: " + strings.Join(todo, "; ")
+	}
+	return d
 }
 
 // Apply runs the migrations the database hasn't run, in order, each in its
@@ -432,14 +502,51 @@ func (m *Migrator) stale(err error) error {
 	}
 }
 
-// wrap returns the adapter's own errors, wherever DPG's engine wrapped
-// them, as they are, and names the migrator in the others.
+// wrap names the migrator in an error, keeping what DPG's engine says
+// around it, and keeps SQL out of its message: a statement of the log is
+// named by its step ID, and any other statement an error quotes (DPG's
+// ledger records, say) is left out. The adapter's own refusals are
+// returned as they are. The error still wraps the original, for errors.Is
+// and errors.As.
 func (m *Migrator) wrap(err error) error {
-	if e := (*errs.Error)(nil); errors.As(err, &e) {
-		return e
-	}
-	if strings.HasPrefix(err.Error(), "dpg: ") {
+	if e := (*errs.Error)(nil); errors.As(err, &e) && e == err {
 		return err
 	}
-	return fmt.Errorf("dpg: migrator %q: %w", m.name, err)
+	msg := m.redact(err)
+	if !strings.HasPrefix(msg, "dpg: ") {
+		msg = fmt.Sprintf("dpg: migrator %q: %s", m.name, msg)
+	}
+	return &redacted{msg: msg, err: err}
 }
+
+// executorPrefix starts DPG's executor's errors, which quote the statement
+// that failed after it.
+const executorPrefix = "executor: "
+
+func (m *Migrator) redact(err error) string {
+	msg := err.Error()
+	for _, s := range m.statements {
+		if sql := strings.TrimSpace(s.SQL); sql != "" {
+			msg = strings.ReplaceAll(msg, sql, "statement "+s.ID)
+		}
+	}
+	// What's left after the executor's prefix, up to the database's own
+	// error, is a statement that isn't in the log.
+	var pgErr *pgconn.PgError
+	if i := strings.Index(msg, executorPrefix); i >= 0 && errors.As(err, &pgErr) {
+		rest := msg[i+len(executorPrefix):]
+		if j := strings.Index(rest, pgErr.Error()); j > 0 && !strings.HasPrefix(rest, "statement ") {
+			msg = msg[:i+len(executorPrefix)] + "a statement of DPG's: " + rest[j:]
+		}
+	}
+	return msg
+}
+
+// redacted is an error whose message has its SQL taken out.
+type redacted struct {
+	msg string
+	err error
+}
+
+func (r *redacted) Error() string { return r.msg }
+func (r *redacted) Unwrap() error { return r.err }

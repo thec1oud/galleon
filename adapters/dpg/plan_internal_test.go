@@ -1,11 +1,17 @@
 package dpg
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/thec1oud/dpg/pkg/dpg/engine"
 
+	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/migrate"
 )
 
@@ -21,9 +27,12 @@ func TestRisksMapDPGsSafetyAndNothingElseIsSafe(t *testing.T) {
 		// A step DPG leaves for a person is Manual, whatever its safety.
 		{engine.Step{Safety: engine.Safe, Mode: engine.Instruction}, migrate.Manual},
 		{engine.Step{Safety: engine.Destructive, Mode: engine.Instruction}, migrate.Manual},
-		// A safety this adapter doesn't know.
-		{engine.Step{Safety: engine.Destructive + 1}, migrate.Unknown},
+		// A safety or a mode this adapter doesn't know.
+		{engine.Step{Safety: engine.UnknownSafety}, migrate.Unknown},
+		{engine.Step{Safety: engine.UnknownSafety + 1}, migrate.Unknown},
 		{engine.Step{Safety: -1}, migrate.Unknown},
+		{engine.Step{Safety: engine.Safe, Mode: engine.UnknownMode}, migrate.Unknown},
+		{engine.Step{Safety: engine.Safe, Mode: engine.UnknownMode + 1}, migrate.Unknown},
 	} {
 		if got := riskOf(c.step); got != c.want {
 			t.Errorf("%s/%s: %s, want %s", c.step.Mode, c.step.Safety, got, c.want)
@@ -38,14 +47,16 @@ func TestAPlanHasAStepPerMigrationAtItsRiskiestStatement(t *testing.T) {
 		{Migration: "m2", Safety: engine.Safe, Mode: engine.BeforeTransaction, SQL: "ALTER TYPE e ADD VALUE IF NOT EXISTS 'x'"},
 		{Migration: "m2", Safety: engine.Safe, Mode: engine.AfterTransaction, SQL: "CREATE INDEX CONCURRENTLY a_id ON a (id)"},
 		{Migration: "m3", Safety: engine.Destructive, SQL: "DROP TABLE a"},
-		{Migration: "m3", Safety: engine.Safe, Mode: engine.Instruction, SQL: "-- rebuild the partitions"},
-		{Migration: "m4", Safety: engine.Destructive + 1, SQL: "SELECT 1"},
+		{Migration: "m3", Safety: engine.Safe, Mode: engine.Instruction, SQL: "-- rebuild the partitions\n--   of p by hand"},
+		{Migration: "m4", Safety: engine.UnknownSafety, SQL: "SELECT 1"},
+		{Migration: "m5", Safety: engine.Safe, Mode: engine.UnknownMode, SQL: "SELECT 2"},
 	})
 	want := []migrate.StepInfo{
 		{ID: "m1", Risk: migrate.Caution, Description: "dpg migration m1 (statements: 2 in its transaction)"},
 		{ID: "m2", Risk: migrate.Safe, Description: "dpg migration m2 (statements: 1 before its transaction, 1 after its transaction)"},
-		{ID: "m3", Risk: migrate.Manual, Description: "dpg migration m3 (statements: 1 in its transaction, 1 for a person to do)"},
+		{ID: "m3", Risk: migrate.Manual, Description: "dpg migration m3 (statements: 1 in its transaction, 1 for a person to do); for a person to do: rebuild the partitions of p by hand"},
 		{ID: "m4", Risk: migrate.Unknown, Description: "dpg migration m4 (statements: 1 in its transaction)"},
+		{ID: "m5", Risk: migrate.Unknown, Description: "dpg migration m5 (statements: 1 of an unknown stage)"},
 	}
 	got := pl.Steps()
 	if len(got) != len(want) {
@@ -122,5 +133,47 @@ func TestMaxSafetyIsTheMostTheOptionsAllow(t *testing.T) {
 		if got := maxSafety(migrate.ApplyOptions{MaxRisk: max}); got != want {
 			t.Errorf("MaxRisk %s: %s, want %s", max, got, want)
 		}
+	}
+}
+
+func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
+	m := &Migrator{name: "schema", statements: []engine.Step{
+		{ID: "m1/2", SQL: `CREATE INDEX CONCURRENTLY "a_x" ON "public"."a" ("x");`},
+	}}
+	pgErr := &pgconn.PgError{Severity: "ERROR", Code: "42P07", Message: `relation "a_x" already exists`}
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{
+			fmt.Errorf(`engine: c/app: finishing migration m1: executor: CREATE INDEX CONCURRENTLY "a_x" ON "public"."a" ("x");: %w`, pgErr),
+			`dpg: migrator "schema": engine: c/app: finishing migration m1: executor: statement m1/2: ERROR: relation "a_x" already exists (SQLSTATE 42P07)`,
+		},
+		{
+			fmt.Errorf(`engine: c/app: migration m1: executor: UPDATE "dpg".migrations SET status = 'complete';: %w`, pgErr),
+			`dpg: migrator "schema": engine: c/app: migration m1: executor: a statement of DPG's: ERROR: relation "a_x" already exists (SQLSTATE 42P07)`,
+		},
+		{
+			fmt.Errorf("engine: c/app: migration m1: executor: CREATE INDEX CONCURRENTLY \"a_x\" ON \"public\".\"a\" (\"x\");: %w", context.Canceled),
+			`dpg: migrator "schema": engine: c/app: migration m1: executor: statement m1/2: context canceled`,
+		},
+	} {
+		got := m.wrap(c.err)
+		if got.Error() != c.want {
+			t.Errorf("%v\n got  %s\n want %s", c.err, got, c.want)
+		}
+		if !errors.Is(got, c.err) {
+			t.Errorf("%v doesn't wrap the original", got)
+		}
+	}
+	// The adapter's own refusal is returned as it is; one the engine
+	// wrapped keeps the engine's context and its code.
+	own := errs.New(errs.FailedPrecondition, CodeStaleToken, "dpg: migrator \"schema\": stale")
+	if m.wrap(own) != error(own) {
+		t.Error("the adapter's own error was wrapped")
+	}
+	got := m.wrap(fmt.Errorf("engine: c/app: migration m1: %w", own))
+	if e := errs.From(got); e == nil || e.Code != CodeStaleToken || !strings.Contains(got.Error(), "engine: c/app: migration m1: ") {
+		t.Errorf("%v", got)
 	}
 }

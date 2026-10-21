@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,6 +93,13 @@ func poolOf(t *testing.T, dsn string) *pgxpool.Pool {
 	return pool
 }
 
+// unreachable is a pool of a server that isn't there, for what never
+// connects; a pool connects only when it is used.
+func unreachable(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	return poolOf(t, "postgres://nobody@127.0.0.1:1/none?connect_timeout=1")
+}
+
 func newMigrator(t *testing.T, build string, pool *pgxpool.Pool) *dpg.Migrator {
 	t.Helper()
 	m, err := dpg.New(migratetest.Name, dir(build), pool)
@@ -151,23 +160,30 @@ func TestNewRefusesASourceItsLogDoesntRecord(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "c/app/schemas/public/tables/z.dpg"), []byte("TABLE z (id int PRIMARY KEY);\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dpg.New("schema", root, nil); err == nil || !strings.Contains(err.Error(), "DPG-E056") {
+	if _, err := dpg.New("schema", root, unreachable(t)); err == nil || !strings.Contains(err.Error(), "DPG-E056") {
 		t.Fatalf("an unrecorded change: %v", err)
 	}
-	if _, err := dpg.New("schema", filepath.Join(t.TempDir(), "nothing"), nil); err == nil {
+	if _, err := dpg.New("schema", filepath.Join(t.TempDir(), "nothing"), unreachable(t)); err == nil {
 		t.Fatal("a directory without a project was accepted")
 	}
 }
 
+func TestNewNeedsAPool(t *testing.T) {
+	if _, err := dpg.New("schema", dir("base"), nil); err == nil || !strings.Contains(err.Error(), "no pool") {
+		t.Fatalf("%v", err)
+	}
+}
+
 func TestANameMustBeValid(t *testing.T) {
-	if _, err := dpg.New("Schema!", dir("base"), nil); err == nil {
+	if _, err := dpg.New("Schema!", dir("base"), unreachable(t)); err == nil {
 		t.Fatal("a bad name was accepted")
 	}
 }
 
 func TestApplyRefusesToRunWithoutALease(t *testing.T) {
-	// No pool: Apply refuses before it connects.
-	m := newMigrator(t, "base", nil)
+	// A pool of a server that isn't there: Apply refuses before it
+	// connects.
+	m := newMigrator(t, "base", unreachable(t))
 	_, err := m.Apply(context.Background(), migrate.ApplyOptions{MaxRisk: migrate.Manual, AllowUnknown: true})
 	if code(err) != dpg.CodeNoLock {
 		t.Fatalf("%v", err)
@@ -176,14 +192,14 @@ func TestApplyRefusesToRunWithoutALease(t *testing.T) {
 
 func TestTheOfflinePlanIsTheWholeLogWithoutADatabase(t *testing.T) {
 	ctx := context.Background()
-	pl, err := newMigrator(t, "last", nil).PlanOffline(ctx)
+	pl, err := newMigrator(t, "last", unreachable(t)).PlanOffline(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pl.Steps()) != 4 || pl.MaxRisk() != migrate.Safe {
 		t.Fatalf("%+v, max %s", pl.Steps(), pl.MaxRisk())
 	}
-	risky, err := newMigrator(t, "risky", nil).PlanOffline(ctx)
+	risky, err := newMigrator(t, "risky", unreachable(t)).PlanOffline(ctx)
 	if err != nil || risky.MaxRisk() != migrate.Destructive {
 		t.Fatalf("%v, %v", risky, err)
 	}
@@ -396,4 +412,207 @@ func TestACancelledApplyStops(t *testing.T) {
 	if exists(t, pool, "public.a") {
 		t.Error("a cancelled apply created a")
 	}
+}
+
+// tracer records the statements traced on a connection.
+type tracer struct {
+	mu  sync.Mutex
+	sql []string
+}
+
+func (r *tracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	r.mu.Lock()
+	r.sql = append(r.sql, d.SQL)
+	r.mu.Unlock()
+	return ctx
+}
+
+func (r *tracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// The adapter's connections are made as the pool makes its own, through
+// its BeforeConnect and AfterConnect hooks, but without its tracer, which
+// may record statements' text, and DPG's statements can hold secrets.
+func TestConnectionsRunThePoolsHooksButNotItsTracer(t *testing.T) {
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(database(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &tracer{}
+	cfg.ConnConfig.Tracer = rec
+	var before, after atomic.Int32
+	cfg.BeforeConnect = func(_ context.Context, cc *pgx.ConnConfig) error {
+		before.Add(1)
+		if cc.Tracer != nil {
+			t.Error("BeforeConnect was given a configuration with the tracer")
+		}
+		cc.RuntimeParams["application_name"] = "rotated"
+		return nil
+	}
+	cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
+		after.Add(1)
+		var name string
+		if err := c.QueryRow(ctx, "SELECT current_setting('application_name')").Scan(&name); err != nil || name != "rotated" {
+			t.Errorf("the connection BeforeConnect configured has application_name %q: %v", name, err)
+		}
+		return nil
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	m := newMigrator(t, "base", pool)
+	if _, err := m.Apply(ctx, under(lease{"e", 1})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Status(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if before.Load() < 2 || after.Load() != before.Load() {
+		t.Errorf("BeforeConnect ran %d times, AfterConnect %d", before.Load(), after.Load())
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, sql := range rec.sql {
+		if !strings.Contains(sql, "current_setting('application_name')") {
+			t.Errorf("the pool's tracer saw %q", sql)
+		}
+	}
+	// A hook that fails stops the call.
+	cfg.BeforeConnect = func(context.Context, *pgx.ConnConfig) error { return errors.New("no credentials") }
+	failing, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(failing.Close)
+	if _, err := newMigrator(t, "base", failing).Status(ctx); err == nil || !strings.Contains(err.Error(), "no credentials") {
+		t.Errorf("status with a failing BeforeConnect: %v", err)
+	}
+}
+
+// An apply cancelled while CREATE INDEX CONCURRENTLY waits (a lease lost,
+// a shutdown) leaves the index behind invalid; the next apply, on any
+// node, rebuilds it, and the error quotes no SQL.
+func TestAnIndexBuildCancelledPartWayIsRebuiltByTheNextApply(t *testing.T) {
+	ctx := context.Background()
+	dsn := database(t)
+	pool := poolOf(t, dsn)
+	if _, err := newMigrator(t, "base", pool).Apply(ctx, under(lease{"e", 1})); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	if _, err := blocker.Exec(ctx, "LOCK TABLE a IN ROW EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	actx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	m := newMigrator(t, "indexed", pool)
+	go func() {
+		_, err := m.Apply(actx, under(lease{"e", 2}))
+		done <- err
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'CREATE INDEX CONCURRENTLY%' AND wait_event_type = 'Lock'").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the index build never waited for the lock")
+		}
+		time.Sleep(5 * time.Millisecond) // a poll interval, not synchronization
+	}
+	cancel()
+	err = <-done
+	if err == nil || strings.Contains(err.Error(), "CREATE") || strings.Contains(err.Error(), "--resume") {
+		t.Fatalf("the cancelled apply: %v", err)
+	}
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var valid bool
+	if err := pool.QueryRow(ctx, "SELECT indisvalid FROM pg_index WHERE indexrelid = 'public.a_id_desc'::regclass").Scan(&valid); err != nil || valid {
+		t.Fatalf("after the cancel, the index is valid=%v: %v", valid, err)
+	}
+	if st, err := m.Status(ctx); err != nil || st.State != migrate.Pending {
+		t.Fatalf("status: %+v, %v", st, err)
+	}
+	if _, err := newMigrator(t, "indexed", pool).Apply(ctx, under(lease{"e", 3})); err != nil {
+		t.Fatalf("the next apply: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT indisvalid FROM pg_index WHERE indexrelid = 'public.a_id_desc'::regclass").Scan(&valid); err != nil || !valid {
+		t.Fatalf("after the next apply, the index is valid=%v: %v", valid, err)
+	}
+	if st, err := m.Status(ctx); err != nil || st.State != migrate.UpToDate {
+		t.Errorf("status: %+v, %v", st, err)
+	}
+}
+
+// The adapter needs no superuser: the database's owner, with no other
+// privilege, applies, plans and verifies.
+func TestTheDatabasesOwnerIsEnough(t *testing.T) {
+	ctx := context.Background()
+	role := newRole(t) // before the database, so it is dropped after it
+	dsn := database(t)
+	admin := poolOf(t, dsn)
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, "ALTER DATABASE "+strings.TrimPrefix(u.Path, "/")+" OWNER TO "+role+"; ALTER SCHEMA public OWNER TO "+role); err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.User(role)
+	m := newMigrator(t, "next", poolOf(t, u.String()))
+	if _, err := m.Apply(ctx, under(lease{"e", 1})); err != nil {
+		t.Fatalf("apply as the owner: %v", err)
+	}
+	if st, err := m.Status(ctx); err != nil || st.State != migrate.UpToDate {
+		t.Fatalf("%+v, %v", st, err)
+	}
+	if d, err := m.Verify(ctx); err != nil || !d.None() {
+		t.Fatalf("verify as the owner: %v, %v", d.Differences, err)
+	}
+}
+
+// newRole creates a login role with no privileges, dropped when t ends.
+func newRole(t *testing.T) string {
+	t.Helper()
+	admin := strings.TrimSpace(os.Getenv(testkit.PostgresEnv))
+	if admin == "" {
+		database(t) // skips, or fails in CI
+	}
+	ctx := context.Background()
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	role := "galleon_dpg_owner_" + hex.EncodeToString(b[:])
+	conn, err := pgx.Connect(ctx, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "CREATE ROLE "+role+" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		conn, err := pgx.Connect(context.Background(), admin)
+		if err != nil {
+			t.Errorf("dropping %s: %v", role, err)
+			return
+		}
+		defer conn.Close(context.Background())
+		if _, err := conn.Exec(context.Background(), "DROP ROLE IF EXISTS "+role); err != nil {
+			t.Errorf("dropping %s: %v", role, err)
+		}
+	})
+	return role
 }
