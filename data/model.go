@@ -148,10 +148,10 @@ type Models struct {
 func NewModels(models ...ModelInfo) (*Models, error) {
 	r := &Models{byName: map[string]ModelInfo{}}
 	tables := map[[2]string]string{}
-	refused := map[string]bool{} // models already reported, which relations to them needn't repeat
+	named := map[string]bool{} // every model given, registered or refused
 	var errs []error
 	for _, m := range models {
-		refused[m.Name] = true
+		named[m.Name] = true
 		if err := m.Validate(); err != nil {
 			errs = append(errs, err)
 			continue
@@ -166,14 +166,14 @@ func NewModels(models ...ModelInfo) (*Models, error) {
 			continue
 		}
 		tables[table] = m.Name
-		delete(refused, m.Name)
 		r.byName[m.Name] = m.clone()
 		r.names = append(r.names, m.Name)
 	}
 	for _, name := range r.names {
 		for _, rel := range r.byName[name].Relations {
 			to, ok := r.byName[rel.Model]
-			if !ok && refused[rel.Model] {
+			if !ok && named[rel.Model] {
+				// Refused, and reported, already.
 				continue
 			}
 			if !ok {
