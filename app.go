@@ -23,6 +23,7 @@ import (
 
 	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/coord"
+	"github.com/thec1oud/galleon/migrate"
 	"github.com/thec1oud/galleon/op"
 	"github.com/thec1oud/galleon/process"
 )
@@ -68,6 +69,8 @@ type settings struct {
 	ownMeter        bool
 	roles           []Role
 	replacements    []replacement
+	env             Env
+	migratePolicy   *migrate.Policy
 }
 
 // Option configures an App.
@@ -168,6 +171,10 @@ type App struct {
 	operations   *Operations
 	middleware   *HTTPMiddleware
 
+	migratorRegs     []*migratorReg
+	migrations       *migrations // nil without migrators
+	migrationsHandle *Migrations
+
 	bootErrs []error
 
 	mu           sync.Mutex
@@ -229,6 +236,8 @@ func New(opts ...Option) (*App, error) {
 		operations:   &Operations{byID: map[string]*Operation{}},
 		middleware:   &HTTPMiddleware{},
 		fatal:        make(chan struct{}),
+
+		migrationsHandle: &Migrations{},
 	}
 
 	if nodeErr != nil {
@@ -246,6 +255,7 @@ func New(opts ...Option) (*App, error) {
 	Supply[metric.MeterProvider](kernel, s.meterProvider)
 	Supply[*Operations](kernel, a.operations)
 	Supply[*HTTPMiddleware](kernel, a.middleware)
+	Supply[*Migrations](kernel, a.migrationsHandle)
 	if a.backend != nil {
 		Supply[coord.Backend](kernel, a.backend)
 	}
@@ -268,6 +278,7 @@ func New(opts ...Option) (*App, error) {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q requires module %q, which is not installed (%s)", rq.module, rq.needs, rq.site))
 		}
 	}
+	a.configureMigrations()
 	for section := range a.configRaw {
 		if _, ok := a.configOwners[section]; !ok {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("config section %q is not used by any module (typo?)", section))
@@ -278,6 +289,7 @@ func New(opts ...Option) (*App, error) {
 	a.checkRoles()
 	a.compileOperations()
 
+	a.checkMigratorDeps()
 	if order, err := a.resolveGraph(); err != nil {
 		a.bootErrs = append(a.bootErrs, err)
 	} else {
@@ -417,6 +429,9 @@ func (a *App) Start(ctx context.Context) error {
 			}
 		}
 		a.started = append(a.started, p)
+	}
+	if err := a.startMigrations(ctx); err != nil {
+		return fail(err)
 	}
 	for _, h := range a.startHooks {
 		hctx, cancel := context.WithTimeout(ctx, a.settings.startTimeout)
