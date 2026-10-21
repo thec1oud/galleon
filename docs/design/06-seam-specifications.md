@@ -58,7 +58,7 @@ func (r *Registry) Middleware(mw func(http.Handler) http.Handler)
 func (r *Registry) Needs(caps ...coord.Capability)
 func (r *Registry) Gate(name string, check func(ctx context.Context) error)  // readiness gate
 func (r *Registry) Requires(modules ...string)
-func Collect[T any](r *Registry, values ...T)                        // contributions of several modules, provided as []T
+func Collect[T any](r *Registry, values ...T)                        // contributions of several modules, provided as []T; Validate()d if they can
 ```
 
 **Rules**
@@ -385,12 +385,12 @@ An ORM adapter MAY:
 **Rules** for Galleon's side:
 1. `QuerierFrom` MUST yield a handle only when the transaction in ctx writes; a read transaction, or a read view of a write one, MUST never yield a `Querier`. Neither helper begins a transaction or chooses a source: with nothing in ctx they report absence, never a pool.
 2. `AfterCommit` MUST refuse (`Internal`, `data.propagation`) when ctx carries no write transaction, and MUST NOT run `fn` then.
-3. The registry MUST fail boot on an invalid model, two models with one name or one table, or a relation to a model that isn't registered, and MUST NOT change after boot.
-4. A statement, batch or copy span whose ctx names a model carries it (`galleon.data.model`), and the registered model's table as `db.collection.name`; a copy keeps its own table. No SQL text or argument is recorded for it beyond what statement spans already carry.
+3. The registry MUST fail boot on an invalid model (as it is collected, in `galleon.New`), two models with one name or one table, or a relation to a model that isn't registered (when it is built, at `Start`), and MUST NOT change after boot.
+4. A statement, batch or copy span whose ctx names a model carries it (`galleon.data.model`), and the registered model's table as `db.collection.name`; a copy keeps its own table, and transaction control statements name no model. No SQL text or argument is recorded for it beyond what statement spans already carry.
 
-**Conformance** (`testkit/conformance/ormtest`): the adapter is a repository of the suite's `Widget`, given a ctx carrying the transaction and the same transaction, recorded, explicitly. Every call runs at least one statement through the recorded handle; reads see the transaction's uncommitted writes; nothing of a rolled-back transaction persists; no connection is made with the DSN the adapter was configured with (its `application_name` is the suite's); side effects never run before the commit or on rollback, run once per save after it, and once under a retried closure; and claimed models are valid, cover the table the adapter writes, match the catalog, and include every model its statements name.
+**Conformance** (`testkit/conformance/ormtest`): the adapter is a repository of the suite's `Widget`, given a ctx carrying the transaction and the same transaction, recorded, explicitly. Every call runs at least one statement through the recorded handle; reads see the transaction's uncommitted writes; nothing of a rolled-back transaction persists; no connection is made with the DSN the adapter was configured with (it points at a proxy that counts connections); side effects never run before the commit, on rollback or for a save through a savepoint that rolled back, run once per save after it, and once under a retried closure; and claimed models are valid, cover the table the adapter writes, match the catalog, and include every model its statements name.
 
-**Ships with:** `ormtest.Reference`, a hand-written repository over `data.Querier`, which passes the suite against real Postgres, taking its handle explicitly or from ctx; the suite's own tests show that adapters with a pool of their own, reads elsewhere, inline side effects or mismatched models fail it. Model spans are `pg`'s. **Deferred:** `FilterApplier`, which turns an authorization `Filter` (§7.3) into a `WHERE` clause, until the security plane defines `Filterer` and `Filter`; there is no placeholder. No named ORM adapter ships yet.
+**Ships with:** `ormtest.Reference`, a hand-written repository over `data.Querier`, which passes the suite against real Postgres, taking its handle explicitly or from ctx; the suite's own tests show that adapters with a pool of their own, a connection per call, reads elsewhere, inline side effects, side effects on rollback or mismatched models fail it. Model spans are `pg`'s. **Deferred:** `FilterApplier`, which turns an authorization `Filter` (§7.3) into a `WHERE` clause, until the security plane defines `Filterer` and `Filter`; there is no placeholder. No named ORM adapter ships yet.
 
 ### 6.3 Migrations
 

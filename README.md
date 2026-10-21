@@ -87,7 +87,7 @@ func (r *Orders) Save(ctx context.Context, o Order) error {
 }
 ```
 
-The adapter's module describes its models, and the data module builds the registry (`*data.Models`), failing boot on an invalid model or a duplicate name or table:
+The adapter's module describes its models, and the data module builds the registry (`*data.Models`); an invalid model fails `galleon.New`, and a duplicate name or table fails `Start`:
 
 ```go
 galleon.Collect(r, data.ModelInfo{Name: "order", Schema: "shop", Table: "orders", Key: []string{"id"}})
