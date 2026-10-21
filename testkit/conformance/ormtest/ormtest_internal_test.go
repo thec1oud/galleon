@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
+	"github.com/thec1oud/galleon/errs"
+	"github.com/thec1oud/galleon/testkit"
 )
 
 // ownPool runs every statement on a pool of its own, from the DSN it was
@@ -234,5 +236,23 @@ func TestAReferenceTakingItsHandleFromContextNeverFallsBackToAPool(t *testing.T)
 	}
 	if _, err := r.Find(ctx, nil, 1); err != errNoHandle {
 		t.Errorf("Find: %v", err)
+	}
+}
+
+func TestARecordedHandleThatHasEndedIsRefusedByAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	w, err := testkit.DB(t).Manager().BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := (&recording{}).writer(w)
+	if err := data.AfterCommit(data.With(ctx, rec), func(context.Context) {}); err != nil {
+		t.Fatalf("an open recorded handle was refused: %v", err)
+	}
+	if err := w.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.AfterCommit(data.With(ctx, rec), func(context.Context) {}); err == nil || errs.From(err).Code != data.CodeTxEnded {
+		t.Fatalf("got %v", err)
 	}
 }

@@ -101,6 +101,13 @@ func (t *recWriter) CopyFrom(ctx context.Context, table data.Identifier, columns
 	return t.WriteTx.CopyFrom(ctx, table, columns, src)
 }
 
+// Ended forwards the wrapped handle's, so data.AfterCommit refuses a
+// recorded handle that has ended as it refuses the handle itself.
+func (t *recWriter) Ended() bool {
+	e, ok := t.WriteTx.(data.Ender)
+	return ok && e.Ended()
+}
+
 func (t *recWriter) Begin(ctx context.Context) (data.ReadTx, error) {
 	tx, err := t.WriteTx.Begin(ctx)
 	if err != nil {
