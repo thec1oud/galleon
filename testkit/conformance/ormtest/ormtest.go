@@ -26,9 +26,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/url"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,7 +35,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
-	"github.com/thec1oud/galleon/internal/dsn"
 	"github.com/thec1oud/galleon/pg"
 	"github.com/thec1oud/galleon/testkit"
 )
@@ -54,7 +51,8 @@ type Widget struct {
 // Adapter is the adapter under test, as a repository of widgets. Each
 // method is given a ctx that carries the transaction (data.From), and the
 // same transaction explicitly; the adapter runs every statement through one
-// of them.
+// of them. It begins nothing through a data.Manager: a nested transaction
+// is the handle's own Begin or BeginWrite.
 type Adapter interface {
 	// Insert stores a new widget, and arranges for Setup.Saved to run with
 	// it once the transaction commits.
@@ -73,15 +71,15 @@ type Adapter interface {
 type Setup struct {
 	// DSN is the database, as an ORM configured for it would know it. The
 	// adapter must not connect with it: the suite gives it every handle it
-	// needs, and counts the connections made with this DSN, whose
-	// application_name is the suite's.
+	// needs, and counts the connections made with this DSN, which points at
+	// a proxy the suite watches.
 	DSN string
 	// Schema and Table are the widgets' table.
 	Schema, Table string
 	// Saved is the side effect of saving a widget, as an ORM's after-save
-	// hook would run it: the adapter must register it with the
-	// transaction's AfterCommit, so it runs once the transaction commits,
-	// and never when it rolls back.
+	// hook would run it: the adapter must register it with the AfterCommit
+	// of the transaction it saved through, so it runs once that commits,
+	// and never when it, or the savepoint it is, rolls back.
 	Saved func(ctx context.Context, w Widget)
 }
 
@@ -121,7 +119,7 @@ type env struct {
 	a     Adapter
 	m     *pg.Manager
 	pool  *pgxpool.Pool
-	app   string // the application_name of Setup.DSN
+	proxy *testkit.Proxy // Setup.DSN's
 	saved saved
 }
 
@@ -148,9 +146,8 @@ func newEnv(t *testing.T, f Factory) *env {
 	db := testkit.DB(t)
 	var b [6]byte
 	_, _ = rand.Read(b[:])
-	id := hex.EncodeToString(b[:])
-	e := &env{t: t, app: "ormtest_" + id}
-	e.s = Setup{DSN: withAppName(t, db.DSN(), e.app), Schema: "ormtest_" + id, Table: "widgets", Saved: e.saved.add}
+	e := &env{t: t, proxy: testkit.NewProxy(t, db.DSN())}
+	e.s = Setup{DSN: e.proxy.DSN(db.DSN()), Schema: "ormtest_" + hex.EncodeToString(b[:]), Table: "widgets", Saved: e.saved.add}
 	c := ctxFor(t)
 	pool, err := pgxpool.New(c, db.DSN())
 	if err != nil {
@@ -194,22 +191,6 @@ func ctxFor(t *testing.T) context.Context {
 }
 
 func (e *env) table() string { return data.Identifier{e.s.Schema, e.s.Table}.Sanitize() }
-
-// withAppName sets application_name in s, in either DSN form.
-func withAppName(t *testing.T, s, name string) string {
-	t.Helper()
-	if !dsn.IsURL(s) {
-		return s + " application_name=" + name
-	}
-	u, err := url.Parse(strings.TrimSpace(s))
-	if err != nil {
-		t.Fatal(err)
-	}
-	q := u.Query()
-	q.Set("application_name", name)
-	u.RawQuery = q.Encode()
-	return u.String()
-}
 
 // committed returns the widget with the id as committed, outside every
 // transaction of the suite's, or false when there is none.
@@ -331,11 +312,8 @@ func noConnectionOfItsOwn(e *env) error {
 	if err != nil {
 		errs = append(errs, fmt.Errorf("Find in a read transaction: %w", err))
 	}
-	var n int
-	if err := e.pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1", e.app).Scan(&n); err != nil {
-		errs = append(errs, err)
-	} else if n > 0 {
-		errs = append(errs, fmt.Errorf("the adapter has %d connections of its own to the database: it chose where to run statements rather than use the handle it was given", n))
+	if n := e.proxy.Opened(); n > 0 {
+		errs = append(errs, fmt.Errorf("the adapter opened %d connection(s) of its own to the database: it chose where to run statements rather than use the handle it was given", n))
 	}
 	return errors.Join(errs...)
 }
@@ -344,36 +322,37 @@ func sideEffectsWaitForTheCommit(e *env) error {
 	ctx := ctxFor(e.t)
 	rec := &recording{}
 	var errs []error
-	early := func(when string) {
-		if got := e.saved.get(); len(got) > 0 {
+	// since returns what Saved ran with since the mark, a count of runs.
+	since := func(mark int) []Widget { return e.saved.get()[mark:] }
+	early := func(mark int, when string) {
+		if got := since(mark); len(got) > 0 {
 			errs = append(errs, fmt.Errorf("Saved ran %s, before any commit, with %+v: side effects must wait for AfterCommit", when, got))
 		}
 	}
+	// Each part saves widgets of its own, and stands on its own.
 
 	// Rolled back: Saved never runs.
+	mark := len(e.saved.get())
 	w := Widget{ID: 1, Name: "first", Count: 1}
 	err := e.write(ctx, rec, func(ctx context.Context, q data.WriteTx) error {
 		if err := e.a.Insert(ctx, q, w); err != nil {
 			return fmt.Errorf("Insert: %w", err)
 		}
-		early("after Insert")
+		early(mark, "after Insert")
 		if err := e.a.Update(ctx, q, w); err != nil {
 			return fmt.Errorf("Update: %w", err)
 		}
-		early("after Update")
+		early(mark, "after Update")
 		return errRollback
 	})
 	if !errors.Is(err, errRollback) {
-		return errors.Join(append(errs, err)...)
-	}
-	if got := e.saved.get(); len(got) > 0 {
+		errs = append(errs, err)
+	} else if got := since(mark); len(got) > 0 {
 		errs = append(errs, fmt.Errorf("Saved ran for a transaction that rolled back, with %+v", got))
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
 	}
 
 	// Committed: once for each save, after the commit, in order.
+	mark = len(e.saved.get())
 	inserted, updated := Widget{ID: 2, Name: "second", Count: 1}, Widget{ID: 2, Name: "second", Count: 2}
 	err = e.write(ctx, rec, func(ctx context.Context, q data.WriteTx) error {
 		if err := e.a.Insert(ctx, q, inserted); err != nil {
@@ -382,20 +361,39 @@ func sideEffectsWaitForTheCommit(e *env) error {
 		if err := e.a.Update(ctx, q, updated); err != nil {
 			return fmt.Errorf("Update: %w", err)
 		}
-		early("before the commit")
+		early(mark, "before the commit")
 		return nil
 	})
 	if err != nil {
-		return errors.Join(append(errs, err)...)
-	}
-	if got := e.saved.get(); !slices.Equal(got, []Widget{inserted, updated}) {
+		errs = append(errs, err)
+	} else if got := since(mark); !slices.Equal(got, []Widget{inserted, updated}) {
 		errs = append(errs, fmt.Errorf("after the commit Saved ran with %+v, want once for each save: %+v", got, []Widget{inserted, updated}))
 	}
 
+	// Saved through a savepoint that rolled back: never, though the
+	// transaction commits.
+	mark = len(e.saved.get())
+	dropped := Widget{ID: 3, Name: "third", Count: 1}
+	err = e.write(ctx, rec, func(ctx context.Context, q data.WriteTx) error {
+		sp, err := q.BeginWrite(ctx)
+		if err != nil {
+			return err
+		}
+		if err := e.a.Insert(data.With(ctx, sp), sp, dropped); err != nil {
+			return fmt.Errorf("Insert in a savepoint: %w", err)
+		}
+		return sp.Rollback(ctx)
+	})
+	if err != nil {
+		errs = append(errs, err)
+	} else if got := since(mark); len(got) > 0 {
+		errs = append(errs, fmt.Errorf("Saved ran with %+v, saved through a savepoint that rolled back: register it with the handle the save went through", got))
+	}
+
 	// Retried: once, for the attempt that committed.
-	before := len(e.saved.get())
+	mark = len(e.saved.get())
 	attempts := 0
-	retried := Widget{ID: 3, Name: "third", Count: 1}
+	retried := Widget{ID: 4, Name: "fourth", Count: 1}
 	err = e.write(ctx, rec, func(ctx context.Context, q data.WriteTx) error {
 		attempts++
 		if err := e.a.Insert(ctx, q, retried); err != nil {
@@ -407,9 +405,8 @@ func sideEffectsWaitForTheCommit(e *env) error {
 		return nil
 	}, data.Retry(data.RetryPolicy{Attempts: 2, Backoff: time.Millisecond}))
 	if err != nil {
-		return errors.Join(append(errs, err)...)
-	}
-	if got := e.saved.get()[before:]; attempts != 2 || !slices.Equal(got, []Widget{retried}) {
+		errs = append(errs, err)
+	} else if got := since(mark); attempts != 2 || !slices.Equal(got, []Widget{retried}) {
 		errs = append(errs, fmt.Errorf("a closure that ran %d times, retried once, ran Saved with %+v, want once: %+v", attempts, got, retried))
 	}
 	return errors.Join(errs...)

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
@@ -75,6 +76,32 @@ func (a inline) Update(ctx context.Context, q data.Querier, w Widget) error {
 	return nil
 }
 
+// rollbackToo registers the side effect after a rollback as well as after
+// the commit.
+type rollbackToo struct{ *Reference }
+
+func (a rollbackToo) Insert(ctx context.Context, q data.Querier, w Widget) error {
+	if err := a.Reference.Insert(ctx, q, w); err != nil {
+		return err
+	}
+	q.(data.WriteTx).AfterRollback(func(ctx context.Context) { a.s.Saved(ctx, w) })
+	return nil
+}
+
+// connectsPerCall reads on a connection of its own, which it closes again.
+type connectsPerCall struct{ *Reference }
+
+func (a connectsPerCall) Find(ctx context.Context, _ data.Reader, id int64) (Widget, error) {
+	conn, err := pgx.Connect(ctx, a.s.DSN)
+	if err != nil {
+		return Widget{}, err
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	var w Widget
+	err = conn.QueryRow(ctx, "SELECT id, name, count FROM "+a.table()+" WHERE id = $1", id).Scan(&w.ID, &w.Name, &w.Count)
+	return w, err
+}
+
 // models registers the models it is given.
 type models struct {
 	*Reference
@@ -109,7 +136,7 @@ func TestTheSuiteCatchesBadAdapters(t *testing.T) {
 		{
 			name: "AnAdapterWithAPoolOfItsOwnHasConnections", check: noConnectionOfItsOwn,
 			new:  func(t *testing.T, s Setup) Adapter { return newOwnPool(t, s) },
-			want: []string{"connections of its own"},
+			want: []string{"connection(s) of its own"},
 		},
 		{
 			name: "AnAdapterThatReadsElsewhereDoesntSeeItsTransaction", check: statementsGoThroughTheHandle,
@@ -119,12 +146,22 @@ func TestTheSuiteCatchesBadAdapters(t *testing.T) {
 		{
 			name: "AnAdapterThatReadsElsewhereHasConnections", check: noConnectionOfItsOwn,
 			new:  func(t *testing.T, s Setup) Adapter { return readsElsewhere{newOwnPool(t, s)} },
-			want: []string{"connections of its own"},
+			want: []string{"connection(s) of its own"},
 		},
 		{
 			name: "InlineSideEffectsFireBeforeTheCommit", check: sideEffectsWaitForTheCommit,
 			new:  func(t *testing.T, s Setup) Adapter { return inline{NewReference(s)} },
 			want: []string{"Saved ran after Insert, before any commit", "Saved ran for a transaction that rolled back"},
+		},
+		{
+			name: "SideEffectsOnRollbackFireForRolledBackSaves", check: sideEffectsWaitForTheCommit,
+			new:  func(t *testing.T, s Setup) Adapter { return rollbackToo{NewReference(s)} },
+			want: []string{"Saved ran for a transaction that rolled back", "saved through a savepoint that rolled back", "a closure that ran 2 times, retried once"},
+		},
+		{
+			name: "AnAdapterThatConnectsPerCallIsCounted", check: noConnectionOfItsOwn,
+			new:  func(t *testing.T, s Setup) Adapter { return connectsPerCall{NewReference(s)} },
+			want: []string{"connection(s) of its own"},
 		},
 		{
 			name: "AModelWithTheWrongKeyDoesntMatch", check: modelsMatchTheTablesItWrites,

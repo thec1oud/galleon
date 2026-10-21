@@ -54,9 +54,15 @@ func (r *Reference) reader(ctx context.Context, rd data.Reader) (data.Reader, er
 
 func (r *Reference) table() string { return data.Identifier{r.s.Schema, r.s.Table}.Sanitize() }
 
-// saved registers the side effect of saving w with the transaction.
-func (r *Reference) saved(ctx context.Context, w Widget) error {
-	return data.AfterCommit(ctx, func(ctx context.Context) { r.s.Saved(ctx, w) })
+// saved registers the side effect of saving w with the transaction the
+// save went through: q, or, taking its handle from ctx, the one there.
+func (r *Reference) saved(ctx context.Context, q data.Querier, w Widget) error {
+	fn := func(ctx context.Context) { r.s.Saved(ctx, w) }
+	if tx, ok := q.(data.WriteTx); ok && !r.FromContext {
+		tx.AfterCommit(fn)
+		return nil
+	}
+	return data.AfterCommit(ctx, fn)
 }
 
 func (r *Reference) Insert(ctx context.Context, q data.Querier, w Widget) error {
@@ -68,7 +74,7 @@ func (r *Reference) Insert(ctx context.Context, q data.Querier, w Widget) error 
 	if _, err := q.Exec(ctx, "INSERT INTO "+r.table()+" (id, name, count) VALUES ($1, $2, $3)", w.ID, w.Name, w.Count); err != nil {
 		return err
 	}
-	return r.saved(ctx, w)
+	return r.saved(ctx, q, w)
 }
 
 func (r *Reference) Find(ctx context.Context, rd data.Reader, id int64) (Widget, error) {
@@ -95,7 +101,7 @@ func (r *Reference) Update(ctx context.Context, q data.Querier, w Widget) error 
 	if tag.RowsAffected() != 1 {
 		return errors.New("ormtest: no widget to update")
 	}
-	return r.saved(ctx, w)
+	return r.saved(ctx, q, w)
 }
 
 // Models describes the widget model.
