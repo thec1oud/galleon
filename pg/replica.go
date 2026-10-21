@@ -407,6 +407,10 @@ func (t *topology) pollPrimary(ctx context.Context, m *Manager, src *source) {
 		}
 		if err != nil {
 			next = t.now().Add(t.layoutRetry)
+			if ctx.Err() == nil {
+				// Start warned already.
+				m.logger().DebugContext(ctx, "the primary's WAL layout still can't be read", "error", err)
+			}
 			return
 		}
 		m.wal.Store(&w)

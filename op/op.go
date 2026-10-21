@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"regexp"
 	"time"
+
+	"github.com/thec1oud/galleon/data"
 )
 
 // Kind is the call shape of an operation.
@@ -125,9 +127,9 @@ type RateLimit struct {
 
 // ReadConsistency is a read consistency of the data plane, such as
 // data.ReadYourWrites, which an operation declares as its reads' default.
-// The operation plane only carries it; the data module reads it. One with
-// a Validate() error method, as data.Level has, is validated at
-// registration, so a bad one fails boot.
+// The operation plane only carries it; the data module reads it. It must
+// be a data.Level value, which registration validates, so a bad one, or
+// anything else, fails boot.
 type ReadConsistency interface{ ConsistencyLevel() string }
 
 // Deprecation marks an operation as deprecated.
@@ -238,10 +240,16 @@ func (d *Descriptor) Check() []error {
 	if d.Adapt == nil {
 		errs = append(errs, fmt.Errorf("operation %q has no handler adapter: build it with op.Unary, or set Adapt to op.Adapter[In, Out]()", d.ID))
 	}
-	if v, ok := d.Consistency.(interface{ Validate() error }); ok {
-		if err := v.Validate(); err != nil {
+	switch c := d.Consistency.(type) {
+	case nil:
+	case data.Level:
+		if err := c.Validate(); err != nil {
 			errs = append(errs, fmt.Errorf("operation %q: its read consistency: %w", d.ID, err))
 		}
+	default:
+		// The data module reads only a data.Level value, and would ignore
+		// anything else, a *data.Level among them.
+		errs = append(errs, fmt.Errorf("operation %q: its read consistency must be a data.Level value, such as data.ReadYourWrites, not a %T", d.ID, c))
 	}
 	s := d.Security
 	switch {

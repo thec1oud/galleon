@@ -293,7 +293,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		// primary's poller tries again until it can.
 		if m.wal.Load() == nil {
 			m.topo.layoutTried = m.topo.now()
-			if err := m.readWALLayout(ctx); err != nil {
+			if err := m.readWALLayout(ctx); err != nil && ctx.Err() == nil {
 				m.logger().WarnContext(ctx, "the primary's WAL layout can't be read, so a write ending at a WAL page may make its ReadYourWrites reads wait for more WAL; retrying", "error", err)
 			}
 		}
