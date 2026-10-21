@@ -225,6 +225,26 @@ func TestDuplicateModelsFailStart(t *testing.T) {
 	}
 }
 
+func TestModelsCollectedByPointerFailStart(t *testing.T) {
+	db := testkit.DB(t)
+	byPointer := galleon.ModuleFunc("orm", func(r *galleon.Registry) error {
+		galleon.Collect(r, &data.ModelInfo{Name: "item", Schema: "shop", Table: "items", Key: []string{"id"}})
+		return nil
+	})
+	app, err := galleon.New(append(pgOptions(t, datatest.Setup{DSN: db.DSN()}), galleon.Name("models"), galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode), galleon.Modules(byPointer))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = app.Start(context.Background())
+	if err == nil {
+		_ = app.Shutdown(context.Background())
+	}
+	if err == nil || !strings.Contains(err.Error(), "1 models were collected as *data.ModelInfo") {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestAnInvalidModelFailsBootNamingItsModule(t *testing.T) {
 	db := testkit.DB(t)
 	_, err := galleon.New(append(pgOptions(t, datatest.Setup{DSN: db.DSN()}), galleon.Name("models"), galleon.Coordination(local.New()),

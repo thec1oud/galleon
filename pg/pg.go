@@ -525,8 +525,9 @@ func Use(m *Manager) ModuleOption { return func(s *moduleSettings) { s.use = m }
 //
 // It also provides the model registry, *data.Models, built from the
 // data.ModelInfo every module adds with galleon.Collect. An invalid model
-// fails boot as it is collected; two that share a name or a table fail
-// Start, when the registry is built.
+// fails boot as it is collected; two that share a name or a table, or a
+// model collected as a *data.ModelInfo, fail Start, when the registry is
+// built.
 func Module(opts ...ModuleOption) galleon.Module {
 	var s moduleSettings
 	for _, o := range opts {
@@ -534,7 +535,15 @@ func Module(opts ...ModuleOption) galleon.Module {
 	}
 	return galleon.ModuleFunc("pg", func(r *galleon.Registry) error {
 		galleon.Collect[data.ModelInfo](r)
-		galleon.Provide[*data.Models](r, func(models []data.ModelInfo) (*data.Models, error) { return data.NewModels(models...) })
+		// Collected by pointer, models would land in a collection of their
+		// own, which nothing reads.
+		galleon.Collect[*data.ModelInfo](r)
+		galleon.Provide[*data.Models](r, func(models []data.ModelInfo, pointers []*data.ModelInfo) (*data.Models, error) {
+			if len(pointers) > 0 {
+				return nil, fmt.Errorf("%d models were collected as *data.ModelInfo; collect data.ModelInfo values, galleon.Collect(r, models...)", len(pointers))
+			}
+			return data.NewModels(models...)
+		})
 		if s.use != nil {
 			m := s.use
 			// Supplied, so the kernel doesn't start or stop it.
