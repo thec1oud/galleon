@@ -53,7 +53,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
@@ -98,11 +100,20 @@ var _ data.Manager = (*Manager)(nil)
 type telemetry struct {
 	tracer trace.Tracer
 	log    *slog.Logger
-	models *data.Models // nil without any
+	// tables is each registered model's table, as a span names it.
+	tables map[string]attribute.KeyValue
+}
+
+func newTelemetry(tp trace.TracerProvider, log *slog.Logger, models *data.Models) *telemetry {
+	t := &telemetry{tracer: tp.Tracer(tracerName), log: log, tables: map[string]attribute.KeyValue{}}
+	for _, m := range models.All() {
+		t.tables[m.Name] = semconv.DBCollectionName(m.Identifier().Sanitize())
+	}
+	return t
 }
 
 func (m *Manager) setTelemetry(tp trace.TracerProvider, log *slog.Logger, models *data.Models) {
-	t := &telemetry{tracer: tp.Tracer(tracerName), log: log, models: models}
+	t := newTelemetry(tp, log, models)
 	m.apps.mu.Lock()
 	defer m.apps.mu.Unlock()
 	m.apps.own = t
@@ -137,7 +148,13 @@ func (m *Manager) popTelemetry(t *telemetry) {
 }
 
 func (m *Manager) tracer() trace.Tracer { return m.tel.Load().tracer }
-func (m *Manager) models() *data.Models { return m.tel.Load().models }
+
+// table is the table of the model named name, as a span names it, when the
+// model is registered.
+func (m *Manager) table(name string) (attribute.KeyValue, bool) {
+	kv, ok := m.tel.Load().tables[name]
+	return kv, ok
+}
 func (m *Manager) logger() *slog.Logger { return m.tel.Load().log }
 
 // source is one database and its pool.
@@ -495,11 +512,11 @@ type moduleSettings struct {
 // Use makes the module provide m, as built, instead of one from the config
 // section. The app never starts or stops m: its caller does. While the app
 // runs, from its start to its stop, m sends spans and logs to the app's
-// tracer provider and logger, and its spans name the app's models. With several apps on one Manager at once,
-// the latest started of those still running gets them; with none, m uses
-// its own. data.Manager is built once the app's
-// telemetry is in place, so a provider that starts with it should depend on
-// it rather than on *Manager. testkit.DB uses it.
+// tracer provider and logger, and its spans name the app's models. With
+// several apps on one Manager at once, the latest started of those still
+// running gets them; with none, m uses its own. data.Manager is built once
+// the app's telemetry is in place, so a provider that starts with it should
+// depend on it rather than on *Manager. testkit.DB uses it.
 func Use(m *Manager) ModuleOption { return func(s *moduleSettings) { s.use = m } }
 
 // Module returns the data module: it provides *pg.Manager and data.Manager
@@ -507,8 +524,9 @@ func Use(m *Manager) ModuleOption { return func(s *moduleSettings) { s.use = m }
 // tracks the transactions each operation begins.
 //
 // It also provides the model registry, *data.Models, built from the
-// data.ModelInfo every module adds with galleon.Collect. A model that is
-// invalid, or shares its name or table with another, fails Start.
+// data.ModelInfo every module adds with galleon.Collect. An invalid model
+// fails boot as it is collected; two that share a name or a table fail
+// Start, when the registry is built.
 func Module(opts ...ModuleOption) galleon.Module {
 	var s moduleSettings
 	for _, o := range opts {
@@ -522,7 +540,7 @@ func Module(opts ...ModuleOption) galleon.Module {
 			// Supplied, so the kernel doesn't start or stop it.
 			galleon.Supply[*Manager](r, m)
 			galleon.Provide[*appTelemetry](r, func(tp trace.TracerProvider, log *slog.Logger, models *data.Models) *appTelemetry {
-				return &appTelemetry{m: m, tel: &telemetry{tracer: tp.Tracer(tracerName), log: log, models: models}}
+				return &appTelemetry{m: m, tel: newTelemetry(tp, log, models)}
 			})
 			// Built after the app's telemetry is in place, so what depends
 			// on data.Manager starts with it. A managerView has no Start or

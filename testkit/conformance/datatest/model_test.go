@@ -113,6 +113,15 @@ func TestStatementSpansNameTheModelAndItsTable(t *testing.T) {
 			t.Errorf("%s without a model: the collection is %q, want %q", kind, got, want)
 		}
 	}
+	control := tp.Find(func(s *datatest.Span) bool { return s.Name() == "BEGIN" })
+	if len(control) == 0 {
+		t.Fatalf("no BEGIN span among %v", tp.Names())
+	}
+	for _, s := range control {
+		if s.Attr("galleon.data.model") != "" || s.Attr("db.collection.name") != "" {
+			t.Errorf("a BEGIN span names the model or its table: %q, %q", s.Attr("galleon.data.model"), s.Attr("db.collection.name"))
+		}
+	}
 }
 
 func TestAModelThatIsntRegisteredIsNamedWithoutATable(t *testing.T) {
@@ -161,7 +170,7 @@ func TestAManagerGivenToTheModuleNamesTheAppsModels(t *testing.T) {
 	}
 }
 
-func TestBadOrDuplicateModelsFailBoot(t *testing.T) {
+func TestDuplicateModelsFailStart(t *testing.T) {
 	db := testkit.DB(t)
 	item := data.ModelInfo{Name: "item", Schema: "shop", Table: "items", Key: []string{"id"}}
 	other := item
@@ -169,7 +178,6 @@ func TestBadOrDuplicateModelsFailBoot(t *testing.T) {
 	for want, ms := range map[string][]data.ModelInfo{
 		`model "item" is registered twice`:                            {item, item},
 		`models "item" and "other" are both stored in "shop"."items"`: {item, other},
-		`model "x": it has no primary key columns`:                    {{Name: "x", Schema: "s", Table: "t"}},
 	} {
 		app, err := galleon.New(append(pgOptions(t, datatest.Setup{DSN: db.DSN()}), galleon.Name("models"), galleon.Coordination(local.New()),
 			galleon.Deploy(galleon.SingleNode), galleon.Modules(models(ms...)))...)
@@ -183,5 +191,14 @@ func TestBadOrDuplicateModelsFailBoot(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "*data.Models") {
 			t.Errorf("%s: got %v", want, err)
 		}
+	}
+}
+
+func TestAnInvalidModelFailsBootNamingItsModule(t *testing.T) {
+	db := testkit.DB(t)
+	_, err := galleon.New(append(pgOptions(t, datatest.Setup{DSN: db.DSN()}), galleon.Name("models"), galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode), galleon.Modules(models(data.ModelInfo{Name: "x", Schema: "s", Table: "t"})))...)
+	if err == nil || !strings.Contains(err.Error(), `module "orm" (`) || !strings.Contains(err.Error(), `model "x": it has no primary key columns`) {
+		t.Fatalf("got %v", err)
 	}
 }
