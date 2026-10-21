@@ -1,7 +1,6 @@
 package migrate
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -54,6 +53,8 @@ type Runner struct {
 	clock     clock.Clock
 	// renewed, set by tests, is called after each renewal is handled.
 	renewed func(err error)
+	// sleeping, set by tests, is called once a pause's timer is armed.
+	sleeping func(d time.Duration)
 }
 
 // NewRunner checks cfg and returns its Runner.
@@ -244,7 +245,9 @@ func (r *Runner) Plan(ctx context.Context, offline bool) []PlanReport {
 		if err != nil {
 			rep.StatusErr = fmt.Errorf("plan: migrator %q: reading its status: %w", m.Name(), err)
 		}
-		pending := err == nil && st.State == Pending
+		// A status that can't be read may be pending: an empty plan is
+		// then unplanned, as Apply would find it, and fails closed.
+		pending := err != nil || st.State == Pending
 		rep.Unplanned = unplanned(pl, pending)
 		rep.Refused = r.stateRefusal(m.Name(), st, err)
 		if rep.Refused == nil {
@@ -546,7 +549,7 @@ func (r *Runner) wait(ctx context.Context, name string, ttl time.Duration, log *
 	defer cancel(nil)
 	if r.policy.LockWait > 0 {
 		t := r.clock.AfterFunc(r.policy.LockWait, func() {
-			cancel(fmt.Errorf("waited lock_wait (%s) for another node's apply: %w", r.policy.LockWait, context.DeadlineExceeded))
+			cancel(fmt.Errorf("lock_wait (%s) passed: %w", r.policy.LockWait, context.DeadlineExceeded))
 		})
 		defer t.Stop()
 	}
@@ -554,20 +557,24 @@ func (r *Runner) wait(ctx context.Context, name string, ttl time.Duration, log *
 	for {
 		lease, err := r.locker.Acquire(wctx, LockKey(name), ttl)
 		if err != nil {
-			return nil, time.Time{}, cmp.Or(context.Cause(wctx), err)
+			if wctx.Err() != nil {
+				return nil, time.Time{}, fmt.Errorf("waiting for another node's apply: %w", context.Cause(wctx))
+			}
+			return nil, time.Time{}, err
 		}
 		renewed, err := r.renewAfterWait(wctx, lease, log)
 		switch {
 		case err == nil:
 			return lease, renewed, nil
 		case wctx.Err() != nil:
-			return nil, time.Time{}, context.Cause(wctx)
+			// The lease was granted: the wait ended while renewing it.
+			return nil, time.Time{}, fmt.Errorf("renewing the lease it was granted after waiting: %w", context.Cause(wctx))
 		case !errors.Is(err, coord.ErrLeaseLost):
 			return nil, time.Time{}, fmt.Errorf("renewing the lease it waited for: %w", err)
 		}
 		log.WarnContext(ctx, "the migration lease was lost as soon as it was granted; asking for it again", "token", lease.Token())
 		if err := r.sleep(wctx, every); err != nil {
-			return nil, time.Time{}, err
+			return nil, time.Time{}, fmt.Errorf("pausing before asking for the lease again: %w", err)
 		}
 	}
 }
@@ -576,6 +583,9 @@ func (r *Runner) wait(ctx context.Context, name string, ttl time.Duration, log *
 func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
 	t := r.clock.NewTimer(d)
 	defer t.Stop()
+	if r.sleeping != nil {
+		r.sleeping(d)
+	}
 	select {
 	case <-t.C():
 		return nil
@@ -594,17 +604,24 @@ func (r *Runner) renewAfterWait(ctx context.Context, lease coord.Lease, log *slo
 	every, safe := renewal(r.policy.lockTTL())
 	rctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	deadline := r.clock.AfterFunc(safe, func() {
-		cancel(errs.New(errs.Unavailable, CodeLeaseLost, "the migration lease couldn't be renewed before its deadline"))
-	})
+	deadline := r.clock.AfterFunc(safe, func() { cancel(errRenewDeadline) })
 	defer deadline.Stop()
+	var last error // the last renewal's error
 	for {
 		if rctx.Err() != nil {
 			release(ctx, lease, log)
-			return time.Time{}, context.Cause(rctx)
+			if cause := context.Cause(rctx); cause != errRenewDeadline {
+				return time.Time{}, cause
+			}
+			msg := "the migration lease couldn't be renewed before its deadline"
+			if last == nil {
+				return time.Time{}, errs.New(errs.Unavailable, CodeLeaseLost, msg)
+			}
+			return time.Time{}, errs.Wrap(last, errs.Unavailable, CodeLeaseLost, msg)
 		}
 		start := r.clock.Now()
 		err := lease.Renew(rctx)
+		last = err
 		if err == nil {
 			return start, nil
 		}
@@ -622,6 +639,9 @@ func (r *Runner) renewAfterWait(ctx context.Context, lease coord.Lease, log *slo
 		_ = r.sleep(rctx, every)
 	}
 }
+
+// errRenewDeadline ends the renewals after a wait at their safety deadline.
+var errRenewDeadline = errors.New("the safety deadline passed")
 
 // release releases lease, bounded on its own: ctx may have ended.
 func release(ctx context.Context, lease coord.Lease, log *slog.Logger) {
