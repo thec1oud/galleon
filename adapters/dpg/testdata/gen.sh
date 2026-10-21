@@ -9,6 +9,7 @@
 #	edited  a with another column, then b: a log that diverges from base's
 #	indexed base's log, then an index on a, made CONCURRENTLY after the
 #	        migration's transaction
+#	noted   indexed's log, then a column on a
 #
 # The builds that extend another copy its project and record one more
 # migration, so they share its migrations' IDs, as a newer build of a
@@ -63,6 +64,10 @@ record risky --allow-destructive
 cp -R "$out/base" "$out/indexed"
 printf 'TABLE a (id int PRIMARY KEY) { INDEXES { CONCURRENTLY a_id_desc (id DESC); } }\n' >"$out/indexed/c/app/schemas/public/tables/a.dpg"
 record indexed
+
+cp -R "$out/indexed" "$out/noted"
+printf 'TABLE a (id int PRIMARY KEY, note text) { INDEXES { CONCURRENTLY a_id_desc (id DESC); } }\n' >"$out/noted/c/app/schemas/public/tables/a.dpg"
+record noted
 
 project edited
 table edited a "id int PRIMARY KEY, note text"

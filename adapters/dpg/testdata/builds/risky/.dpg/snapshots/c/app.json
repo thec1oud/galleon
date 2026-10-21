@@ -2,9 +2,9 @@
   "dpg_version": "0.2.0",
   "cluster": "c",
   "database": "app",
-  "applied_at": "2026-10-21T17:21:24Z",
+  "applied_at": "2026-10-21T19:15:39Z",
   "source_revision": "",
-  "migration": "20261021T172124Z-d3d93724f6b0",
+  "migration": "20261021T191539Z-bc2a4791d176",
   "objects": {
     "public.b": {
       "kind": "table",

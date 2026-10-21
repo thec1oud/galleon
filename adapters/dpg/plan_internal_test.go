@@ -137,25 +137,35 @@ func TestMaxSafetyIsTheMostTheOptionsAllow(t *testing.T) {
 }
 
 func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
-	m := &Migrator{name: "schema", statements: []engine.Step{
-		{ID: "m1/2", SQL: `CREATE INDEX CONCURRENTLY "a_x" ON "public"."a" ("x");`},
-	}}
+	create := `CREATE INDEX CONCURRENTLY "a_x" ON "public"."a" ("x");`
+	m := &Migrator{name: "schema"}
+	m.statements = []engine.Step{{ID: "m1/2", SQL: create}, {ID: "m1/1", SQL: `CREATE TABLE "a" ("x" int);`}, {ID: "m1/3", SQL: `CREATE TABLE "a" ("x" int);` + " -- longer"}}
+	m.byLength = []engine.Step{m.statements[2], m.statements[0], m.statements[1]}
 	pgErr := &pgconn.PgError{Severity: "ERROR", Code: "42P07", Message: `relation "a_x" already exists`}
+	stale := errs.New(errs.FailedPrecondition, CodeStaleToken, `dpg: migrator "schema": the lease's fencing token 1 is stale`)
 	for _, c := range []struct {
 		err  error
 		want string
 	}{
 		{
-			fmt.Errorf(`engine: c/app: finishing migration m1: executor: CREATE INDEX CONCURRENTLY "a_x" ON "public"."a" ("x");: %w`, pgErr),
+			fmt.Errorf("engine: c/app: finishing migration m1: %w", &engine.StatementError{SQL: create, Err: pgErr}),
 			`dpg: migrator "schema": engine: c/app: finishing migration m1: executor: statement m1/2: ERROR: relation "a_x" already exists (SQLSTATE 42P07)`,
 		},
 		{
-			fmt.Errorf(`engine: c/app: migration m1: executor: UPDATE "dpg".migrations SET status = 'complete';: %w`, pgErr),
-			`dpg: migrator "schema": engine: c/app: migration m1: executor: a statement of DPG's: ERROR: relation "a_x" already exists (SQLSTATE 42P07)`,
+			// The fence refused the lease before DPG's own record.
+			fmt.Errorf("engine: c/app: migration m1: %w", &engine.StatementError{SQL: "DO $dpg$ BEGIN INSERT INTO \"dpg\".migrations VALUES ('m1'); END $dpg$;", Err: stale}),
+			`dpg: migrator "schema": engine: c/app: migration m1: executor: a statement of DPG's: dpg.stale_token: dpg: migrator "schema": the lease's fencing token 1 is stale`,
 		},
 		{
-			fmt.Errorf("engine: c/app: migration m1: executor: CREATE INDEX CONCURRENTLY \"a_x\" ON \"public\".\"a\" (\"x\");: %w", context.Canceled),
-			`dpg: migrator "schema": engine: c/app: migration m1: executor: statement m1/2: context canceled`,
+			// The drop of an invalid index before building it again.
+			fmt.Errorf("engine: c/app: finishing migration m1: %w", &engine.StatementError{SQL: `DROP INDEX CONCURRENTLY IF EXISTS "public"."a_x";`, Err: context.Canceled}),
+			`dpg: migrator "schema": engine: c/app: finishing migration m1: executor: a statement of DPG's: context canceled`,
+		},
+		{
+			// Quoted outside a StatementError: the longer statement is
+			// replaced whole.
+			fmt.Errorf(`engine: c/app: DPG-E053: CREATE TABLE "a" ("x" int); -- longer`),
+			`dpg: migrator "schema": engine: c/app: DPG-E053: statement m1/3`,
 		},
 	} {
 		got := m.wrap(c.err)
@@ -168,12 +178,23 @@ func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 	}
 	// The adapter's own refusal is returned as it is; one the engine
 	// wrapped keeps the engine's context and its code.
-	own := errs.New(errs.FailedPrecondition, CodeStaleToken, "dpg: migrator \"schema\": stale")
-	if m.wrap(own) != error(own) {
+	if m.wrap(stale) != error(stale) {
 		t.Error("the adapter's own error was wrapped")
 	}
-	got := m.wrap(fmt.Errorf("engine: c/app: migration m1: %w", own))
+	got := m.wrap(fmt.Errorf("engine: c/app: migration m1: %w", stale))
 	if e := errs.From(got); e == nil || e.Code != CodeStaleToken || !strings.Contains(got.Error(), "engine: c/app: migration m1: ") {
 		t.Errorf("%v", got)
+	}
+}
+
+func TestWarningsAreAddedToTheDetail(t *testing.T) {
+	if got := withWarnings("1 migration(s) to run: m2", []string{"a.json: format 9"}); got != "1 migration(s) to run: m2; warning: a.json: format 9" {
+		t.Errorf("%q", got)
+	}
+	if got := withWarnings("", []string{"x", "y"}); got != "warning: x; warning: y" {
+		t.Errorf("%q", got)
+	}
+	if got := withWarnings("d", nil); got != "d" {
+		t.Errorf("%q", got)
 	}
 }

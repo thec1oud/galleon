@@ -36,8 +36,13 @@
 // transaction committed and the statements after it to run again. They
 // are safe to run again: an enum value is ADD VALUE IF NOT EXISTS, a grant
 // repeats harmlessly, and before running a CREATE INDEX CONCURRENTLY again
-// DPG drops an index of that name that a cancelled or failed build left
-// invalid, and takes a valid one as built. Two statements DPG may run
+// DPG drops an index of that name on the table that a cancelled or failed
+// build left invalid, and takes a valid one as built; an index of the name
+// on another table makes it refuse. That drop isn't in the plan, nor in
+// its fingerprint: it is DPG's, like its ledger's records, and runs only
+// when finishing a migration. A cancelled build may go on for a while on
+// the server; the drop waits for it, and a build that completes first
+// leaves a valid index, taken as built. Two statements DPG may run
 // after a transaction still aren't: CREATE SUBSCRIPTION, and ALTER TABLE
 // ... DETACH PARTITION ... CONCURRENTLY, which a cancel leaves pending; a
 // person finishes those. See README.md.
@@ -45,12 +50,15 @@
 // Status, Plan and Verify only read. Each call opens a connection of its
 // own, and closes it, rather than borrowing one of the pool's: a migration
 // may change session state (SET ROLE, to create an object as its owner),
-// which must not reach the app's connections. The connection is made as
-// the pool makes its own, through its BeforeConnect hook (which may rotate
-// credentials) and its AfterConnect hook, but without its tracer, which
-// may record statements' text: DPG resolves secrets into some statements
-// (user mappings, subscriptions). For the same reason the adapter's errors
-// name statements by their step IDs, not their SQL.
+// which must not reach the app's connections. The connection is made from
+// the pool's configuration through its BeforeConnect hook (which may
+// rotate credentials), but without its tracer, which may record
+// statements' text: DPG resolves secrets into some statements (user
+// mappings, subscriptions). The pool's AfterConnect hook doesn't run: it
+// prepares connections for the app's queries. For the same reason as the
+// tracer, the adapter's errors name statements by their step IDs, not
+// their SQL, and what DPG warns of (Engine.Warnings) is in a status's or
+// a result's Detail.
 //
 // The database's owner is role enough: the adapter needs no superuser.
 //
@@ -64,10 +72,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/dpg/pkg/dpg/engine"
@@ -114,6 +122,7 @@ type Migrator struct {
 	// statements are every statement of the log, which errors name by
 	// their step IDs instead of their SQL.
 	statements []engine.Step
+	byLength   []engine.Step // the statements with SQL, longest first
 }
 
 var (
@@ -144,6 +153,12 @@ func New(name, dir string, pool *pgxpool.Pool, opts ...Option) (*Migrator, error
 	all := e.PlanOffline().Steps
 	m.offline = planOf(all)
 	m.statements = all
+	for _, s := range all {
+		if strings.TrimSpace(s.SQL) != "" {
+			m.byLength = append(m.byLength, s)
+		}
+	}
+	slices.SortStableFunc(m.byLength, func(a, b engine.Step) int { return len(b.SQL) - len(a.SQL) })
 	return m, nil
 }
 
@@ -158,12 +173,13 @@ func (m *Migrator) engine(conn *pgx.Conn) (*engine.Engine, error) {
 	return e, nil
 }
 
-// connect opens a connection of its own, as the pool would open one: its
-// BeforeConnect hook (which may rotate credentials) sees the copied
-// configuration first, and its AfterConnect hook the connection. The
-// copy has no tracer: the pool's may record statements' text, and DPG
-// resolves secrets into some of its statements (user mappings,
-// subscriptions).
+// connect opens a connection of its own from the pool's configuration:
+// its BeforeConnect hook (which may rotate credentials) sees the copied
+// configuration first. The copy has no tracer: the pool's may record
+// statements' text, and DPG resolves secrets into some of its statements
+// (user mappings, subscriptions). The pool's AfterConnect hook doesn't
+// run: it prepares a connection for the app's queries (registering types,
+// setting session state), which a migration's connection mustn't take on.
 func (m *Migrator) connect(ctx context.Context) (*pgx.Conn, error) {
 	pc := m.pool.Config()
 	cfg := pc.ConnConfig.Copy()
@@ -173,17 +189,7 @@ func (m *Migrator) connect(ctx context.Context) (*pgx.Conn, error) {
 			return nil, err
 		}
 	}
-	conn, err := pgx.ConnectConfig(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if pc.AfterConnect != nil {
-		if err := pc.AfterConnect(ctx, conn); err != nil {
-			conn.Close(context.WithoutCancel(ctx))
-			return nil, err
-		}
-	}
-	return conn, nil
+	return pgx.ConnectConfig(ctx, cfg)
 }
 
 // session runs f on an engine over a connection of its own.
@@ -199,6 +205,19 @@ func (m *Migrator) session(ctx context.Context, f func(*engine.Engine, *pgx.Conn
 	}
 	defer e.Close(context.WithoutCancel(ctx))
 	return f(e, conn)
+}
+
+// withWarnings adds what DPG warned of, such as a snapshot of another
+// format version, to a status's or a result's detail, for people: status
+// reports (migrate.WriteStatus) show a status's.
+func withWarnings(detail string, warnings []string) string {
+	for _, w := range warnings {
+		if detail != "" {
+			detail += "; "
+		}
+		detail += "warning: " + w
+	}
+	return detail
 }
 
 func version(id string) string {
@@ -234,6 +253,7 @@ func (m *Migrator) Status(ctx context.Context) (migrate.Status, error) {
 	err := m.session(ctx, func(e *engine.Engine, _ *pgx.Conn) error {
 		s, err := e.Status(ctx)
 		st = statusOf(s)
+		st.Detail = withWarnings(st.Detail, e.Warnings())
 		return err
 	})
 	if err != nil {
@@ -442,6 +462,7 @@ func (m *Migrator) Apply(ctx context.Context, opts migrate.ApplyOptions) (migrat
 		for _, id := range r.Applied {
 			res.Applied = append(res.Applied, info(id))
 		}
+		res.Detail = withWarnings(res.Detail, e.Warnings())
 		return err
 	})
 	if err != nil {
@@ -503,11 +524,12 @@ func (m *Migrator) stale(err error) error {
 }
 
 // wrap names the migrator in an error, keeping what DPG's engine says
-// around it, and keeps SQL out of its message: a statement of the log is
-// named by its step ID, and any other statement an error quotes (DPG's
-// ledger records, say) is left out. The adapter's own refusals are
-// returned as they are. The error still wraps the original, for errors.Is
-// and errors.As.
+// around it, and keeps SQL out of its message: a statement that failed (an
+// engine.StatementError) is named by its step ID, or as one of DPG's own
+// (its ledger's records, its guards, the drop of an invalid index before
+// a build) when it isn't a step of the log. The adapter's own refusals
+// are returned as they are. The error still wraps the original, for
+// errors.Is and errors.As.
 func (m *Migrator) wrap(err error) error {
 	if e := (*errs.Error)(nil); errors.As(err, &e) && e == err {
 		return err
@@ -519,25 +541,23 @@ func (m *Migrator) wrap(err error) error {
 	return &redacted{msg: msg, err: err}
 }
 
-// executorPrefix starts DPG's executor's errors, which quote the statement
-// that failed after it.
-const executorPrefix = "executor: "
-
 func (m *Migrator) redact(err error) string {
 	msg := err.Error()
-	for _, s := range m.statements {
-		if sql := strings.TrimSpace(s.SQL); sql != "" {
-			msg = strings.ReplaceAll(msg, sql, "statement "+s.ID)
+	var se *engine.StatementError
+	if errors.As(err, &se) {
+		named := "a statement of DPG's"
+		for _, s := range m.statements {
+			if s.SQL == se.SQL {
+				named = "statement " + s.ID
+				break
+			}
 		}
+		msg = strings.Replace(msg, se.Error(), "executor: "+named+": "+m.redact(se.Err), 1)
 	}
-	// What's left after the executor's prefix, up to the database's own
-	// error, is a statement that isn't in the log.
-	var pgErr *pgconn.PgError
-	if i := strings.Index(msg, executorPrefix); i >= 0 && errors.As(err, &pgErr) {
-		rest := msg[i+len(executorPrefix):]
-		if j := strings.Index(rest, pgErr.Error()); j > 0 && !strings.HasPrefix(rest, "statement ") {
-			msg = msg[:i+len(executorPrefix)] + "a statement of DPG's: " + rest[j:]
-		}
+	// Any statement of the log an error quotes otherwise, longest first so
+	// that one statement inside another is replaced whole.
+	for _, s := range m.byLength {
+		msg = strings.ReplaceAll(msg, s.SQL, "statement "+s.ID)
 	}
 	return msg
 }

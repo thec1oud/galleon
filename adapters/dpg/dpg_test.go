@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -239,6 +240,12 @@ func TestAStaleLeaseIsRefusedWithTheAdaptersCodes(t *testing.T) {
 	if code(err) != dpg.CodeStaleToken || !strings.Contains(err.Error(), "token 5 is stale") {
 		t.Fatalf("a lower token: %v", err)
 	}
+	// The fence refused DPG's first record, whose SQL isn't quoted.
+	for _, sql := range []string{"$dpg$", `"dpg".`, "INSERT", "CREATE"} {
+		if strings.Contains(err.Error(), sql) {
+			t.Errorf("the stale lease's error quotes SQL (%s): %v", sql, err)
+		}
+	}
 	if exists(t, pool, "public.c") {
 		t.Fatal("the stale holder created c")
 	}
@@ -429,12 +436,21 @@ func (r *tracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQu
 
 func (r *tracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
-// The adapter's connections are made as the pool makes its own, through
-// its BeforeConnect and AfterConnect hooks, but without its tracer, which
-// may record statements' text, and DPG's statements can hold secrets.
-func TestConnectionsRunThePoolsHooksButNotItsTracer(t *testing.T) {
+// The adapter's connections run the pool's BeforeConnect hook, which may
+// rotate credentials or move the server, but not its AfterConnect hook,
+// which prepares a connection for the app, nor its tracer, which may
+// record statements' text, and DPG's statements can hold secrets.
+func TestConnectionsRunBeforeConnectButNotAfterConnectOrTheTracer(t *testing.T) {
 	ctx := context.Background()
-	cfg, err := pgxpool.ParseConfig(database(t))
+	dsn, err := url.Parse(database(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := dsn.Port()
+	// The configured port is wrong; BeforeConnect puts the right one in,
+	// as a hook that looks the server up would.
+	dsn.Host = dsn.Hostname() + ":1"
+	cfg, err := pgxpool.ParseConfig(dsn.String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,15 +462,12 @@ func TestConnectionsRunThePoolsHooksButNotItsTracer(t *testing.T) {
 		if cc.Tracer != nil {
 			t.Error("BeforeConnect was given a configuration with the tracer")
 		}
-		cc.RuntimeParams["application_name"] = "rotated"
-		return nil
+		p, err := strconv.ParseUint(port, 10, 16)
+		cc.Port = uint16(p)
+		return err
 	}
-	cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
+	cfg.AfterConnect = func(context.Context, *pgx.Conn) error {
 		after.Add(1)
-		var name string
-		if err := c.QueryRow(ctx, "SELECT current_setting('application_name')").Scan(&name); err != nil || name != "rotated" {
-			t.Errorf("the connection BeforeConnect configured has application_name %q: %v", name, err)
-		}
 		return nil
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -469,16 +482,14 @@ func TestConnectionsRunThePoolsHooksButNotItsTracer(t *testing.T) {
 	if _, err := m.Status(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if before.Load() < 2 || after.Load() != before.Load() {
+	if before.Load() < 2 || after.Load() != 0 {
 		t.Errorf("BeforeConnect ran %d times, AfterConnect %d", before.Load(), after.Load())
 	}
 	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	for _, sql := range rec.sql {
-		if !strings.Contains(sql, "current_setting('application_name')") {
-			t.Errorf("the pool's tracer saw %q", sql)
-		}
+	if len(rec.sql) != 0 {
+		t.Errorf("the pool's tracer saw %q", rec.sql)
 	}
+	rec.mu.Unlock()
 	// A hook that fails stops the call.
 	cfg.BeforeConnect = func(context.Context, *pgx.ConnConfig) error { return errors.New("no credentials") }
 	failing, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -488,6 +499,32 @@ func TestConnectionsRunThePoolsHooksButNotItsTracer(t *testing.T) {
 	t.Cleanup(failing.Close)
 	if _, err := newMigrator(t, "base", failing).Status(ctx); err == nil || !strings.Contains(err.Error(), "no credentials") {
 		t.Errorf("status with a failing BeforeConnect: %v", err)
+	}
+}
+
+// What DPG warns of, here a snapshot of another format version, is in the
+// status's detail.
+func TestDPGsWarningsAreInTheStatus(t *testing.T) {
+	root := t.TempDir()
+	if err := os.CopyFS(root, os.DirFS(dir("base"))); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(root, ".dpg", "snapshots", "c", "app.json")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = []byte(strings.Replace(string(b), `"dpg_version": "0.2.0"`, `"dpg_version": "9.0.0"`, 1))
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := dpg.New("schema", root, poolOf(t, database(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := m.Status(context.Background())
+	if err != nil || st.State != migrate.Pending || !strings.Contains(st.Detail, "warning: ") || !strings.Contains(st.Detail, "format 9.0.0") {
+		t.Fatalf("%+v, %v", st, err)
 	}
 }
 
@@ -520,7 +557,7 @@ func TestAnIndexBuildCancelledPartWayIsRebuiltByTheNextApply(t *testing.T) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		var n int
-		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'CREATE INDEX CONCURRENTLY%' AND wait_event_type = 'Lock'").Scan(&n); err != nil {
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'CREATE INDEX CONCURRENTLY%' AND wait_event_type = 'Lock'").Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n > 0 {
@@ -615,4 +652,55 @@ func newRole(t *testing.T) string {
 		}
 	})
 	return role
+}
+
+// A migration whose index wasn't built yet is finished, then a later
+// migration on the same table runs: the index still to be built isn't
+// drift on the table.
+func TestFinishingAMigrationThenTheNextOnTheSameTable(t *testing.T) {
+	ctx := context.Background()
+	dsn := database(t)
+	pool := poolOf(t, dsn)
+	if _, err := newMigrator(t, "base", pool).Apply(ctx, under(lease{"e", 1})); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	e, err := engine.Open(engine.Config{Dir: dir("indexed"), Conn: conn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterCommit := errors.New("failed after the commit")
+	_, err = e.Apply(ctx, engine.ApplyOptions{MaxSafety: engine.Caution, Hook: func(ctx context.Context, tx pgx.Tx) error {
+		var committed bool
+		err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM dpg.migrations WHERE status = 'committed')").Scan(&committed)
+		if err == nil && committed {
+			return afterCommit
+		}
+		return err
+	}})
+	if !errors.Is(err, afterCommit) {
+		t.Fatalf("the engine's apply: %v", err)
+	}
+	m := newMigrator(t, "noted", pool)
+	if st, err := m.Status(ctx); err != nil || st.State != migrate.Pending {
+		t.Fatalf("%+v, %v", st, err)
+	}
+	res, err := m.Apply(ctx, under(lease{"e", 2}))
+	if err != nil || len(res.Applied) != 2 {
+		t.Fatalf("finishing, then the next migration: %+v, %v", res, err)
+	}
+	if st, err := m.Status(ctx); err != nil || st.State != migrate.UpToDate {
+		t.Errorf("%+v, %v", st, err)
+	}
+	if !exists(t, pool, "public.a_id_desc") {
+		t.Error("the index wasn't built")
+	}
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_name = 'a' AND column_name = 'note'").Scan(&n); err != nil || n != 1 {
+		t.Errorf("column note: %d, %v", n, err)
+	}
 }
