@@ -16,7 +16,11 @@
 // are valid and match the tables it writes. Reference is an adapter that
 // passes it.
 //
-// The suite gets its database from testkit.DB, so it skips when
+// An ORM that connects when it is opened, as GORM pings its database, must
+// have that turned off (for GORM, DisableAutomaticPing), or be opened
+// without a DSN: the suite counts that connection as one of its own.
+//
+// The suite gets its database from testkit.PackageDSN, so it skips when
 // testkit.PostgresEnv is unset, and fails in CI if it is.
 package ormtest
 
@@ -31,6 +35,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -144,13 +149,13 @@ func (s *saved) get() []Widget {
 
 func newEnv(t *testing.T, f Factory) *env {
 	t.Helper()
-	db := testkit.DB(t)
+	dsn := testkit.PackageDSN(t)
 	var b [6]byte
 	_, _ = rand.Read(b[:])
-	e := &env{t: t, proxy: testkit.NewProxy(t, db.DSN())}
-	e.s = Setup{DSN: e.proxy.DSN(db.DSN()), Schema: "ormtest_" + hex.EncodeToString(b[:]), Table: "widgets", Saved: e.saved.add}
+	e := &env{t: t, proxy: testkit.NewProxy(t, dsn)}
+	e.s = Setup{DSN: e.proxy.DSN(dsn), Schema: "ormtest_" + hex.EncodeToString(b[:]), Table: "widgets", Saved: e.saved.add}
 	c := ctxFor(t)
-	pool, err := pgxpool.New(c, db.DSN())
+	pool, err := pgxpool.New(c, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +171,7 @@ func newEnv(t *testing.T, f Factory) *env {
 		}
 		pool.Close()
 	})
-	if e.m, err = pg.New(pg.Config{Primary: pg.Source{DSN: db.DSN(), MaxConns: 4}}); err != nil {
+	if e.m, err = pg.New(pg.Config{Primary: pg.Source{DSN: dsn, MaxConns: 4}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.m.Start(c); err != nil {
@@ -491,14 +496,5 @@ func (e *env) names(ctx context.Context, sql string, args ...any) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
-			return nil, err
-		}
-		out = append(out, s)
-	}
-	return out, rows.Err()
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
