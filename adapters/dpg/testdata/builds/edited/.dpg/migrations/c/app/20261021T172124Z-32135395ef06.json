@@ -1,0 +1,50 @@
+{
+  "format": "1",
+  "id": "20261021T172124Z-32135395ef06",
+  "parent": "20261021T172124Z-df2178bb70a5",
+  "checksum": "sha256:664809545d80adae625a6c92c608fbcbddff3bf47912c3fcca0264adfb6743ae",
+  "steps": [
+    {
+      "sql": "DO $dpg$\nBEGIN\n  IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'b') THEN\n    RAISE EXCEPTION 'DPG-E051: the migration creates table public.b, which already exists in this database (DPG doesn''t manage it: dpg resolve can adopt or ignore it)';\n  END IF;\nEND\n$dpg$;",
+      "safety": "SAFE",
+      "stage": "check"
+    },
+    {
+      "sql": "CREATE TABLE \"public\".\"b\" (\n    \"id\" integer PRIMARY KEY\n);",
+      "safety": "SAFE",
+      "stage": "transaction",
+      "target": {
+        "Kind": "table",
+        "Key": "public.b",
+        "Effect": 1,
+        "From": ""
+      }
+    }
+  ],
+  "steps_checksum": "sha256:5cbf5f557885e837019ec8eae1ce834e1b8095d9e4d5e04bedfbbdc46c058eb1",
+  "snapshot": "sha256:b8f5e64bcffc6405eb233cdbbb2254a4edc8f5e70a120ce2b0c16d42ecd49dcb",
+  "origin": "record",
+  "set": {
+    "public.b": {
+      "kind": "table",
+      "table": {
+        "columns": [
+          {
+            "name": "id",
+            "not_null": true,
+            "type": "integer"
+          }
+        ],
+        "constraints": [
+          {
+            "expr": "PRIMARY KEY (\"id\")",
+            "name": "",
+            "type": "PRIMARY KEY"
+          }
+        ],
+        "name": "b",
+        "schema": "public"
+      }
+    }
+  }
+}

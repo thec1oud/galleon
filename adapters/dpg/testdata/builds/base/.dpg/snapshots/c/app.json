@@ -1,0 +1,52 @@
+{
+  "dpg_version": "0.2.0",
+  "cluster": "c",
+  "database": "app",
+  "applied_at": "2026-10-21T17:21:24Z",
+  "source_revision": "",
+  "migration": "20261021T172124Z-e6bff4b6c8fa",
+  "objects": {
+    "public.a": {
+      "kind": "table",
+      "table": {
+        "schema": "public",
+        "name": "a",
+        "columns": [
+          {
+            "name": "id",
+            "type": "integer",
+            "not_null": true
+          }
+        ],
+        "constraints": [
+          {
+            "name": "",
+            "type": "PRIMARY KEY",
+            "expr": "PRIMARY KEY (\"id\")"
+          }
+        ]
+      }
+    },
+    "public.b": {
+      "kind": "table",
+      "table": {
+        "schema": "public",
+        "name": "b",
+        "columns": [
+          {
+            "name": "id",
+            "type": "integer",
+            "not_null": true
+          }
+        ],
+        "constraints": [
+          {
+            "name": "",
+            "type": "PRIMARY KEY",
+            "expr": "PRIMARY KEY (\"id\")"
+          }
+        ]
+      }
+    }
+  }
+}
