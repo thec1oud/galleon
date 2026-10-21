@@ -157,7 +157,8 @@ func Supply[T any](r *Registry, value T) {
 // line, as a config section does. A nil pointer isn't checked.
 //
 // Collect belongs in Register: once New has provided the collections, it
-// panics rather than drop the values.
+// panics rather than drop the values. A collection with values that no
+// constructor takes fails boot, for the same reason.
 //
 // An ORM adapter module, for one, registers its models with
 // galleon.Collect(r, models...), and the data module builds its model
@@ -180,15 +181,18 @@ func Collect[T any](r *Registry, values ...T) {
 				continue
 			}
 		}
+		if c.valueSite == "" {
+			c.valueModule, c.valueSite = r.module, callerSite(2)
+		}
 		c.values = reflect.Append(c.values, reflect.ValueOf(&v).Elem())
 	}
 }
 
 // validator returns *v as a Validator, through T's methods or *T's, or nil
-// when it has neither, or is a nil pointer, whose Validate may dereference
-// it, held in an interface or not.
+// when it has neither, or is a nil pointer or func, whose Validate may
+// dereference or call it, held in an interface or not.
 func validator[T any](v *T) Validator {
-	if rv := reflect.ValueOf(any(*v)); !rv.IsValid() || rv.Kind() == reflect.Pointer && rv.IsNil() {
+	if rv := reflect.ValueOf(any(*v)); !rv.IsValid() || (rv.Kind() == reflect.Pointer || rv.Kind() == reflect.Func) && rv.IsNil() {
 		return nil
 	}
 	if val, ok := any(*v).(Validator); ok {
@@ -204,14 +208,38 @@ type collection struct {
 	typ          reflect.Type // []T
 	values       reflect.Value
 	module, site string // where it was first collected
+	// valueModule and valueSite are where its first value was added.
+	valueModule, valueSite string
 }
 
 // provideCollections provides each collection, once every module has
 // registered. Each slice is full to its capacity, so a consumer that
 // appends to it gets a copy rather than writing into another's.
+//
+// A collection that has values but that no constructor takes fails boot,
+// naming where its first value was added: its values would go nowhere, as
+// models collected as *data.ModelInfo rather than data.ModelInfo would.
 func (a *App) provideCollections() {
 	a.collected = true
+	taken := map[reflect.Type]bool{}
+	for _, p := range a.providerOrder {
+		for _, t := range p.params {
+			taken[t] = true
+		}
+	}
+	for _, m := range a.migratorRegs {
+		for _, t := range m.params {
+			taken[t] = true
+		}
+	}
 	for _, c := range a.collectionOrder {
+		if c.valueSite != "" && !taken[c.typ] {
+			hint := ""
+			if elem := c.typ.Elem(); elem.Kind() == reflect.Pointer && taken[reflect.SliceOf(elem.Elem())] {
+				hint = fmt.Sprintf(" (collect %s values: %s is what is taken)", elem.Elem(), reflect.SliceOf(elem.Elem()))
+			}
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): Collect[%s]: nothing takes %s, so its values would go nowhere%s", c.valueModule, c.valueSite, c.typ.Elem(), c.typ, hint))
+		}
 		if prev, ok := a.providers[c.typ]; ok {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("%s is provided by %s, but it is a collection (galleon.Collect, first by module %q, %s), which the kernel provides", c.typ, prev.describe(), c.module, c.site))
 			continue

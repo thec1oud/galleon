@@ -108,9 +108,17 @@ func (c *checkedPtr) Validate() error {
 	return nil
 }
 
+// taker takes the collection of T, as a consumer would.
+type taker[T any] struct{ all []T }
+
+func take[T any](r *galleon.Registry) {
+	galleon.Provide[*taker[T]](r, func(all []T) *taker[T] { return &taker[T]{all: all} })
+}
+
 func TestANilCollectedValueIsntValidated(t *testing.T) {
 	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
 		galleon.Collect(r, (*checkedPtr)(nil), &checkedPtr{ok: true})
+		take[*checkedPtr](r)
 		return nil
 	})
 	if _, err := galleon.New(base(mod)...); err != nil {
@@ -124,6 +132,7 @@ type pchecker interface{ Validate() error }
 func TestANilPointerInAnInterfaceCollectionIsntValidated(t *testing.T) {
 	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
 		galleon.Collect[pchecker](r, (*checkedPtr)(nil), nil, &checkedPtr{ok: true})
+		take[pchecker](r)
 		return nil
 	})
 	if _, err := galleon.New(base(mod)...); err != nil {
@@ -189,6 +198,45 @@ func TestAConsumerAppendingToACollectionDoesntChangeAnothers(t *testing.T) {
 	}
 	if got := galleon.MustResolve[[]tag](app); !slices.Equal(got, []tag{"a", "b", "c"}) {
 		t.Fatalf("the collection is %v", got)
+	}
+}
+
+// hookFn is a collected func whose Validate calls it.
+type hookFn func() error
+
+func (h hookFn) Validate() error { return h() }
+
+func TestANilCollectedFuncIsntValidated(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect(r, hookFn(nil), hookFn(func() error { return nil }))
+		take[hookFn](r)
+		return nil
+	})
+	if _, err := galleon.New(base(mod)...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestACollectionNothingTakesFailsBootWhereItsFirstValueWasAdded(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect[*tag](r)
+		ptr := tag("a")
+		galleon.Collect(r, &ptr)
+		take[tag](r)
+		return nil
+	})
+	_, err := galleon.New(base(mod)...)
+	if err == nil || !strings.Contains(err.Error(), `module "orders" (`) || !strings.Contains(err.Error(), "collect_test.go:") ||
+		!strings.Contains(err.Error(), "Collect[*galleon_test.tag]: nothing takes []*galleon_test.tag") ||
+		!strings.Contains(err.Error(), "(collect galleon_test.tag values: []galleon_test.tag is what is taken)") {
+		t.Fatalf("got %v", err)
+	}
+	empty := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect[tag](r)
+		return nil
+	})
+	if _, err := galleon.New(base(empty)...); err != nil {
+		t.Fatalf("an empty collection nothing takes: %v", err)
 	}
 }
 
