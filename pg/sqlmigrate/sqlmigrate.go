@@ -62,7 +62,11 @@
 // aren't ordered otherwise: the first lease of an epoch the row hasn't seen
 // wins it. A cluster backend keeps one epoch for good; the in-process
 // backend, whose epoch is per process, serves a single node, which the
-// kernel's multi-node check enforces. A fencing table made by an earlier
+// kernel's multi-node check enforces. Its random epochs can't be ordered,
+// so if a process paused before a restart resumes and raises the fence
+// after the new process has, the new process is refused (CodeStaleEpoch)
+// until it restarts with a fresh epoch: nothing is applied twice, but
+// migrations stop until then. A fencing table made by an earlier
 // version, without the epoch or superseded columns, gains them when the
 // migrator first runs.
 //

@@ -228,3 +228,34 @@ func TestTheFakeCallsAGapBelowItsLatestAppliedStepDrift(t *testing.T) {
 		t.Fatalf("%+v, %v", st, err)
 	}
 }
+
+// epochLease is a lease of a given epoch and token.
+type epochLease struct {
+	epoch string
+	token uint64
+}
+
+func (epochLease) Key() string                   { return "" }
+func (l epochLease) Token() uint64               { return l.token }
+func (l epochLease) Epoch() string               { return l.epoch }
+func (epochLease) Renew(context.Context) error   { return nil }
+func (epochLease) Release(context.Context) error { return nil }
+func (epochLease) Lost() <-chan struct{}         { return nil }
+
+func TestTheFakeSupersedesTheEmptyEpochAsSQLMigrateDoes(t *testing.T) {
+	ctx := context.Background()
+	store := testkit.NewMigrationStore()
+	apply := func(epoch string, steps ...testkit.FakeStep) error {
+		_, err := store.Migrator("schema", steps...).Apply(ctx, migrate.ApplyOptions{Lock: epochLease{epoch, 1}, MaxRisk: migrate.Manual, AllowUnknown: true})
+		return err
+	}
+	if err := apply("", stepA); err != nil {
+		t.Fatalf("the empty epoch: %v", err)
+	}
+	if err := apply("e1", stepA, stepB); err != nil {
+		t.Fatalf("e1: %v", err)
+	}
+	if err := apply("", stepA, stepB, stepC); err == nil || !strings.Contains(err.Error(), "superseded") {
+		t.Fatalf("the empty epoch after e1: %v", err)
+	}
+}

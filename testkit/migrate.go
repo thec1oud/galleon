@@ -52,8 +52,10 @@ func (s *MigrationStore) staleLocked(name string, l coord.Lease) error {
 
 // raiseLocked moves the fence of name to lease l, which isn't stale.
 func (s *MigrationStore) raiseLocked(name string, l coord.Lease) {
-	f := s.fence[name]
-	if f.epoch != l.Epoch() && f.epoch != "" {
+	// As in pg/sqlmigrate, the first lease supersedes nothing, and any
+	// other epoch, the empty one included, is superseded when replaced.
+	f, ok := s.fence[name]
+	if ok && f.epoch != l.Epoch() {
 		f.superseded = append(f.superseded, f.epoch)
 	}
 	f.epoch, f.token = l.Epoch(), l.Token()
