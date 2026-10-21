@@ -55,7 +55,8 @@ func (r *Reference) reader(ctx context.Context, rd data.Reader) (data.Reader, er
 func (r *Reference) table() string { return data.Identifier{r.s.Schema, r.s.Table}.Sanitize() }
 
 // saved registers the side effect of saving w with the transaction the
-// save went through: q, or, taking its handle from ctx, the one there.
+// save went through: q, or, taking its handle from ctx, the one there,
+// through data.AfterCommit, as an ORM that never holds a handle would.
 func (r *Reference) saved(ctx context.Context, q data.Querier, w Widget) error {
 	fn := func(ctx context.Context) { r.s.Saved(ctx, w) }
 	if tx, ok := q.(data.WriteTx); ok && !r.FromContext {

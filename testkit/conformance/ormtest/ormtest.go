@@ -70,9 +70,10 @@ type Adapter interface {
 // Setup is what the adapter under test is configured with.
 type Setup struct {
 	// DSN is the database, as an ORM configured for it would know it. The
-	// adapter must not connect with it: the suite gives it every handle it
-	// needs, and counts the connections made with this DSN, which points at
-	// a proxy the suite watches.
+	// adapter must not connect with it, not even to check it when it is
+	// built: the suite gives it every handle it needs, and counts every
+	// connection made with this DSN, which points at a proxy the suite
+	// watches, from before the adapter is built.
 	DSN string
 	// Schema and Table are the widgets' table.
 	Schema, Table string
