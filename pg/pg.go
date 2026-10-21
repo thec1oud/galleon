@@ -291,10 +291,10 @@ func (m *Manager) Start(ctx context.Context) error {
 		// The layout matters only where replicas wait on positions. It is
 		// read here so reads can rely on it from the start, and the
 		// primary's poller tries again until it can.
-		var block, seg, align int64
-		if err := m.sources[data.PrimarySource].pool.Load().QueryRow(ctx, walLayoutSQL).Scan(&block, &seg, &align); err == nil {
-			if w, err := newWALLayout(block, seg, align); err == nil {
-				m.wal.Store(&w)
+		if m.wal.Load() == nil {
+			m.topo.layoutTried = m.topo.now()
+			if err := m.readWALLayout(ctx); err != nil {
+				m.logger().WarnContext(ctx, "the primary's WAL layout can't be read, so a write ending at a WAL page may make its ReadYourWrites reads wait for more WAL; retrying", "error", err)
 			}
 		}
 		if m.topo.maxLag < m.topo.staleAfter() {

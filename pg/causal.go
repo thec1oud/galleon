@@ -151,6 +151,34 @@ const (
 // let it be called gets no layout, and its positions stay as they are.
 const walLayoutSQL = "SELECT wal_block_size, bytes_per_wal_segment, max_data_alignment FROM pg_control_init()"
 
+// readWALLayout reads the primary's layout through one of its pool's
+// connections, as the poller does through its own: as text, by
+// parseWALLayout.
+func (m *Manager) readWALLayout(ctx context.Context) error {
+	pool := m.sources[data.PrimarySource].pool.Load()
+	if pool == nil {
+		return errUnavailable
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	res, err := conn.Conn().PgConn().Exec(ctx, walLayoutSQL).ReadAll()
+	if err != nil {
+		return err
+	}
+	if len(res) != 1 || len(res[0].Rows) != 1 {
+		return errors.New("no WAL layout")
+	}
+	w, err := parseWALLayout(res[0].Rows[0])
+	if err != nil {
+		return err
+	}
+	m.wal.Store(&w)
+	return nil
+}
+
 // parseWALLayout reads walLayoutSQL's row as text.
 func parseWALLayout(row [][]byte) (walLayout, error) {
 	if len(row) != 3 {
@@ -164,12 +192,7 @@ func parseWALLayout(row [][]byte) (walLayout, error) {
 		}
 		v[i] = n
 	}
-	return newWALLayout(v[0], v[1], v[2])
-}
-
-// newWALLayout is the layout of pages of block bytes in segments of seg,
-// aligned to align, refusing anything Postgres couldn't have.
-func newWALLayout(block, seg, align int64) (walLayout, error) {
+	block, seg, align := v[0], v[1], v[2]
 	if block <= 0 || seg < block || seg%block != 0 || align <= 0 || align&(align-1) != 0 || align > 64 {
 		return walLayout{}, fmt.Errorf("a WAL layout of %d-byte pages, %d-byte segments and %d-byte alignment", block, seg, align)
 	}
@@ -328,9 +351,10 @@ func (m *Manager) takeToken(ctx context.Context, call *op.Call, c *causal) {
 // A response with a token is the answer for one client: a shared cache
 // that kept it would hand one client's token to others. It gets
 // "Cache-Control: private, no-store" unless the call set a Cache-Control
-// of its own, which is kept if it lets only private caches store the
-// response, and replaced with "private, no-store" if it lets shared ones
-// (public, or s-maxage).
+// that already keeps shared caches out, with private (not qualified by
+// field names) or no-store. Any other, max-age, no-cache, must-revalidate,
+// immutable, public and s-maxage among them, lets a shared cache store the
+// response under RFC 9111, and is replaced.
 func (m *Manager) giveToken(call *op.Call, c *causal) {
 	if m.keys == nil || call.Response == nil || call.Response.Header == nil || !(c.wrote.Load() || c.reissue.Load()) {
 		return
@@ -339,18 +363,20 @@ func (m *Manager) giveToken(call *op.Call, c *causal) {
 	// clamps it to the primary's position.
 	h := call.Response.Header
 	h.Set(ConsistencyHeader, m.keys.sign(c.lsn.Load(), m.clock.Now()))
-	if cc := h.Values("Cache-Control"); len(cc) == 0 || sharedCacheable(cc) {
+	if !sharedCachesKeptOut(h.Values("Cache-Control")) {
 		h.Set("Cache-Control", "private, no-store")
 	}
 }
 
-// sharedCacheable reports whether Cache-Control values let a shared cache
-// store the response.
-func sharedCacheable(values []string) bool {
+// sharedCachesKeptOut reports whether Cache-Control values forbid a
+// shared cache to store the response: no-store, or private without field
+// names (private="f" only keeps those fields out).
+func sharedCachesKeptOut(values []string) bool {
 	for _, v := range values {
 		for d := range strings.SplitSeq(v, ",") {
-			name, _, _ := strings.Cut(strings.TrimSpace(d), "=")
-			if strings.EqualFold(name, "public") || strings.EqualFold(name, "s-maxage") {
+			name, arg, qualified := strings.Cut(strings.TrimSpace(d), "=")
+			name = strings.TrimSpace(name)
+			if strings.EqualFold(name, "no-store") || (strings.EqualFold(name, "private") && (!qualified || strings.Trim(strings.TrimSpace(arg), `"`) == "")) {
 				return true
 			}
 		}

@@ -560,9 +560,13 @@ func TestSpansAndMetricsNameTheReplicaAndTheFallbacks(t *testing.T) {
 	if _, ok := seen["galleon.data.replica.lag galleon.data.replica=replica_1"]; !ok {
 		t.Errorf("lag isn't observed: %v", seen)
 	}
-	if _, ok := seen["galleon.data.replica.lag_bytes galleon.data.replica=replica_1"]; !ok {
-		t.Errorf("lag in bytes isn't observed: %v", seen)
-	}
+	// Lag in bytes is known, and observed, once the tracker has a reading
+	// of the primary, which a replica in rotation by its last replayed
+	// commit alone may not have waited for.
+	until(t, "lag in bytes to be observed", func() bool {
+		_, ok := meter.observe()["galleon.data.replica.lag_bytes galleon.data.replica=replica_1"]
+		return ok
+	})
 	if meter.count("galleon.data.reads galleon.data.consistency=any galleon.data.target=replica_1") == 0 {
 		t.Errorf("reads on the replica aren't counted: %v", meter.counts)
 	}

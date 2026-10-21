@@ -237,7 +237,7 @@ func TestAnInvalidLevelFailsTheReadRatherThanFallingBack(t *testing.T) {
 		"from the call": {context.Background(), []data.ReadOption{data.Consistency(bad)}},
 	} {
 		_, err := m.BeginRead(c.ctx, c.opts...)
-		if e := errs.From(err); err == nil || e.Kind != errs.InvalidArgument || e.Code != data.CodeInvalidConsistency {
+		if e := errs.From(err); err == nil || e.Kind != errs.Internal || e.Code != data.CodeInvalidConsistency {
 			t.Errorf("%s: %v", what, err)
 		}
 	}
@@ -711,7 +711,7 @@ func TestTheFloorNeedsNoTopology(t *testing.T) {
 }
 
 // A token's response is never left for a shared cache: the call's own
-// Cache-Control stands only while it keeps shared caches out.
+// Cache-Control stands only if it has private or no-store.
 func TestATokensResponseIsNeverSharedCacheable(t *testing.T) {
 	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}, TokenKey: key})
 	if err != nil {
@@ -721,12 +721,20 @@ func TestATokensResponseIsNeverSharedCacheable(t *testing.T) {
 		set  []string
 		want string
 	}{
-		{nil, "private, no-store"},
-		{[]string{"no-cache"}, "no-cache"},
+		// Kept: they keep shared caches out.
 		{[]string{"private, max-age=10"}, "private, max-age=10"},
+		{[]string{"no-store"}, "no-store"},
+		{[]string{"max-age=0", "No-Store"}, "max-age=0"}, // Get reads the first; both stay
+		// Replaced: a shared cache may store them under RFC 9111.
+		{nil, "private, no-store"},
+		{[]string{"max-age=60"}, "private, no-store"},
+		{[]string{"no-cache"}, "private, no-store"},
+		{[]string{"must-revalidate, max-age=60"}, "private, no-store"},
+		{[]string{"max-age=31536000, immutable"}, "private, no-store"},
+		{[]string{"PUBLIC"}, "private, no-store"},
 		{[]string{"public, max-age=60"}, "private, no-store"},
 		{[]string{"max-age=60", " S-MaxAge=60"}, "private, no-store"},
-		{[]string{"PUBLIC"}, "private, no-store"},
+		{[]string{`private="Set-Cookie", max-age=60`}, "private, no-store"},
 	} {
 		for _, how := range []string{"wrote", "reissued"} {
 			cs := &causal{}
@@ -741,7 +749,8 @@ func TestATokensResponseIsNeverSharedCacheable(t *testing.T) {
 				h["Cache-Control"] = c.set
 			}
 			m.giveToken(&op.Call{Response: &op.Response{Header: h}}, cs)
-			if h.Get(ConsistencyHeader) == "" || len(h.Values("Cache-Control")) != 1 || h.Get("Cache-Control") != c.want {
+			kept := c.want != "private, no-store"
+			if h.Get(ConsistencyHeader) == "" || h.Get("Cache-Control") != c.want || (!kept && len(h.Values("Cache-Control")) != 1) || (kept && len(h.Values("Cache-Control")) != len(c.set)) {
 				t.Errorf("%s, Cache-Control %q: %q, token %q", how, c.set, h.Values("Cache-Control"), h.Get(ConsistencyHeader))
 			}
 		}
@@ -751,10 +760,7 @@ func TestATokensResponseIsNeverSharedCacheable(t *testing.T) {
 // Any token the clamp lowers is reissued at the clamped floor; one it
 // leaves isn't. It needs a Postgres to clamp against.
 func TestAClampThatLowersATokenReissuesIt(t *testing.T) {
-	dsn := os.Getenv("GALLEON_TEST_POSTGRES")
-	if dsn == "" {
-		t.Skip("GALLEON_TEST_POSTGRES is not set")
-	}
+	dsn, _ := ownDatabase(t, false)
 	m, err := New(Config{Primary: Source{DSN: dsn}, TokenKey: key})
 	if err != nil {
 		t.Fatal(err)
@@ -871,10 +877,9 @@ func TestTheWALLayoutIsReadOnlyWhenItIsWholeAndSane(t *testing.T) {
 // The primary's poller reads the WAL layout, and tries again until it can;
 // without replicas nothing reads it. It needs a primary and a replica.
 func TestThePrimarysPollerReadsTheWALLayoutUntilItCan(t *testing.T) {
-	dsn, rep := os.Getenv("GALLEON_TEST_POSTGRES"), os.Getenv("GALLEON_TEST_POSTGRES_REPLICA")
-	if dsn == "" || rep == "" {
-		t.Skip("GALLEON_TEST_POSTGRES and GALLEON_TEST_POSTGRES_REPLICA are not set")
-	}
+	// pg_control_init's grant is the database's own: the test's database
+	// keeps the change to itself.
+	dsn, rep := ownDatabase(t, true)
 	ctx := context.Background()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -922,9 +927,8 @@ func TestThePrimarysPollerReadsTheWALLayoutUntilItCan(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.Stop(ctx) })
-	// The poller tries the layout in the tick of its first sample of the
-	// primary, and its ticks run one after another: by the second sample,
-	// it has tried.
+	// Start tried the layout and couldn't; whatever the poller has tried
+	// since, by its second sample, couldn't either.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		m.topo.primary.mu.Lock()
@@ -954,5 +958,58 @@ func TestThePrimarysPollerReadsTheWALLayoutUntilItCan(t *testing.T) {
 	}
 	if alone.wal.Load() != nil {
 		t.Fatal("a Manager without replicas read the layout")
+	}
+}
+
+// ownDatabase creates a database of the test's own on GALLEON_TEST_POSTGRES,
+// dropped when it ends, and returns its DSN, and with replica, the DSN of
+// the same database on GALLEON_TEST_POSTGRES_REPLICA once the replica has
+// it. It skips the test without them.
+func ownDatabase(t *testing.T, replica bool) (string, string) {
+	t.Helper()
+	admin, rep := os.Getenv("GALLEON_TEST_POSTGRES"), os.Getenv("GALLEON_TEST_POSTGRES_REPLICA")
+	if admin == "" || (replica && rep == "") {
+		t.Skip("GALLEON_TEST_POSTGRES, and for this test GALLEON_TEST_POSTGRES_REPLICA, are not set")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	name := fmt.Sprintf("galleon_pg_%d", time.Now().UnixNano())
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), admin)
+		if err == nil {
+			_, _ = c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+			_ = c.Close(context.Background())
+		}
+	})
+	in := func(dsn string) string {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.Path = "/" + name
+		return u.String()
+	}
+	if !replica {
+		return in(admin), ""
+	}
+	repDSN := in(rep)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		c, err := pgx.Connect(ctx, repDSN)
+		if err == nil {
+			_ = c.Close(ctx)
+			return in(admin), repDSN
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the replica never had the test's database: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
