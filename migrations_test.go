@@ -410,3 +410,71 @@ func TestMigrationPolicyKeepsTheProfilesDefaultsItDoesntSet(t *testing.T) {
 		t.Fatal("the step was applied")
 	}
 }
+
+// cancelling is a stub that ends its caller's context once the Runner has
+// read its status after applying, and whose status reads honour ctx.
+type cancelling struct {
+	*stub
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (c *cancelling) Status(ctx context.Context) (migrate.Status, error) {
+	if err := ctx.Err(); err != nil {
+		return migrate.Status{}, err
+	}
+	st, err := c.stub.Status(ctx)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.up {
+		c.reads++
+		if c.reads == 1 && c.cancel != nil {
+			c.cancel() // the Runner's recheck has its answer
+		}
+	}
+	return st, err
+}
+
+func TestAnOperatorApplyUpdatesTheGatesEvenWhenItsContextEnds(t *testing.T) {
+	var mu sync.Mutex
+	var log []string
+	s := &cancelling{stub: newStub("schema", &log, &mu)}
+	mod := migratorModule("m", func(r *galleon.Registry) {
+		galleon.Migrator(r, "schema", func() migrate.Migrator { return s })
+	})
+	t.Setenv("ORDERS_MIGRATE_MODE", "verify")
+	t.Setenv("ORDERS_MIGRATE_RECHECK", "1h")
+	app, err := galleon.New(append(base(mod), galleon.Environment(galleon.Development))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer app.Shutdown(context.Background())
+	if err := app.Ready(context.Background()); err == nil {
+		t.Fatal("ready with the migration pending")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	mu.Lock()
+	s.cancel = cancel
+	mu.Unlock()
+	reps, err := app.Migrations().Apply(ctx)
+	if err != nil || reps[0].Outcome != migrate.Applied {
+		t.Fatalf("%+v, %v", reps, err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the test's context didn't end")
+	}
+	if err := app.Ready(context.Background()); err != nil {
+		t.Errorf("not ready after the apply: %v", err)
+	}
+}
+
+func TestAMigrateSectionSetOnlyInTheEnvironmentIsCheckedWithoutMigrators(t *testing.T) {
+	t.Setenv("ORDERS_MIGRATE_LOCK_TTL", "30")
+	_, err := galleon.New(base()...)
+	if err == nil || !strings.Contains(err.Error(), "lock_ttl") {
+		t.Fatalf("got %v, want an error about lock_ttl", err)
+	}
+}

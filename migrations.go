@@ -263,10 +263,9 @@ func (a *App) configureMigrations() {
 	kernel := &Registry{app: a, module: kernelModule}
 	if len(a.migratorRegs) == 0 {
 		// The section is the kernel's, so it is claimed and checked even
-		// in an app without migrators, such as one that has none yet.
-		if _, ok := a.configRaw["migrate"]; ok {
-			Config[migrateSection](kernel, "migrate")
-		}
+		// in an app without migrators, such as one that has none yet,
+		// whether it is set in the config file or only in the environment.
+		Config[migrateSection](kernel, "migrate")
 		return
 	}
 	policy := migrate.ProductionPolicy()
@@ -591,7 +590,9 @@ func (m *Migrations) Apply(ctx context.Context) ([]migrate.ApplyReport, error) {
 	m.mu.Lock()
 	refresh := m.refresh
 	m.mu.Unlock()
-	refresh(ctx)
+	// The gates show what the apply did even when the caller's ctx ended
+	// with it; each read is bounded by the gate timeout.
+	refresh(context.WithoutCancel(ctx))
 	return reps, err
 }
 

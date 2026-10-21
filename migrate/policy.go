@@ -64,8 +64,9 @@ type Policy struct {
 	// the online plan, of the changes pending on the database, as
 	// Runner.Plan(ctx, false) and WritePlans report it. An offline plan
 	// covers the whole build, so its fingerprint differs. Apply refuses any
-	// other plan; a migrator with nothing pending has no plan to check; and
-	// a migrator that can't plan can't be pinned.
+	// other plan, and an empty plan where the status is Pending, since what
+	// it would apply is in no plan; a migrator with nothing pending has no
+	// plan to check; and a migrator that can't plan can't be pinned.
 	Approved map[string]string
 	// LockTTL is the lease's time to live; the Runner renews it at a quarter
 	// of that while an apply runs. The default is 30s.

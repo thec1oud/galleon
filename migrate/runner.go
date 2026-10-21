@@ -364,6 +364,12 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 			rep.Outcome, rep.Err = Refused, err
 			return rep
 		}
+		// A pending database with an empty plan would apply something no
+		// plan shows, so an approval can't vouch for it.
+		if want, pinned := r.policy.Approved[name]; pinned && len(pl.Steps()) == 0 {
+			rep.Outcome, rep.Err = Refused, errs.New(errs.FailedPrecondition, CodeFingerprintMismatch, fmt.Sprintf("migrator %q: its status is pending, but its plan is empty, so it can't be checked against the approved fingerprint %s; nothing was applied", name, want))
+			return rep
+		}
 		opts.Fingerprint = pl.Fingerprint()
 		span.SetAttributes(attrFingerprint.String(pl.Fingerprint()), attrRisk.String(pl.MaxRisk().String()))
 	} else {

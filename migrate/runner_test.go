@@ -456,6 +456,25 @@ func TestAPinnedMigratorWithNothingPendingHasNoMismatch(t *testing.T) {
 	}
 }
 
+// emptyPlanner plans nothing, whatever its status says.
+type emptyPlanner struct{ *fake }
+
+func (emptyPlanner) Plan(context.Context) (migrate.Plan, error) { return migrate.NewPlan("", nil), nil }
+
+func TestAPinnedMigratorThatIsPendingWithAnEmptyPlanIsRefused(t *testing.T) {
+	d := newDB()
+	m := &fake{db: d, name: "schema", steps: twoSafe}
+	p := dev
+	p.Approved = map[string]string{"schema": "a-reviewed-plan"}
+	reps, err := newRunner(t, newLocker(), p, emptyPlanner{m}).Apply(context.Background())
+	if reps[0].Outcome != migrate.Refused || !hasCode(err, migrate.CodeFingerprintMismatch) {
+		t.Fatalf("%+v, %v", reps[0], err)
+	}
+	if d.applied["schema"] != 0 {
+		t.Error("the unplanned changes were applied")
+	}
+}
+
 // held starts an apply of m that holds its lease on a fake clock, with a
 // LockTTL of 2s: the Runner renews every 500ms and gives up 1.5s after the
 // last renewal began. It returns the clock, the renewals the Runner has
