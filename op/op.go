@@ -123,6 +123,15 @@ type RateLimit struct {
 	Key    func(*Call) string
 }
 
+// ReadConsistency is a read consistency of the data plane, such as
+// data.ReadYourWrites, which an operation declares as its reads' default.
+// The operation plane only carries it, and knows nothing of the data
+// module; the data module reads it. Registration refuses a pointer with a
+// Validate method, such as a *data.Level, and validates a value that has
+// one, so a bad data.Level fails boot. A consistency of any type other than
+// data.Level fails each call that reads it.
+type ReadConsistency interface{ ConsistencyLevel() string }
+
 // Deprecation marks an operation as deprecated.
 type Deprecation struct {
 	Since   string
@@ -150,8 +159,12 @@ type Descriptor struct {
 	Errors     []string // error catalog codes the operation can return
 	Security   Security
 	Policies   Policies
-	Docs       Docs
-	Meta       map[string]any // extension point for adapters
+	// Consistency is the default read consistency of the operation's
+	// reads, such as data.ReadYourWrites; nil leaves it to the data
+	// module's config. A read that asks for a level itself wins over it.
+	Consistency ReadConsistency
+	Docs        Docs
+	Meta        map[string]any // extension point for adapters
 
 	// Adapt turns a handler into a Handler without reflection. op.Unary sets
 	// it; generated or hand-written descriptors set it with Adapter.
@@ -226,6 +239,15 @@ func (d *Descriptor) Check() []error {
 	}
 	if d.Adapt == nil {
 		errs = append(errs, fmt.Errorf("operation %q has no handler adapter: build it with op.Unary, or set Adapt to op.Adapter[In, Out]()", d.ID))
+	}
+	if v, ok := d.Consistency.(interface{ Validate() error }); ok {
+		// The data module reads a level value; a pointer to one, nil or
+		// not, it would ignore, and a nil one can't be validated.
+		if reflect.ValueOf(v).Kind() == reflect.Pointer {
+			errs = append(errs, fmt.Errorf("operation %q: its read consistency must be a level value, such as data.ReadYourWrites, not a %T", d.ID, v))
+		} else if err := v.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("operation %q: its read consistency: %w", d.ID, err))
+		}
 	}
 	s := d.Security
 	switch {

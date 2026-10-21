@@ -2,11 +2,14 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
@@ -46,6 +49,14 @@ type root struct {
 	began   []uintptr // where it began, when an operation tracks it
 	scope   *scope
 	release func() // gives a Within manager's turn back
+	// conn is the pooled connection the transaction runs on, released when
+	// it ends; nil for a Within manager's.
+	conn *pgxpool.Conn
+	// replica is the replica a read runs on, or nil.
+	replica *replica
+	// causal is the floor of the request that began it, which its commit
+	// raises.
+	causal *causal
 }
 
 // handle is one handle on a transaction. Handles are not safe for
@@ -181,6 +192,16 @@ func (m *Manager) begin(ctx context.Context, write bool, o data.Options, closure
 	default:
 		return nil, misuse(data.CodePropagation, fmt.Sprintf("unknown isolation level %q", o.Isolation))
 	}
+	if !write {
+		// Resolved and checked once, for every read, joined ones too,
+		// though only a read that begins on the primary source routes by
+		// it.
+		l, err := m.levelFor(ctx, o)
+		if err != nil {
+			return nil, err
+		}
+		o.Consistency = &l
+	}
 	src, err := m.source(o.Source)
 	if err != nil {
 		return nil, err
@@ -209,6 +230,12 @@ func (m *Manager) begin(ctx context.Context, write bool, o data.Options, closure
 		if m.within != nil && inTx {
 			return nil, misuse(data.CodePropagation, "data.Independent can't run inside a transaction of a Within manager, which has one connection")
 		}
+		if !write && enc != nil && enc.root.write && enc.state == open && m.leaks == leaksError {
+			// The classic bug (design §7.4), flagged where leaks fail
+			// calls too: in development and tests.
+			m.logger().WarnContext(ctx, "an Independent read began while a write transaction is open: it doesn't see that transaction's writes, and may run on a replica",
+				"began", firstFrame(callers()))
+		}
 		return m.beginRoot(ctx, src, write, o)
 	case data.Never:
 		if inTx {
@@ -223,36 +250,72 @@ func (m *Manager) beginRoot(ctx context.Context, src *source, write bool, o data
 	attrs := []attribute.KeyValue{
 		semconv.DBSystemNamePostgreSQL,
 		semconv.DBNamespace(src.db),
-		semconv.ServerAddress(src.host),
 		attrSource.String(src.name),
 		attrPropagation.String(o.Propagation.String()),
 		attrAccess.String(access(write)),
 	}
-	if src.port != 0 {
-		attrs = append(attrs, semconv.ServerPort(src.port))
-	}
 	if o.Isolation != "" {
 		attrs = append(attrs, attrIsolation.String(string(o.Isolation)))
 	}
+	// Only reads of the primary source have a consistency: writes and named
+	// sources have one copy of the data.
+	routed := !write && src.name == data.PrimarySource
+	var level data.Level
+	if routed {
+		level = *o.Consistency // begin resolved it
+		attrs = append(attrs, attrConsistency.String(level.String()))
+	}
 	sctx, span := m.tracer().Start(ctx, "transaction", trace.WithAttributes(attrs...))
-	r := &root{m: m, src: src, write: write, iso: o.Isolation, span: span, outer: trace.SpanContextFromContext(ctx)}
+	r := &root{m: m, src: src, write: write, iso: o.Isolation, span: span, outer: trace.SpanContextFromContext(ctx), causal: causalFrom(ctx)}
 	var tx pgx.Tx
 	var err error
+	host, port := src.host, src.port
 	switch {
 	case m.within != nil:
 		tx, err = m.within.begin(sctx, write, r)
 	default:
-		pool := src.pool.Load()
-		if pool == nil {
-			err = errUnavailable
-			break
-		}
 		opts := pgx.TxOptions{IsoLevel: pgx.TxIsoLevel(o.Isolation)}
 		if !write {
 			// The backstop for reads: the database refuses writes.
 			opts.AccessMode = pgx.ReadOnly
 		}
-		tx, err = pool.BeginTx(sctx, opts)
+		var rt routing
+		if routed && m.topo != nil {
+			rt, err = m.route(sctx, level)
+			if err != nil {
+				m.metrics.read(ctx, level, rt)
+				spanRouting(span, rt)
+				end(span, err)
+				return nil, err
+			}
+		}
+		if rt.rep != nil {
+			r.conn, tx, err = beginOn(sctx, rt.rep.src, rt.conn, opts)
+			if err != nil && ctx.Err() == nil {
+				// The tracker hasn't noticed yet; the primary has the data.
+				m.topo.markDown(rt.rep)
+				m.logger().DebugContext(ctx, "a read could not begin on its replica, and reads the primary", "replica", rt.rep.src.name, "error", err)
+				if level.FailsOnTimeout() {
+					end(span, err)
+					return nil, classify(ctx, err)
+				}
+				rt = routing{fallback: fallbackError, waited: rt.waited}
+			}
+		}
+		if rt.rep == nil {
+			r.conn, tx, err = beginOn(sctx, src, nil, opts)
+		} else {
+			r.replica = rt.rep
+			host, port = rt.rep.src.host, rt.rep.src.port
+		}
+		if routed {
+			m.metrics.read(ctx, level, rt)
+			spanRouting(span, rt)
+		}
+	}
+	span.SetAttributes(semconv.ServerAddress(host))
+	if port != 0 {
+		span.SetAttributes(semconv.ServerPort(port))
 	}
 	if err != nil {
 		end(span, err)
@@ -266,6 +329,72 @@ func (m *Manager) beginRoot(ctx context.Context, src *source, write bool, o data
 		}
 	}
 	return h, nil
+}
+
+// levelFor is a read's consistency: the call's, else the operation's (in
+// ctx), else the Manager's default. A level that fails validation, from
+// the call or from ctx, fails the read: falling back to another would read
+// at a consistency nobody asked for. It is the server's mistake, not the
+// client's, so the error is Internal; an operation's own level is checked
+// when it is registered.
+func (m *Manager) levelFor(ctx context.Context, o data.Options) (data.Level, error) {
+	l, ok := m.level, false
+	if o.Consistency != nil {
+		l, ok = *o.Consistency, true
+	} else if cl, has := data.ConsistencyFrom(ctx); has {
+		l, ok = cl, true
+	}
+	if ok {
+		if err := l.Validate(); err != nil {
+			return data.Level{}, misuse(data.CodeInvalidConsistency, err.Error())
+		}
+	}
+	return l, nil
+}
+
+// spanRouting records on a read's span where it ran and why.
+func spanRouting(span trace.Span, rt routing) {
+	if rt.rep != nil {
+		span.SetAttributes(attrReplica.String(rt.rep.src.name))
+	}
+	if rt.fallback != "" {
+		span.SetAttributes(attrFallback.String(rt.fallback))
+	}
+	if rt.waited > 0 {
+		span.SetAttributes(attrWaited.Float64(rt.waited.Seconds()))
+	}
+}
+
+// beginOn begins a transaction on conn, or on a connection it acquires from
+// src's pool, and releases the connection if that fails. Connections that
+// had died while idle, as all of a pool's do when its server restarts, are
+// replaced: nothing was sent on them, and a dead one is destroyed when it
+// is released, so the pool runs out of them.
+func beginOn(ctx context.Context, src *source, conn *pgxpool.Conn, opts pgx.TxOptions) (*pgxpool.Conn, pgx.Tx, error) {
+	for attempt := 1; ; attempt++ {
+		pool := src.pool.Load()
+		if pool == nil {
+			if conn != nil {
+				conn.Release()
+			}
+			return nil, nil, errUnavailable
+		}
+		if conn == nil {
+			var err error
+			if conn, err = pool.Acquire(ctx); err != nil {
+				return nil, nil, err
+			}
+		}
+		tx, err := conn.BeginTx(ctx, opts)
+		if err == nil {
+			return conn, tx, nil
+		}
+		conn.Release()
+		conn = nil
+		if attempt > int(pool.Config().MaxConns) || !pgconn.SafeToRetry(err) || ctx.Err() != nil {
+			return nil, nil, err
+		}
+	}
 }
 
 // begin takes the Within manager's turn and begins a savepoint as the root.
@@ -442,9 +571,14 @@ func (h *handle) commit(ctx context.Context) error {
 		p.afterRollback = append(p.afterRollback, h.afterRollback...)
 		return nil
 	}
-	err := h.tx.Commit(h.root.stmtCtx(ctx))
+	var err error
+	if h.root.write && h.root.conn != nil {
+		err = h.root.commitWrite(h.root.stmtCtx(ctx), h.tx)
+	} else {
+		err = h.tx.Commit(h.root.stmtCtx(ctx))
+	}
 	if err != nil {
-		// pgx has ended the transaction either way.
+		// The transaction has ended either way.
 		h.state = rolledBack
 		h.root.finish(h, "rollback", err)
 		run(ctx, h.afterRollback)
@@ -453,6 +587,67 @@ func (h *handle) commit(ctx context.Context) error {
 	h.state = committed
 	h.root.finish(h, "commit", nil)
 	run(ctx, h.afterCommit)
+	return nil
+}
+
+// commitSQL commits a write transaction and reads the WAL position past its
+// commit record, in one round trip: a simple query of three statements.
+// The first tells whether the transaction wrote anything, so one that only
+// read gives no causal token. COMMIT ends the transaction block, and the
+// last statement runs in a transaction of its own; if COMMIT fails, the
+// statement after it doesn't run. The insert position is never behind the
+// commit record, even with synchronous_commit off.
+const commitSQL = "SELECT pg_current_xact_id_if_assigned() IS NOT NULL; COMMIT; SELECT pg_current_wal_insert_lsn()::text"
+
+// commitWrite commits a pooled write transaction, raising the causal floor
+// of the request that began it to the commit's position when it wrote.
+//
+// The COMMIT's own result decides the outcome. If the statement after it
+// fails, as it does where pg_current_wal_insert_lsn isn't granted, or the
+// connection breaks once COMMIT has answered, the write is committed all
+// the same and Commit succeeds: failing would have the caller retry a
+// committed write. The floor is then raised as far as it goes, so the
+// request's ReadYourWrites reads go to the primary; its token carries that
+// floor, and the next request clamps it to the primary's position then.
+func (r *root) commitWrite(ctx context.Context, tx pgx.Tx) error {
+	conn := tx.Conn()
+	if conn.PgConn().TxStatus() != 'T' {
+		// A failed transaction ('E'): pgx's Commit rolls it back and
+		// says so.
+		return tx.Commit(ctx)
+	}
+	sctx, span := r.m.commitSpan(ctx, conn, commitSQL)
+	res, err := conn.PgConn().Exec(sctx, commitSQL).ReadAll()
+	committed := len(res) >= 2 && res[1].Err == nil && res[1].CommandTag.String() == "COMMIT"
+	if !committed {
+		end(span, err)
+		if err != nil {
+			// A COMMIT that failed rolled back; a broken connection is
+			// destroyed when it is released.
+			return err
+		}
+		return pgx.ErrTxCommitRollback
+	}
+	end(span, nil)
+	wrote := res[0].Err == nil && len(res[0].Rows) == 1 && string(res[0].Rows[0][0]) == "t"
+	if !wrote || r.causal == nil || r.src.name != data.PrimarySource {
+		return nil
+	}
+	lsn, perr := uint64(0), err
+	if perr == nil {
+		if len(res) == 3 && len(res[2].Rows) == 1 {
+			lsn, perr = parseLSN(string(res[2].Rows[0][0]))
+			lsn = r.m.atRecordEnd(lsn)
+		} else {
+			perr = errors.New("no position after the commit")
+		}
+	}
+	if perr != nil {
+		r.m.logger().DebugContext(ctx, "a write committed, but its WAL position couldn't be read; this request's ReadYourWrites reads go to the primary, and the next request clamps its token", "error", perr)
+		lsn = unknownFloor
+	}
+	r.causal.raise(lsn)
+	r.causal.wrote.Store(true)
 	return nil
 }
 
@@ -494,6 +689,10 @@ func (r *root) finish(h *handle, outcome string, err error) {
 	}
 	if r.release != nil {
 		r.release()
+	}
+	if r.conn != nil {
+		r.conn.Release()
+		r.conn = nil
 	}
 }
 

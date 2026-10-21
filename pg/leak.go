@@ -60,10 +60,27 @@ func (s *scope) take() []*handle {
 // reports every root transaction the call began and left open. The module
 // installs it as the outermost interceptor, so the op plane needs nothing of
 // this package.
+//
+// It also gives the call its causal floor, raised by the token the call
+// brought and by every write it commits, and its operation's default read
+// consistency, and once the call is over sends a token for the floor if
+// it committed a write, whether it then failed or not.
 func (m *Manager) track(ctx context.Context, call *op.Call, next op.Invoker) (any, error) {
+	level, err := m.declaredLevel(ctx, call.Desc)
+	if err != nil {
+		return nil, err
+	}
 	s := &scope{}
-	out, err := next(context.WithValue(ctx, scopeKey{}, s), call)
+	c := &causal{}
+	m.takeToken(ctx, call, c)
+	ictx := context.WithValue(context.WithValue(ctx, scopeKey{}, s), causalKey{}, c)
+	if level != nil {
+		ictx = data.WithConsistency(ictx, *level)
+	}
+	out, err := next(ictx, call)
 	leaked := s.take()
+	// Leaked transactions are rolled back below, and give no token.
+	m.giveToken(call, c)
 	if len(leaked) == 0 {
 		return out, err
 	}
@@ -93,4 +110,27 @@ func access(write bool) string {
 		return "write"
 	}
 	return "read"
+}
+
+// declaredLevel is the read consistency d declares, nil if none. The op
+// plane carries any op.ReadConsistency, and checks at registration only
+// what it can without knowing this module; one that isn't a data.Level
+// would otherwise be ignored, and the operation's reads run at another
+// level, so its calls fail instead, logged once per operation.
+func (m *Manager) declaredLevel(ctx context.Context, d *op.Descriptor) (*data.Level, error) {
+	if d == nil {
+		return nil, nil
+	}
+	switch l := d.Consistency.(type) {
+	case nil:
+		return nil, nil
+	case data.Level:
+		return &l, nil
+	default:
+		msg := fmt.Sprintf("operation %q declares a read consistency of type %T; it must be a data.Level, such as data.ReadYourWrites", d.ID, l)
+		if _, logged := m.foreignLevels.LoadOrStore(d.ID, true); !logged {
+			m.logger().ErrorContext(ctx, msg)
+		}
+		return nil, misuse(data.CodeInvalidConsistency, msg)
+	}
 }

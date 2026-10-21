@@ -206,6 +206,7 @@ type Call struct {
     Desc    *Descriptor
     Input   any            // set after Decode
     Request *Request       // transport-neutral view: headers/metadata, peer, binding
+    Response *Response     // headers/metadata interceptors add to the answer; nil for in-process calls
 }
 
 type Position struct{ Stage Stage; Where Where } // Before or After a stage
@@ -319,7 +320,9 @@ type Manager interface {
 }
 
 // Options: Propagation (Join, Independent, Nested, Mandatory, Never: each value is an option),
-// Consistency (Primary, ReadYourWrites, BoundedStaleness(d), Any, Snapshot(tok)) [reads only],
+// Consistency(level) [reads only]: Primary, Any, BoundedStaleness(d), ReadYourWrites[.Wait(d)][.OrFail()];
+//   Snapshot(tok) is deferred. An operation's default is Descriptor.Consistency; WithConsistency(ctx, l)
+//   carries it. The primary's source name is PrimarySource ("primary").
 // Source(name), Isolation(level), Retry(policy) [closure form only; Retry(policy).Do(ctx, fn) reruns pair code]
 
 func With(ctx context.Context, tx ReadTx) context.Context // transactions begun with ctx join or nest in tx
@@ -333,13 +336,14 @@ func From(ctx context.Context) ReadTx                    // the closure forms se
 4. A read transaction, on a replica or the primary, MUST run `READ ONLY` (`BEGIN … READ ONLY`, or `SET TRANSACTION READ ONLY`), at its requested isolation level.
 5. `AfterCommit` callbacks MUST run only after the root transaction commits, in registration order, and MUST NOT run on rollback. A callback registered on a nested handle belongs to the root, and is dropped if that handle's savepoint rolls back. `AfterRollback` callbacks run when the work they were registered with is rolled back: the root's (a failed commit included), or a nested handle's savepoint.
 6. Closure form: on SQLSTATE `40001` or `40P01`, the whole closure MUST be retried under the retry policy, when it owns the root transaction; a joined or nested closure MUST NOT retry, and its error goes to the owner. `AfterCommit` registrations from failed attempts MUST be discarded; each failed attempt is a rollback, so its `AfterRollback` callbacks run. The pair form never retries. Serialization failures and deadlocks are `Conflict` errors with a `RetryInfo` detail.
-7. `ReadYourWrites` MUST never return data older than the causal token's LSN. If no replica qualifies within the wait budget, it MUST read from the primary or fail with `Unavailable`, as the policy says.
+7. `ReadYourWrites` MUST never return data older than the causal floor: the request's own commits, and the causal token it brought. If no replica qualifies within the wait budget, it MUST read from the primary or fail with `Unavailable` (`data.consistency_timeout`), as the policy says. With no replicas, every level MUST read the primary without failing. A read that joins or nests in a transaction MUST stay on it, whatever its level. A level that fails validation, from the call's options or from ctx, MUST fail the read with `Internal` (`data.invalid_consistency`), never fall back to another level; an operation that declares one MUST fail registration where the op plane can tell, and otherwise each of its calls MUST fail the same way.
 8. A transaction open at the end of its owning request or job MUST be rolled back and reported (an error in dev and test).
 9. Two-phase commit across sources MUST be refused.
+10. A call that committed a write MUST send a causal token (`Galleon-Consistency`) when tokens are configured, even when the write's WAL position couldn't be read after its commit. A call that didn't MUST NOT, unless it reissues the token it brought, lowered to the primary's position (a read may do this). A response with a token MUST NOT be storable by a shared cache. A token that fails verification MUST be ignored, never fail the call.
 
-**Conformance:** savepoint semantics; ownership (a nested `Commit` doesn't commit the root); commit hooks on commit, rollback and retry; retry on injected serialization failures; read-only enforcement on replicas; read-your-writes against an artificially lagged replica; leak detection.
+**Conformance:** savepoint semantics; ownership (a nested `Commit` doesn't commit the root); commit hooks on commit, rollback and retry; retry on injected serialization failures; read-only enforcement; every level without replicas, and reads in write transactions staying there; causal tokens sent only after a commit and ignored when bad; read-your-writes, across requests and within one, with its wait and fail policies, against a real streaming replica whose replay the suite pauses; leak detection.
 
-**Ships with:** `galleon/pg` (pgx, a package of the core module); `testkit/conformance/datatest`; `testkit.DB` (template database per package, transaction per test, through `pg.Within`; it skips without `GALLEON_TEST_POSTGRES`, and fails without it in CI); a lag-injecting replica proxy for tests.
+**Ships with:** `galleon/pg` (pgx, a package of the core module); `testkit/conformance/datatest`; `testkit.DB` (template database per package, transaction per test, through `pg.Within`; it skips without `GALLEON_TEST_POSTGRES`, and fails without it in CI); `testkit.Replica` (the package's database on a streaming standby, `GALLEON_TEST_POSTGRES_REPLICA`, with replay to pause and resume, taking turns across packages); `testkit.Proxy`, a TCP proxy that cuts a database off and records what clients send. Pausing replay replaced the lag-injecting proxy: it lags exactly, and only when asked.
 
 ### 6.2 ORM integration
 

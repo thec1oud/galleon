@@ -94,6 +94,23 @@ type Call struct {
 	// it beforehand, skipping decode, must pass a non-nil *In.
 	Input   any
 	Request *Request
+	// Response is what the call sends back besides its output. It is nil
+	// when the transport can send nothing else, as for in-process calls.
+	Response *Response
+}
+
+// Response is the transport-neutral part of a call's answer that
+// interceptors may add to, beside the output or error.
+type Response struct {
+	// Header is sent as HTTP response headers or RPC response metadata,
+	// whether the call succeeds or fails. Transports keep the headers they
+	// set themselves over these, and drop the ones that are theirs alone,
+	// over HTTP and RPC alike: Content-Type, Content-Length,
+	// Content-Encoding, Transfer-Encoding, Connection, Keep-Alive, Upgrade,
+	// Trailer, TE, Accept-Encoding, Trailer-*, Proxy-*, Grpc-* and Connect-*
+	// headers, and keys net/http would send as trailers ("Trailer:" before
+	// them, in any case).
+	Header http.Header
 }
 
 // Invoker runs the rest of the pipeline for a call and returns its output.

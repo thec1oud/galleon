@@ -22,6 +22,16 @@
 // Transactions get a span each, and statements, batches and copies a client
 // span each, with the database semantic conventions. Statement spans carry
 // the SQL text, never its arguments.
+//
+// The primary may have streaming replicas ("replicas"). A read that begins
+// a transaction on the primary source runs on one when its read consistency
+// allows (see data.Level), chosen from the readings a background tracker
+// takes of each; writes never do. Every operation call has a causal floor:
+// the WAL position of each write it commits, read in the commit's own round
+// trip, and of the token it brought. With "token_key" set, a call that
+// committed a write sends a signed token for its floor in the
+// Galleon-Consistency response header, and a later call that brings it
+// back, to any node sharing the key, reads at least that far.
 package pg
 
 import (
@@ -40,10 +50,12 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/data"
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/op"
@@ -60,6 +72,19 @@ type Manager struct {
 	retry   data.RetryPolicy
 	leaks   string
 	within  *within
+	// topo is the primary's replicas; nil without any.
+	topo *topology
+	// level is the read consistency of reads that set none.
+	level   data.Level
+	keys    *keyring // nil without a token key
+	clock   clock.Clock
+	metrics *metrics
+	// foreignLevels is the operations already logged for declaring a read
+	// consistency that isn't a data.Level.
+	foreignLevels sync.Map
+	// wal is the primary's WAL page layout, which the primary's poller
+	// reads until it can; nil until then, and without replicas.
+	wal atomic.Pointer[walLayout]
 }
 
 var _ data.Manager = (*Manager)(nil)
@@ -125,14 +150,20 @@ type source struct {
 type Option func(*settings)
 
 type settings struct {
-	tp  trace.TracerProvider
-	log *slog.Logger
+	tp    trace.TracerProvider
+	mp    metric.MeterProvider
+	log   *slog.Logger
+	clock clock.Clock
 }
 
-// TracerProvider and Logger replace the defaults (no tracing, the default
-// logger); the module sets them from the app.
+// TracerProvider, MeterProvider, Logger and Clock replace the defaults (no
+// tracing, no metrics, the default logger, the system clock); the module
+// sets them from the app. The clock dates causal tokens; tracking replicas
+// keeps real time.
 func TracerProvider(tp trace.TracerProvider) Option { return func(s *settings) { s.tp = tp } }
+func MeterProvider(mp metric.MeterProvider) Option  { return func(s *settings) { s.mp = mp } }
 func Logger(l *slog.Logger) Option                  { return func(s *settings) { s.log = l } }
+func Clock(c clock.Clock) Option                    { return func(s *settings) { s.clock = c } }
 
 func (s *settings) defaults() {
 	if s.tp == nil {
@@ -140,6 +171,9 @@ func (s *settings) defaults() {
 	}
 	if s.log == nil {
 		s.log = slog.Default()
+	}
+	if s.clock == nil {
+		s.clock = clock.System()
 	}
 }
 
@@ -149,12 +183,11 @@ var beforePools = func() {}
 
 // New builds a Manager for cfg. It doesn't connect: Start opens the pools.
 func New(cfg Config, opts ...Option) (*Manager, error) {
-	if cfg.Leaks == "" {
-		cfg.Leaks = leaksError
-	}
-	// Validate writes the validated sources back, and the map is the
-	// caller's, perhaps shared.
+	cfg.withDefaults()
+	// Validate writes the validated sources back, and the map and slice
+	// are the caller's, perhaps shared.
 	cfg.Named = maps.Clone(cfg.Named)
+	cfg.Replicas = slices.Clone(cfg.Replicas)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("pg: %w", err)
 	}
@@ -167,21 +200,28 @@ func New(cfg Config, opts ...Option) (*Manager, error) {
 		sources: map[string]*source{},
 		retry:   cfg.retryPolicy(),
 		leaks:   cfg.Leaks,
+		level:   cfg.defaultLevel(),
+		keys:    newKeyring(cfg),
+		clock:   s.clock,
 	}
 	m.setTelemetry(s.tp, s.log)
 	beforePools()
-	add := func(name string, src Source) error {
+	build := func(name string, src Source, tracer *queryTracer) (*source, error) {
 		// Validate parsed it, but parsing reads files, such as an
 		// sslrootcert, that may have changed since.
 		pc, err := src.poolConfig()
 		if err != nil {
-			return fmt.Errorf("pg: source %q: %w", name, err)
+			return nil, fmt.Errorf("pg: source %q: %w", name, err)
 		}
-		pc.ConnConfig.Tracer = &queryTracer{m: m, source: name}
-		m.sources[name] = &source{name: name, config: pc, db: pc.ConnConfig.Database, host: pc.ConnConfig.Host, port: int(pc.ConnConfig.Port)}
-		return nil
+		pc.ConnConfig.Tracer = tracer
+		return &source{name: name, config: pc, db: pc.ConnConfig.Database, host: pc.ConnConfig.Host, port: int(pc.ConnConfig.Port)}, nil
 	}
-	if err := add(data.Primary, cfg.Primary); err != nil {
+	add := func(name string, src Source) error {
+		s, err := build(name, src, &queryTracer{m: m, source: name})
+		m.sources[name] = s
+		return err
+	}
+	if err := add(data.PrimarySource, cfg.Primary); err != nil {
 		return nil, err
 	}
 	for name, src := range cfg.Named {
@@ -190,11 +230,25 @@ func New(cfg Config, opts ...Option) (*Manager, error) {
 		}
 	}
 	m.names = sortedNames(cfg)
+	if len(cfg.Replicas) > 0 {
+		t := &topology{sel: cfg.Select, zone: cfg.Zone, maxLag: cfg.MaxLag, maxBytes: cfg.MaxLagBytes, poll: cfg.LagPoll, now: time.Now, layoutRetry: defaultLayoutRetry}
+		for _, rc := range cfg.Replicas {
+			// A replica's statements belong to the primary source, on the
+			// replica that ran them.
+			src, err := build(rc.Name, rc, &queryTracer{m: m, source: data.PrimarySource, replica: rc.Name})
+			if err != nil {
+				return nil, err
+			}
+			t.replicas = append(t.replicas, &replica{src: src, zone: rc.Zone})
+		}
+		m.topo = t
+	}
+	m.metrics = newMetrics(s.mp, m.topo)
 	return m, nil
 }
 
 func sortedNames(cfg Config) []string {
-	names := []string{data.Primary}
+	names := []string{data.PrimarySource}
 	for name := range cfg.Named {
 		names = append(names, name)
 	}
@@ -226,6 +280,31 @@ func (m *Manager) Start(ctx context.Context) error {
 			return errors.Join(fmt.Errorf("pg: source %q: %w", name, classify(ctx, err)), cerr)
 		}
 	}
+	if m.topo != nil {
+		// A replica that can't be reached doesn't stop the start: reads
+		// go to the primary until the tracker finds it healthy.
+		for _, r := range m.topo.replicas {
+			pool, err := pgxpool.NewWithConfig(ctx, r.src.config)
+			if err != nil {
+				cerr := m.closePools(context.Background())
+				return errors.Join(fmt.Errorf("pg: replica %q: %w", r.src.name, err), cerr)
+			}
+			r.src.pool.Store(pool)
+		}
+		// The layout matters only where replicas wait on positions. It is
+		// read here so reads can rely on it from the start, and the
+		// primary's poller tries again until it can.
+		if m.wal.Load() == nil {
+			m.topo.layoutTried = m.topo.now()
+			if err := m.readWALLayout(ctx); err != nil && ctx.Err() == nil {
+				m.logger().WarnContext(ctx, "the primary's WAL layout can't be read, so a write ending at a WAL page may make its ReadYourWrites reads wait for more WAL; retrying", "error", err)
+			}
+		}
+		if m.topo.maxLag < m.topo.staleAfter() {
+			m.logger().WarnContext(ctx, "max_lag is below the tracker's staleness bound, which a caught-up replica's lag can reach; caught-up replicas may leave rotation", "max_lag", m.topo.maxLag, "staleness_bound", m.topo.staleAfter())
+		}
+		m.topo.start(m, m.sources[data.PrimarySource])
+	}
 	m.started = true
 	return nil
 }
@@ -236,13 +315,25 @@ func (m *Manager) Stop(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
 	m.started = false
+	if m.topo != nil {
+		m.topo.stop()
+	}
 	return m.closePools(ctx)
 }
 
 func (m *Manager) closePools(ctx context.Context) error {
 	var errs []error
+	srcs := make([]*source, 0, len(m.names))
 	for _, name := range m.names {
-		pool := m.sources[name].pool.Swap(nil)
+		srcs = append(srcs, m.sources[name])
+	}
+	if m.topo != nil {
+		for _, r := range m.topo.replicas {
+			srcs = append(srcs, r.src)
+		}
+	}
+	for _, src := range srcs {
+		pool := src.pool.Swap(nil)
 		if pool == nil {
 			continue
 		}
@@ -251,7 +342,7 @@ func (m *Manager) closePools(ctx context.Context) error {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			errs = append(errs, fmt.Errorf("pg: closing source %q: connections still in use: %w", name, ctx.Err()))
+			errs = append(errs, fmt.Errorf("pg: closing source %q: connections still in use: %w", src.name, ctx.Err()))
 		}
 	}
 	return errors.Join(errs...)
@@ -280,7 +371,7 @@ var errUnavailable = errs.New(errs.Unavailable, data.CodeUnavailable, "the datab
 // for a Manager made with Within.
 func (m *Manager) Pool(name string) *pgxpool.Pool {
 	if name == "" {
-		name = data.Primary
+		name = data.PrimarySource
 	}
 	if src := m.sources[name]; src != nil {
 		return src.pool.Load()
@@ -290,7 +381,7 @@ func (m *Manager) Pool(name string) *pgxpool.Pool {
 
 func (m *Manager) source(name string) (*source, error) {
 	if name == "" {
-		name = data.Primary
+		name = data.PrimarySource
 	}
 	src := m.sources[name]
 	if src == nil {
@@ -326,10 +417,13 @@ func Within(tx pgx.Tx, opts ...Option) *Manager {
 	s.defaults()
 	cfg := tx.Conn().Config()
 	m := &Manager{
-		sources: map[string]*source{data.Primary: {name: data.Primary, db: cfg.Database, host: cfg.Host, port: int(cfg.Port)}},
-		names:   []string{data.Primary},
+		sources: map[string]*source{data.PrimarySource: {name: data.PrimarySource, db: cfg.Database, host: cfg.Host, port: int(cfg.Port)}},
+		names:   []string{data.PrimarySource},
 		leaks:   leaksError,
 		within:  &within{tx: tx, turn: make(chan struct{}, 1), wait: 10 * time.Second},
+		level:   defaultConsistency,
+		clock:   s.clock,
+		metrics: newMetrics(s.mp, nil),
 	}
 	m.setTelemetry(s.tp, s.log)
 	return m
@@ -339,7 +433,9 @@ func Within(tx pgx.Tx, opts ...Option) *Manager {
 // spans, for a connection the Manager didn't open itself, such as the one
 // a Within manager runs on. It uses whatever tracer provider the Manager has
 // when a statement runs.
-func (m *Manager) QueryTracer() pgx.QueryTracer { return &queryTracer{m: m, source: data.Primary} }
+func (m *Manager) QueryTracer() pgx.QueryTracer {
+	return &queryTracer{m: m, source: data.PrimarySource}
+}
 
 // ping checks the test's connection when no transaction holds it; an open
 // one is using the connection, which shows it works, and a ping then would
@@ -421,9 +517,9 @@ func Module(opts ...ModuleOption) galleon.Module {
 		}
 		cfg := galleon.Config[Config](r, "pg")
 		var m *Manager
-		galleon.Provide[*Manager](r, func(tp trace.TracerProvider, log *slog.Logger) (*Manager, error) {
+		galleon.Provide[*Manager](r, func(tp trace.TracerProvider, mp metric.MeterProvider, log *slog.Logger, clk clock.Clock) (*Manager, error) {
 			var err error
-			m, err = New(*cfg, TracerProvider(tp), Logger(log))
+			m, err = New(*cfg, TracerProvider(tp), MeterProvider(mp), Logger(log), Clock(clk))
 			return m, err
 		})
 		galleon.Provide[data.Manager](r, func(m *Manager) data.Manager { return managerView{m} })
@@ -460,4 +556,19 @@ func formatStack(pcs []uintptr) string {
 		}
 	}
 	return string(b)
+}
+
+// firstFrame is the first frame of a stack recorded by callers outside
+// this package, as "function file:line".
+func firstFrame(pcs []uintptr) string {
+	frames := runtime.CallersFrames(pcs)
+	for {
+		f, more := frames.Next()
+		if !strings.HasPrefix(f.Function, "github.com/thec1oud/galleon/pg.") {
+			return fmt.Sprintf("%s %s:%d", f.Function, f.File, f.Line)
+		}
+		if !more {
+			return ""
+		}
+	}
 }

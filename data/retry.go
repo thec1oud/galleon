@@ -122,6 +122,9 @@ const (
 	CodeStatementTimeout = "data.statement_timeout" // 57014
 	// Unavailable: the database can't be reached, or refused the session.
 	CodeUnavailable = "data.unavailable"
+	// Unavailable, retryable: a ReadYourWrites read with OrFail found no
+	// replica caught up with its causal floor within its wait.
+	CodeConsistencyTimeout = "data.consistency_timeout"
 	// Internal: the handle was used wrongly.
 	CodeTxEnded       = "data.tx_ended"      // used after Commit or Rollback
 	CodePropagation   = "data.propagation"   // Mandatory, Never, a read joined by a write, …
@@ -130,6 +133,10 @@ const (
 	CodeTxOpen        = "data.tx_open"       // a nested transaction was still open at commit
 	CodeTxLeaked      = "data.tx_leaked"     // still open when its operation ended
 	CodeUnknownSource = "data.unknown_source"
+	// CodeInvalidConsistency is a read's level that fails Level.Validate,
+	// from its options or its ctx: an Internal error, since the level is
+	// the server's.
+	CodeInvalidConsistency = "data.invalid_consistency"
 )
 
 // Retryable reports whether err is a serialization failure or a deadlock,

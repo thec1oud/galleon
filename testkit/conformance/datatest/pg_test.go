@@ -26,12 +26,19 @@ func pgOptions(t *testing.T, s datatest.Setup) []galleon.Option {
 	if s.LogLeaks {
 		leaks = "log"
 	}
-	cfg, err := json.Marshal(map[string]any{"pg": map[string]any{
+	section := map[string]any{
 		"primary":       map[string]any{"dsn": s.DSN, "max_conns": 4},
 		"named":         map[string]any{"other": map[string]any{"dsn": s.DSN, "max_conns": 2}},
 		"leaks":         leaks,
 		"retry_backoff": 1_000_000, // 1ms
-	}})
+		"token_key":     s.TokenKey,
+	}
+	if s.ReplicaDSN != "" {
+		section["replicas"] = []any{map[string]any{"dsn": s.ReplicaDSN, "max_conns": 4}}
+		section["lag_poll"] = int64(10 * time.Millisecond)
+		section["max_lag"] = int64(time.Hour)
+	}
+	cfg, err := json.Marshal(map[string]any{"pg": section})
 	if err != nil {
 		t.Fatal(err)
 	}

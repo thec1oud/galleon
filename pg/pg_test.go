@@ -200,15 +200,23 @@ func TestValidatedSourcesKeepTheirSummary(t *testing.T) {
 func TestConfigReportHidesPasswords(t *testing.T) {
 	app, err := galleon.New(galleon.Coordination(local.New()), galleon.Deploy(galleon.SingleNode),
 		galleon.Modules(pg.Module()),
-		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "postgres://app:hunter2@db/orders"}, "named": {"other": {"dsn": "postgres://app:hunter2@db/other"}}}}`)))
+		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "postgres://app:hunter2@db/orders"}, "named": {"other": {"dsn": "postgres://app:hunter2@db/other"}},
+			"replicas": [{"dsn": "postgres://app:hunter2@replica/orders", "zone": "a"}],
+			"token_key": "hunter2 hunter2 hunter2 hunter2 hunter2", "token_previous_key": "hunter2 and hunter2, the previous key"}}`)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer app.Shutdown(context.Background())
+	seen := map[string]string{}
 	for _, v := range app.ConfigReport() {
 		if strings.Contains(v.Value, "hunter2") {
 			t.Fatalf("the config report shows a password: %+v", v)
 		}
+		seen[v.Field] = v.Value
+	}
+	if !strings.Contains(seen["replicas"], "@replica:5432/orders") || seen["token_key"] != "[REDACTED]" || seen["max_lag"] != "2s" || seen["lag_poll"] != "50ms" ||
+		seen["consistency"] != "read_your_writes" || seen["select"] != "least_lag" {
+		t.Fatalf("the report: %v", seen)
 	}
 }
 

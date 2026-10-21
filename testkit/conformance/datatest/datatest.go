@@ -50,6 +50,14 @@ type Setup struct {
 	// LogLeaks asks for a leaked transaction to be logged only, as in
 	// production, rather than to fail the call.
 	LogLeaks bool
+	// ReplicaDSN, when set, is a streaming replica of DSN's database. The
+	// module must have it as the primary's only replica, track it at
+	// least every 50ms, and keep it in rotation however far behind it
+	// falls: the suite pauses its replay to make it lag.
+	ReplicaDSN string
+	// TokenKey, when set, is the key the module must sign and verify
+	// causal tokens with.
+	TokenKey string
 }
 
 // Factory installs the implementation under test.
@@ -63,22 +71,25 @@ type Factory struct {
 // seam's specification (06-seam-specifications.md, §6.1).
 func Run(t *testing.T, f Factory) {
 	t.Run("ReadTxCannotWrite", func(t *testing.T) { readTxCannotWrite(t, f) })
-	t.Run("JoinIsTheDefault", func(t *testing.T) { joinIsTheDefault(t, f) })         // rule 1
-	t.Run("Independent", func(t *testing.T) { independent(t, f) })                   // §7.4
-	t.Run("Nested", func(t *testing.T) { nested(t, f) })                             // rule 2
-	t.Run("MandatoryAndNever", func(t *testing.T) { mandatoryAndNever(t, f) })       // §7.4
-	t.Run("Ownership", func(t *testing.T) { ownership(t, f) })                       // rules 2, 3
-	t.Run("EndedHandles", func(t *testing.T) { endedHandles(t, f) })                 // rule 3
-	t.Run("CommitHooks", func(t *testing.T) { commitHooks(t, f) })                   // rule 5
-	t.Run("RetryOnInjectedFailures", func(t *testing.T) { retryOnInjected(t, f) })   // rule 6
-	t.Run("RetryOnRealConflict", func(t *testing.T) { retryOnRealConflict(t, f) })   // rule 6
-	t.Run("ReadOnlyAndIsolation", func(t *testing.T) { readOnlyAndIsolation(t, f) }) // rule 4
-	t.Run("NoTwoPhaseCommit", func(t *testing.T) { noTwoPhaseCommit(t, f) })         // rule 9
-	t.Run("LeaksFailInDevelopment", func(t *testing.T) { leaks(t, f, false) })       // rule 8
-	t.Run("LeaksAreLoggedInProduction", func(t *testing.T) { leaks(t, f, true) })    // rule 8
-	t.Run("Errors", func(t *testing.T) { errorKinds(t, f) })                         // conventions 1, 3
-	t.Run("UnreachableIsUnavailable", func(t *testing.T) { unreachable(t, f) })      // convention 3
-	t.Run("Spans", func(t *testing.T) { spans(t, f) })                               // convention 6
+	t.Run("JoinIsTheDefault", func(t *testing.T) { joinIsTheDefault(t, f) })                               // rule 1
+	t.Run("Independent", func(t *testing.T) { independent(t, f) })                                         // §7.4
+	t.Run("Nested", func(t *testing.T) { nested(t, f) })                                                   // rule 2
+	t.Run("MandatoryAndNever", func(t *testing.T) { mandatoryAndNever(t, f) })                             // §7.4
+	t.Run("Ownership", func(t *testing.T) { ownership(t, f) })                                             // rules 2, 3
+	t.Run("EndedHandles", func(t *testing.T) { endedHandles(t, f) })                                       // rule 3
+	t.Run("CommitHooks", func(t *testing.T) { commitHooks(t, f) })                                         // rule 5
+	t.Run("RetryOnInjectedFailures", func(t *testing.T) { retryOnInjected(t, f) })                         // rule 6
+	t.Run("RetryOnRealConflict", func(t *testing.T) { retryOnRealConflict(t, f) })                         // rule 6
+	t.Run("ReadOnlyAndIsolation", func(t *testing.T) { readOnlyAndIsolation(t, f) })                       // rule 4
+	t.Run("NoTwoPhaseCommit", func(t *testing.T) { noTwoPhaseCommit(t, f) })                               // rule 9
+	t.Run("LeaksFailInDevelopment", func(t *testing.T) { leaks(t, f, false) })                             // rule 8
+	t.Run("LeaksAreLoggedInProduction", func(t *testing.T) { leaks(t, f, true) })                          // rule 8
+	t.Run("Errors", func(t *testing.T) { errorKinds(t, f) })                                               // conventions 1, 3
+	t.Run("UnreachableIsUnavailable", func(t *testing.T) { unreachable(t, f) })                            // convention 3
+	t.Run("Spans", func(t *testing.T) { spans(t, f) })                                                     // convention 6
+	t.Run("ConsistencyWithoutReplicas", func(t *testing.T) { consistencyWithoutReplicas(t, f) })           // §7.4
+	t.Run("CausalTokens", func(t *testing.T) { causalTokens(t, f) })                                       // rule 10
+	t.Run("ReadYourWritesOnALaggingReplica", func(t *testing.T) { readYourWritesOnALaggingReplica(t, f) }) // rule 7
 }
 
 // env is one test's app, its Manager, and a pool outside it for checking
@@ -91,15 +102,28 @@ type env struct {
 	tp    *Recorder
 	table string
 	dsn   string
+	// replica is the replica the module has, for tests that asked for one.
+	replica *testkit.Replica
 }
 
 var tables atomic.Int64
 
 func newEnv(t *testing.T, f Factory, s Setup, opts ...galleon.Option) *env {
 	t.Helper()
+	return newEnvWith(t, f, s, false, opts...)
+}
+
+// newEnvWith is newEnv, giving the module the replica when withReplica is
+// set, or skipping the test when there is none.
+func newEnvWith(t *testing.T, f Factory, s Setup, withReplica bool, opts ...galleon.Option) *env {
+	t.Helper()
 	db := testkit.DB(t)
 	s.DSN = db.DSN()
 	e := &env{t: t, tp: &Recorder{}, dsn: s.DSN}
+	if withReplica {
+		e.replica = db.Replica(t)
+		s.ReplicaDSN = e.replica.DSN()
+	}
 	e.table = fmt.Sprintf("datatest_%d_%d", time.Now().UnixNano()%1e9, tables.Add(1))
 	pool, err := pgxpool.New(context.Background(), s.DSN)
 	if err != nil {
@@ -109,6 +133,9 @@ func newEnv(t *testing.T, f Factory, s Setup, opts ...galleon.Option) *env {
 	t.Cleanup(pool.Close)
 	e.exec("CREATE TABLE " + e.table + " (id int PRIMARY KEY, v text)")
 	t.Cleanup(func() { e.drop("TABLE", e.table) })
+	if e.replica != nil {
+		e.replica.CatchUp()
+	}
 	all := append(f.Options(t, s), galleon.TracerProvider(e.tp))
 	e.h = testkit.New(t, append(all, opts...)...)
 	e.m = testkit.Get[data.Manager](e.h)

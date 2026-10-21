@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -136,8 +137,9 @@ func (h *opHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Header:    r.Header,
 		Peer:      peerFrom(ctx),
 		Decode:    func(into any) error { return h.decode(w, r, into) },
-	}}
+	}, Response: &op.Response{Header: http.Header{}}}
 	out, err := h.x.Invoke(ctx, call)
+	addHeaders(w.Header(), call.Response.Header)
 	if err != nil {
 		status := 0
 		if errors.Is(err, errUnsupportedMediaType) {
@@ -159,6 +161,46 @@ func (h *opHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", enc.MediaType())
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// addHeaders adds the headers interceptors set for the response to dst,
+// leaving alone any dst already has, and never ones that frame the message
+// or belong to the connection or the protocol (see reservedHeader): the
+// transport owns those.
+func addHeaders(dst, src http.Header) {
+	for k, v := range src {
+		k = http.CanonicalHeaderKey(k)
+		if _, ok := dst[k]; ok || len(v) == 0 || reservedHeader(k) {
+			continue
+		}
+		dst[k] = v
+	}
+}
+
+// reservedPrefixes begin the canonical keys of headers that are the
+// transport's.
+var reservedPrefixes = []string{"Trailer-", "Proxy-", "Grpc-", "Connect-"}
+
+// reservedHeader reports whether an interceptor's response header k, in
+// canonical form, is the transport's: framing, negotiation and hop-by-hop
+// headers, trailers, and gRPC's and Connect's own. HTTP and RPC refuse the
+// same ones. A key with "Trailer:" before it, in any case, is one net/http
+// sends as a trailer; it has no canonical form.
+func reservedHeader(k string) bool {
+	switch k {
+	case "Content-Length", "Content-Encoding", "Content-Type", "Transfer-Encoding", "Connection", "Keep-Alive",
+		"Upgrade", "Trailer", "Te", "Accept-Encoding":
+		return true
+	}
+	if len(k) >= len(http.TrailerPrefix) && strings.EqualFold(k[:len(http.TrailerPrefix)], http.TrailerPrefix) {
+		return true
+	}
+	for _, p := range reservedPrefixes {
+		if strings.HasPrefix(k, p) {
+			return true
+		}
+	}
+	return false
 }
 
 var errUnsupportedMediaType = errs.New(errs.InvalidArgument, "galleon.unsupported_media_type", "the request body's media type is not supported")
