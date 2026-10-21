@@ -125,7 +125,9 @@ type RateLimit struct {
 
 // ReadConsistency is a read consistency of the data plane, such as
 // data.ReadYourWrites, which an operation declares as its reads' default.
-// The operation plane only carries it; the data module reads it.
+// The operation plane only carries it; the data module reads it. One with
+// a Validate() error method, as data.Level has, is validated at
+// registration, so a bad one fails boot.
 type ReadConsistency interface{ ConsistencyLevel() string }
 
 // Deprecation marks an operation as deprecated.
@@ -235,6 +237,11 @@ func (d *Descriptor) Check() []error {
 	}
 	if d.Adapt == nil {
 		errs = append(errs, fmt.Errorf("operation %q has no handler adapter: build it with op.Unary, or set Adapt to op.Adapter[In, Out]()", d.ID))
+	}
+	if v, ok := d.Consistency.(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("operation %q: its read consistency: %w", d.ID, err))
+		}
 	}
 	s := d.Security
 	switch {

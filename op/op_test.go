@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thec1oud/galleon/data"
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/op"
 )
@@ -125,6 +126,7 @@ func TestCheckReportsProblems(t *testing.T) {
 		"needs a protobuf service": op.Unary[In, Out]("orders.create").Public().RPC("", "Create").Describe(),
 		"a method name":            op.Unary[In, Out]("orders.create").Public().RPC("orders.v1.Orders", "Cre/ate").Describe(),
 		"positive limit":           op.Unary[In, Out]("orders.create").Public().RateLimit(0, time.Second).Describe(),
+		"its read consistency":     op.Unary[In, Out]("orders.create").Public().Consistency(data.BoundedStaleness(-time.Second)).Describe(),
 		"must be a struct":         {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[[]string](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
 		"no handler adapter":       {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}},
 		"input and output types":   {ID: "orders.create", Kind: op.KindUnary, Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},

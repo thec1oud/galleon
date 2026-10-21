@@ -78,8 +78,10 @@ type topology struct {
 	primary  history
 	now      func() time.Time
 	// layoutRetry is how long the primary's poller waits to try the WAL
-	// layout again after it couldn't read it.
+	// layout again after it couldn't read it, and layoutTried when Start
+	// last tried.
 	layoutRetry time.Duration
+	layoutTried time.Time
 
 	life   sync.Mutex
 	cancel context.CancelFunc
@@ -318,7 +320,9 @@ type poller struct {
 const defaultPollerConnectTimeout = 10 * time.Second
 
 // query runs sql, connecting first if need be, and returns its one row.
-// On an error the connection is closed, and the next query connects anew.
+// An error the server sent, such as a function the role may not call,
+// leaves the connection open for the next query; on any other the
+// connection is closed, and the next query connects anew.
 func (p *poller) query(ctx context.Context, sql string) ([][]byte, error) {
 	if p.conn == nil || p.conn.IsClosed() {
 		// pgconn bounds the connecting with the config's ConnectTimeout.
@@ -335,8 +339,6 @@ func (p *poller) query(ctx context.Context, sql string) ([][]byte, error) {
 		err = errors.New("the tracker's query returned no row")
 	}
 	if err != nil {
-		// An error the server sent leaves the connection good; any other
-		// may not have.
 		if _, sent := errors.AsType[*pgconn.PgError](err); !sent {
 			p.close()
 		}
@@ -385,8 +387,8 @@ const defaultLayoutRetry = 5 * time.Second
 func (t *topology) pollPrimary(ctx context.Context, m *Manager, src *source) {
 	p := t.newPoller(src)
 	defer p.close()
-	var next time.Time // when to try the layout again
-	warned := false
+	// Start tried the layout already, and warned if it couldn't.
+	next := t.layoutTried.Add(t.layoutRetry)
 	t.every(ctx, func(qctx context.Context) {
 		row, err := p.query(qctx, primarySQL)
 		if err != nil {
@@ -405,13 +407,10 @@ func (t *topology) pollPrimary(ctx context.Context, m *Manager, src *source) {
 		}
 		if err != nil {
 			next = t.now().Add(t.layoutRetry)
-			if !warned && ctx.Err() == nil {
-				warned = true
-				m.logger().WarnContext(ctx, "the primary's WAL layout can't be read, so a write ending at a WAL page may make its ReadYourWrites reads wait for more WAL; retrying", "error", err)
-			}
 			return
 		}
 		m.wal.Store(&w)
+		m.logger().InfoContext(ctx, "the primary's WAL layout was read")
 	})
 }
 

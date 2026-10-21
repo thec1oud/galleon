@@ -193,11 +193,14 @@ func (m *Manager) begin(ctx context.Context, write bool, o data.Options, closure
 		return nil, misuse(data.CodePropagation, fmt.Sprintf("unknown isolation level %q", o.Isolation))
 	}
 	if !write {
-		// Checked for every read, joined ones too, though only a read that
-		// begins on the primary source routes by it.
-		if _, err := m.levelFor(ctx, o); err != nil {
+		// Resolved and checked once, for every read, joined ones too,
+		// though only a read that begins on the primary source routes by
+		// it.
+		l, err := m.levelFor(ctx, o)
+		if err != nil {
 			return nil, err
 		}
+		o.Consistency = &l
 	}
 	src, err := m.source(o.Source)
 	if err != nil {
@@ -259,10 +262,7 @@ func (m *Manager) beginRoot(ctx context.Context, src *source, write bool, o data
 	routed := !write && src.name == data.PrimarySource
 	var level data.Level
 	if routed {
-		var err error
-		if level, err = m.levelFor(ctx, o); err != nil {
-			return nil, err
-		}
+		level = *o.Consistency // begin resolved it
 		attrs = append(attrs, attrConsistency.String(level.String()))
 	}
 	sctx, span := m.tracer().Start(ctx, "transaction", trace.WithAttributes(attrs...))
@@ -333,8 +333,10 @@ func (m *Manager) beginRoot(ctx context.Context, src *source, write bool, o data
 
 // levelFor is a read's consistency: the call's, else the operation's (in
 // ctx), else the Manager's default. A level that fails validation, from
-// the call or from ctx, fails the read with InvalidArgument: falling back
-// to another would read at a consistency nobody asked for.
+// the call or from ctx, fails the read: falling back to another would read
+// at a consistency nobody asked for. It is the server's mistake, not the
+// client's, so the error is Internal; an operation's own level is checked
+// when it is registered.
 func (m *Manager) levelFor(ctx context.Context, o data.Options) (data.Level, error) {
 	l, ok := m.level, false
 	if o.Consistency != nil {
@@ -344,7 +346,7 @@ func (m *Manager) levelFor(ctx context.Context, o data.Options) (data.Level, err
 	}
 	if ok {
 		if err := l.Validate(); err != nil {
-			return data.Level{}, errs.New(errs.InvalidArgument, data.CodeInvalidConsistency, err.Error())
+			return data.Level{}, misuse(data.CodeInvalidConsistency, err.Error())
 		}
 	}
 	return l, nil

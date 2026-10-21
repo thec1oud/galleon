@@ -134,7 +134,8 @@ const (
 	CodeTxLeaked      = "data.tx_leaked"     // still open when its operation ended
 	CodeUnknownSource = "data.unknown_source"
 	// CodeInvalidConsistency is a read's level that fails Level.Validate,
-	// from its options or its ctx: an InvalidArgument error.
+	// from its options or its ctx: an Internal error, since the level is
+	// the server's.
 	CodeInvalidConsistency = "data.invalid_consistency"
 )
 
