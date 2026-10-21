@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -208,15 +211,35 @@ func TestTheCallsLevelWinsOverTheOperationsAndTheConfigs(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if l := m.levelFor(ctx, data.ReadOptions()); l != data.Any {
+	if l, _ := m.levelFor(ctx, data.ReadOptions()); l != data.Any {
 		t.Errorf("config: %v", l)
 	}
 	octx := data.WithConsistency(ctx, data.BoundedStaleness(time.Second))
-	if l := m.levelFor(octx, data.ReadOptions()); l != data.BoundedStaleness(time.Second) {
+	if l, _ := m.levelFor(octx, data.ReadOptions()); l != data.BoundedStaleness(time.Second) {
 		t.Errorf("operation: %v", l)
 	}
-	if l := m.levelFor(octx, data.ReadOptions(data.Consistency(data.Primary))); l != data.Primary {
+	if l, _ := m.levelFor(octx, data.ReadOptions(data.Consistency(data.Primary))); l != data.Primary {
 		t.Errorf("call: %v", l)
+	}
+}
+
+func TestAnInvalidLevelFailsTheReadRatherThanFallingBack(t *testing.T) {
+	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}, Consistency: "any"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := data.BoundedStaleness(-time.Second)
+	for what, c := range map[string]struct {
+		ctx  context.Context
+		opts []data.ReadOption
+	}{
+		"from ctx":      {data.WithConsistency(context.Background(), bad), nil},
+		"from the call": {context.Background(), []data.ReadOption{data.Consistency(bad)}},
+	} {
+		_, err := m.BeginRead(c.ctx, c.opts...)
+		if e := errs.From(err); err == nil || e.Kind != errs.InvalidArgument || e.Code != data.CodeInvalidConsistency {
+			t.Errorf("%s: %v", what, err)
+		}
 	}
 }
 
@@ -687,18 +710,73 @@ func TestTheFloorNeedsNoTopology(t *testing.T) {
 	}
 }
 
-func TestATokensResponseKeepsTheCallsOwnCacheControl(t *testing.T) {
+// A token's response is never left for a shared cache: the call's own
+// Cache-Control stands only while it keeps shared caches out.
+func TestATokensResponseIsNeverSharedCacheable(t *testing.T) {
 	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}, TokenKey: key})
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &causal{}
-	c.raise(7)
-	c.wrote.Store(true)
-	call := &op.Call{Response: &op.Response{Header: http.Header{"Cache-Control": {"no-cache"}}}}
-	m.giveToken(call, c)
-	if call.Response.Header.Get(ConsistencyHeader) == "" || call.Response.Header.Get("Cache-Control") != "no-cache" {
-		t.Fatalf("%v", call.Response.Header)
+	for _, c := range []struct {
+		set  []string
+		want string
+	}{
+		{nil, "private, no-store"},
+		{[]string{"no-cache"}, "no-cache"},
+		{[]string{"private, max-age=10"}, "private, max-age=10"},
+		{[]string{"public, max-age=60"}, "private, no-store"},
+		{[]string{"max-age=60", " S-MaxAge=60"}, "private, no-store"},
+		{[]string{"PUBLIC"}, "private, no-store"},
+	} {
+		for _, how := range []string{"wrote", "reissued"} {
+			cs := &causal{}
+			cs.raise(7)
+			if how == "wrote" {
+				cs.wrote.Store(true)
+			} else {
+				cs.reissue.Store(true)
+			}
+			h := http.Header{}
+			if c.set != nil {
+				h["Cache-Control"] = c.set
+			}
+			m.giveToken(&op.Call{Response: &op.Response{Header: h}}, cs)
+			if h.Get(ConsistencyHeader) == "" || len(h.Values("Cache-Control")) != 1 || h.Get("Cache-Control") != c.want {
+				t.Errorf("%s, Cache-Control %q: %q, token %q", how, c.set, h.Values("Cache-Control"), h.Get(ConsistencyHeader))
+			}
+		}
+	}
+}
+
+// Any token the clamp lowers is reissued at the clamped floor; one it
+// leaves isn't. It needs a Postgres to clamp against.
+func TestAClampThatLowersATokenReissuesIt(t *testing.T) {
+	dsn := os.Getenv("GALLEON_TEST_POSTGRES")
+	if dsn == "" {
+		t.Skip("GALLEON_TEST_POSTGRES is not set")
+	}
+	m, err := New(Config{Primary: Source{DSN: dsn}, TokenKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(context.Background()) })
+	cur, err := m.primaryLSN(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		tok     uint64
+		reissue bool
+	}{{cur + 1<<30, true}, {unknownFloor, true}, {cur, false}, {1, false}} {
+		cs := &causal{}
+		cs.pending.Store(c.tok)
+		got := m.floor(context.WithValue(context.Background(), causalKey{}, cs))
+		if cs.reissue.Load() != c.reissue || got > max(c.tok, cur) || (c.reissue && got > cur+1<<20) {
+			t.Errorf("a token at %d: floor %d, reissued %v", c.tok, got, cs.reissue.Load())
+		}
 	}
 }
 
@@ -764,5 +842,117 @@ func TestLogsSayUnknownLagIsUnknown(t *testing.T) {
 	rd = &reading{lag: time.Second, lagBytes: 10}
 	if lagAttr(rd) != time.Second || lagBytesAttr(rd) != int64(10) {
 		t.Errorf("%v, %v", lagAttr(rd), lagBytesAttr(rd))
+	}
+}
+
+func TestTheWALLayoutIsReadOnlyWhenItIsWholeAndSane(t *testing.T) {
+	w, err := parseWALLayout([][]byte{[]byte("8192"), []byte("16777216"), []byte("8")})
+	if err != nil || w != (walLayout{block: 8192, seg: 16 << 20, short: 24, long: 40}) {
+		t.Fatalf("%+v, %v", w, err)
+	}
+	if w, err := parseWALLayout([][]byte{[]byte("8192"), []byte("16777216"), []byte("4")}); err != nil || w.short != 20 || w.long != 36 {
+		t.Fatalf("aligned to 4: %+v, %v", w, err)
+	}
+	for what, row := range map[string][][]byte{
+		"no row":              nil,
+		"no alignment":        {[]byte("8192"), []byte("16777216")},
+		"a null alignment":    {[]byte("8192"), []byte("16777216"), nil},
+		"a zero page":         {[]byte("0"), []byte("16777216"), []byte("8")},
+		"segments of no page": {[]byte("8192"), []byte("10000"), []byte("8")},
+		"an odd alignment":    {[]byte("8192"), []byte("16777216"), []byte("6")},
+		"not a number":        {[]byte("8kB"), []byte("16777216"), []byte("8")},
+	} {
+		if _, err := parseWALLayout(row); err == nil {
+			t.Errorf("%s: a layout", what)
+		}
+	}
+}
+
+// The primary's poller reads the WAL layout, and tries again until it can;
+// without replicas nothing reads it. It needs a primary and a replica.
+func TestThePrimarysPollerReadsTheWALLayoutUntilItCan(t *testing.T) {
+	dsn, rep := os.Getenv("GALLEON_TEST_POSTGRES"), os.Getenv("GALLEON_TEST_POSTGRES_REPLICA")
+	if dsn == "" || rep == "" {
+		t.Skip("GALLEON_TEST_POSTGRES and GALLEON_TEST_POSTGRES_REPLICA are not set")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+
+	alone, err := New(Config{Primary: Source{DSN: dsn}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := alone.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = alone.Stop(ctx) })
+
+	// A role that may not call pg_control_init gets no layout, until it may.
+	role := fmt.Sprintf("galleon_layout_%d", time.Now().UnixNano())
+	for _, sql := range []string{"CREATE ROLE " + role + " LOGIN", "REVOKE EXECUTE ON FUNCTION pg_control_init() FROM PUBLIC"} {
+		if _, err := admin.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	granted := false
+	grant := func() {
+		if !granted {
+			granted = true
+			if _, err := admin.Exec(ctx, "GRANT EXECUTE ON FUNCTION pg_control_init() TO PUBLIC"); err != nil {
+				t.Errorf("restoring pg_control_init: %v", err)
+			}
+		}
+	}
+	t.Cleanup(func() { grant(); _, _ = admin.Exec(context.Background(), "DROP ROLE "+role) })
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.User(role)
+	m, err := New(Config{Primary: Source{DSN: u.String()}, Replicas: []Source{{DSN: rep}}, LagPoll: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.topo.layoutRetry = 20 * time.Millisecond
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(ctx) })
+	// The poller tries the layout in the tick of its first sample of the
+	// primary, and its ticks run one after another: by the second sample,
+	// it has tried.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		m.topo.primary.mu.Lock()
+		n := len(m.topo.primary.samples)
+		m.topo.primary.mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the primary's poller took no two samples")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if m.wal.Load() != nil {
+		t.Fatal("a layout without pg_control_init")
+	}
+	grant()
+	deadline = time.Now().Add(30 * time.Second)
+	for m.wal.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the poller never read the layout once it could")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if w := m.wal.Load(); w.block == 0 || w.short == 0 {
+		t.Fatalf("%+v", w)
+	}
+	if alone.wal.Load() != nil {
+		t.Fatal("a Manager without replicas read the layout")
 	}
 }

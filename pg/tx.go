@@ -192,9 +192,11 @@ func (m *Manager) begin(ctx context.Context, write bool, o data.Options, closure
 	default:
 		return nil, misuse(data.CodePropagation, fmt.Sprintf("unknown isolation level %q", o.Isolation))
 	}
-	if o.Consistency != nil {
-		if err := o.Consistency.Validate(); err != nil {
-			return nil, misuse(data.CodePropagation, err.Error())
+	if !write {
+		// Checked for every read, joined ones too, though only a read that
+		// begins on the primary source routes by it.
+		if _, err := m.levelFor(ctx, o); err != nil {
+			return nil, err
 		}
 	}
 	src, err := m.source(o.Source)
@@ -257,7 +259,10 @@ func (m *Manager) beginRoot(ctx context.Context, src *source, write bool, o data
 	routed := !write && src.name == data.PrimarySource
 	var level data.Level
 	if routed {
-		level = m.levelFor(ctx, o)
+		var err error
+		if level, err = m.levelFor(ctx, o); err != nil {
+			return nil, err
+		}
 		attrs = append(attrs, attrConsistency.String(level.String()))
 	}
 	sctx, span := m.tracer().Start(ctx, "transaction", trace.WithAttributes(attrs...))
@@ -326,16 +331,23 @@ func (m *Manager) beginRoot(ctx context.Context, src *source, write bool, o data
 	return h, nil
 }
 
-// levelFor is a read's consistency: the call's, else the operation's, else
-// the Manager's default.
-func (m *Manager) levelFor(ctx context.Context, o data.Options) data.Level {
+// levelFor is a read's consistency: the call's, else the operation's (in
+// ctx), else the Manager's default. A level that fails validation, from
+// the call or from ctx, fails the read with InvalidArgument: falling back
+// to another would read at a consistency nobody asked for.
+func (m *Manager) levelFor(ctx context.Context, o data.Options) (data.Level, error) {
+	l, ok := m.level, false
 	if o.Consistency != nil {
-		return *o.Consistency
+		l, ok = *o.Consistency, true
+	} else if cl, has := data.ConsistencyFrom(ctx); has {
+		l, ok = cl, true
 	}
-	if l, ok := data.ConsistencyFrom(ctx); ok && l.Validate() == nil {
-		return l
+	if ok {
+		if err := l.Validate(); err != nil {
+			return data.Level{}, errs.New(errs.InvalidArgument, data.CodeInvalidConsistency, err.Error())
+		}
 	}
-	return m.level
+	return l, nil
 }
 
 // spanRouting records on a read's span where it ran and why.

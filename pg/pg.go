@@ -79,8 +79,8 @@ type Manager struct {
 	keys    *keyring // nil without a token key
 	clock   clock.Clock
 	metrics *metrics
-	// wal is the primary's WAL page layout, read when it starts; nil
-	// before, or if it couldn't be read.
+	// wal is the primary's WAL page layout, which the primary's poller
+	// reads until it can; nil until then, and without replicas.
 	wal atomic.Pointer[walLayout]
 }
 
@@ -228,7 +228,7 @@ func New(cfg Config, opts ...Option) (*Manager, error) {
 	}
 	m.names = sortedNames(cfg)
 	if len(cfg.Replicas) > 0 {
-		t := &topology{sel: cfg.Select, zone: cfg.Zone, maxLag: cfg.MaxLag, maxBytes: cfg.MaxLagBytes, poll: cfg.LagPoll, now: time.Now}
+		t := &topology{sel: cfg.Select, zone: cfg.Zone, maxLag: cfg.MaxLag, maxBytes: cfg.MaxLagBytes, poll: cfg.LagPoll, now: time.Now, layoutRetry: defaultLayoutRetry}
 		for _, rc := range cfg.Replicas {
 			// A replica's statements belong to the primary source, on the
 			// replica that ran them.
@@ -276,13 +276,6 @@ func (m *Manager) Start(ctx context.Context) error {
 			cerr := m.closePools(context.Background())
 			return errors.Join(fmt.Errorf("pg: source %q: %w", name, classify(ctx, err)), cerr)
 		}
-		if name == data.PrimarySource {
-			if w, err := readWALLayout(ctx, pool); err == nil {
-				m.wal.Store(&w)
-			} else {
-				m.logger().WarnContext(ctx, "the primary's WAL layout couldn't be read; a write ending at a WAL page may make its ReadYourWrites reads wait for more WAL", "error", err)
-			}
-		}
 	}
 	if m.topo != nil {
 		// A replica that can't be reached doesn't stop the start: reads
@@ -295,8 +288,17 @@ func (m *Manager) Start(ctx context.Context) error {
 			}
 			r.src.pool.Store(pool)
 		}
+		// The layout matters only where replicas wait on positions. It is
+		// read here so reads can rely on it from the start, and the
+		// primary's poller tries again until it can.
+		var block, seg, align int64
+		if err := m.sources[data.PrimarySource].pool.Load().QueryRow(ctx, walLayoutSQL).Scan(&block, &seg, &align); err == nil {
+			if w, err := newWALLayout(block, seg, align); err == nil {
+				m.wal.Store(&w)
+			}
+		}
 		if m.topo.maxLag < m.topo.staleAfter() {
-			m.logger().WarnContext(ctx, "pg: max_lag is below the tracker's staleness bound, which a caught-up replica's lag can reach: replicas may leave rotation while caught up", "max_lag", m.topo.maxLag, "staleness_bound", m.topo.staleAfter())
+			m.logger().WarnContext(ctx, "max_lag is below the tracker's staleness bound, which a caught-up replica's lag can reach; caught-up replicas may leave rotation", "max_lag", m.topo.maxLag, "staleness_bound", m.topo.staleAfter())
 		}
 		m.topo.start(m, m.sources[data.PrimarySource])
 	}

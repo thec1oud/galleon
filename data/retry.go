@@ -133,6 +133,9 @@ const (
 	CodeTxOpen        = "data.tx_open"       // a nested transaction was still open at commit
 	CodeTxLeaked      = "data.tx_leaked"     // still open when its operation ended
 	CodeUnknownSource = "data.unknown_source"
+	// CodeInvalidConsistency is a read's level that fails Level.Validate,
+	// from its options or its ctx: an InvalidArgument error.
+	CodeInvalidConsistency = "data.invalid_consistency"
 )
 
 // Retryable reports whether err is a serialization failure or a deadlock,

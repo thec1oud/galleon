@@ -181,11 +181,18 @@ func consistencyWithoutReplicas(t *testing.T, f Factory) {
 		t.Fatal(err)
 	}
 
+	// An invalid level, from the call or from ctx, fails the read; it never
+	// reads at another level.
 	for _, l := range []data.Level{{}, data.BoundedStaleness(-time.Second), data.Any.Wait(time.Second)} {
 		_, err := e.m.BeginRead(c, data.Consistency(l))
-		wantCode(t, err, errs.Internal, data.CodePropagation)
+		wantCode(t, err, errs.InvalidArgument, data.CodeInvalidConsistency)
 		err = e.m.Read(c, func(context.Context, data.ReadTx) error { return nil }, data.Consistency(l))
-		wantCode(t, err, errs.Internal, data.CodePropagation)
+		wantCode(t, err, errs.InvalidArgument, data.CodeInvalidConsistency)
+		lc := data.WithConsistency(c, l)
+		_, err = e.m.BeginRead(lc)
+		wantCode(t, err, errs.InvalidArgument, data.CodeInvalidConsistency)
+		err = e.m.Read(lc, func(context.Context, data.ReadTx) error { return nil })
+		wantCode(t, err, errs.InvalidArgument, data.CodeInvalidConsistency)
 	}
 
 	// An operation's default consistency applies to its reads.
