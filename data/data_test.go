@@ -39,6 +39,73 @@ func TestContextCarriesTheTransaction(t *testing.T) {
 	}
 }
 
+type fakeWriteTx struct {
+	data.WriteTx
+	after []func(context.Context)
+}
+
+func (w *fakeWriteTx) AfterCommit(fn func(context.Context)) { w.after = append(w.after, fn) }
+
+func TestAnORMTakesAHandleFromContextOnlyWhereOneIs(t *testing.T) {
+	ctx := context.Background()
+	if q, ok := data.QuerierFrom(ctx); ok || q != nil {
+		t.Fatal("an empty ctx yields a Querier")
+	}
+	if r, ok := data.ReaderFrom(ctx); ok || r != nil {
+		t.Fatal("an empty ctx yields a Reader")
+	}
+	read := &fakeTx{}
+	if _, ok := data.QuerierFrom(data.With(ctx, read)); ok {
+		t.Fatal("a read transaction yields a Querier")
+	}
+	if r, ok := data.ReaderFrom(data.With(ctx, read)); !ok || r != read {
+		t.Fatal("a read transaction yields no Reader")
+	}
+	write := &fakeWriteTx{}
+	if q, ok := data.QuerierFrom(data.With(ctx, write)); !ok || q != write {
+		t.Fatal("a write transaction yields no Querier")
+	}
+	if r, ok := data.ReaderFrom(data.With(ctx, write)); !ok || r != write {
+		t.Fatal("a write transaction yields no Reader")
+	}
+}
+
+func TestAfterCommitRegistersWithTheWriteTransactionInContext(t *testing.T) {
+	w := &fakeWriteTx{}
+	ran := 0
+	if err := data.AfterCommit(data.With(context.Background(), w), func(context.Context) { ran++ }); err != nil {
+		t.Fatal(err)
+	}
+	if ran != 0 || len(w.after) != 1 {
+		t.Fatalf("ran %d times, registered %d callbacks", ran, len(w.after))
+	}
+	w.after[0](context.Background())
+	if ran != 1 {
+		t.Fatal("the registered callback isn't fn")
+	}
+}
+
+func TestAfterCommitRefusesWithoutAWriteTransactionAndNeverRunsFn(t *testing.T) {
+	ran := false
+	fn := func(context.Context) { ran = true }
+	for name, ctx := range map[string]context.Context{
+		"none": context.Background(),
+		"read": data.With(context.Background(), &fakeTx{}),
+	} {
+		err := data.AfterCommit(ctx, fn)
+		if errs.KindOf(err) != errs.Internal || errs.From(err).Code != data.CodePropagation {
+			t.Errorf("%s: got %v", name, err)
+		}
+	}
+	if ran {
+		t.Fatal("fn ran without a commit")
+	}
+	w := &fakeWriteTx{}
+	if err := data.AfterCommit(data.With(context.Background(), w), nil); errs.From(err).Code != data.CodePropagation || len(w.after) != 0 {
+		t.Fatalf("a nil callback: %v, %d registered", err, len(w.after))
+	}
+}
+
 func TestRetryDoLeavesRetriesToTheOwner(t *testing.T) {
 	runs := 0
 	fail := func(context.Context) error { runs++; return &pgconn.PgError{Code: "40001"} }

@@ -29,6 +29,12 @@
 //
 // A transaction joins the one in ctx by default (Join). The closure form puts
 // its handle in the ctx it passes on; with pairs, data.With does it.
+//
+// An ORM, query builder or repository takes the handle it is given, or the
+// one in ctx with QuerierFrom and ReaderFrom, and never opens a connection
+// or chooses a host of its own. It fires side effects with AfterCommit,
+// describes its models with ModelInfo, and marks the statements of each
+// model with ForModel, so their spans name it.
 package data
 
 import (
@@ -36,6 +42,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/thec1oud/galleon/errs"
 )
 
 // The pgx shapes the handles use.
@@ -136,4 +144,46 @@ func With(ctx context.Context, tx ReadTx) context.Context {
 func From(ctx context.Context) ReadTx {
 	tx, _ := ctx.Value(txKey{}).(ReadTx)
 	return tx
+}
+
+// QuerierFrom returns the transaction ctx carries as a Querier, for an ORM
+// or query builder that takes its handle from ctx. It reports false unless
+// the enclosing transaction writes: a read transaction, or a read view of a
+// write one, is never a Querier. Like ReaderFrom, it never begins a
+// transaction or chooses a source: with no transaction in ctx, there is no
+// handle, and no pool to fall back to.
+func QuerierFrom(ctx context.Context) (Querier, bool) {
+	tx, ok := From(ctx).(WriteTx)
+	return tx, ok
+}
+
+// ReaderFrom returns the transaction ctx carries as a Reader, whether it
+// reads or writes, or false when ctx carries none.
+func ReaderFrom(ctx context.Context) (Reader, bool) {
+	tx := From(ctx)
+	return tx, tx != nil
+}
+
+// AfterCommit registers fn with the write transaction ctx carries, to run
+// once its root commits, as WriteTx.AfterCommit does: the way an ORM fires
+// a side effect of a change, such as a hook, an event or a cache
+// invalidation, so that it never fires for a change that rolls back, and
+// fires once for a closure that was retried. The handle in ctx must still
+// be open: one that has ended has no commit ahead of it, and package pg's
+// drops fn.
+//
+// Without a write transaction in ctx, none or a read one, it refuses with
+// Internal and CodePropagation, and fn never runs: there is no commit to
+// wait for, and running fn at once would fire the side effect as if a
+// commit had happened. A nil fn is refused the same way.
+func AfterCommit(ctx context.Context, fn func(ctx context.Context)) error {
+	tx, ok := From(ctx).(WriteTx)
+	switch {
+	case fn == nil:
+		return errs.New(errs.Internal, CodePropagation, "data.AfterCommit needs a callback")
+	case !ok:
+		return errs.New(errs.Internal, CodePropagation, "data.AfterCommit needs a write transaction in ctx; without one there is no commit to run the callback after")
+	}
+	tx.AfterCommit(fn)
+	return nil
 }
