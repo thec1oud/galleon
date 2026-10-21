@@ -29,8 +29,9 @@ type Harness struct {
 
 // New builds and starts an app for t and shuts it down when t ends. The app
 // runs on a fake clock starting at Epoch, the in-process coordination backend
-// as a single node, no drain grace, and a logger that records into Logs and
-// prints them only if the test fails. opts are applied after those defaults,
+// as a single node, the Test profile (so migrators apply at boot), no drain
+// grace, and a logger that records into Logs and prints them only if the
+// test fails. opts are applied after those defaults,
 // so any of them can be overridden; use galleon.Replace to swap in fakes.
 //
 // If opts replace the logger or the clock, the app no longer uses Logs or
@@ -43,6 +44,7 @@ func New(t testing.TB, opts ...galleon.Option) *Harness {
 		galleon.Name("test"),
 		galleon.Coordination(local.New()),
 		galleon.Deploy(galleon.SingleNode),
+		galleon.Environment(galleon.Test),
 		galleon.DrainGrace(0),
 		galleon.Clock(h.Clock),
 		galleon.Logger(slog.New(slog.NewTextHandler(h.Logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
