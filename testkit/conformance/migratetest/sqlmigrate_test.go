@@ -426,8 +426,6 @@ func TestTwoAppsMigrateOnePostgresDatabaseOnce(t *testing.T) {
 	}
 }
 
-// The fence outlives the in-process backend's token counter: a new
-// process's backend starts at token 1 again, under a new epoch.
 func TestALeaseOfASupersededEpochIsRefusedWhateverItsToken(t *testing.T) {
 	ctx := context.Background()
 	pool := schemaPool(t)
@@ -488,6 +486,8 @@ INSERT INTO galleon_migrations_fence VALUES ('schema', 9)`); err != nil {
 	}
 }
 
+// The fence outlives the in-process backend's token counter: a new
+// process's backend starts at token 1 again, under a new epoch.
 func TestARestartedProcessAppliesAfterAHigherTokenWasRecorded(t *testing.T) {
 	ctx := context.Background()
 	pool := schemaPool(t)
@@ -572,5 +572,48 @@ func TestADirectApplyWithNoMaxRiskRefusesAManualFileAndCreatesNothing(t *testing
 	opts.MaxRisk = migrate.Manual
 	if _, err := newSQL(t, "schema", files, pool).Apply(ctx, opts); !hasCode(err, migrate.CodeFingerprintMismatch) || exists(t, pool, "galleon_migrations") {
 		t.Fatalf("a plan other than the approved one: %v", err)
+	}
+}
+
+func TestANodeThatWaitsLongerThanTheLeaseTTLSeesTheFirstNodesWork(t *testing.T) {
+	ctx := context.Background()
+	pool := schemaPool(t)
+	files := fstest.MapFS{"0001_slow.sql": {Data: []byte("-- galleon:risk safe\nSELECT pg_sleep(1.2); CREATE TABLE x (id int);")}}
+	locks := local.New().Locks()
+	// A TTL of 1s gives a safety deadline of 750ms: the second node waits
+	// longer than that.
+	p := migrate.Policy{MaxRisk: migrate.Manual, LockTTL: time.Second}
+	apply := func() ([]migrate.ApplyReport, error) {
+		r, err := migrate.NewRunner(migrate.Config{Locker: locks, Migrators: []migrate.Migrator{newSQL(t, "schema", files, pool)}, Policy: p})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Apply(ctx)
+	}
+	first := make(chan error, 1)
+	go func() {
+		_, err := apply()
+		first <- err
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(1.2)%' AND pid <> pg_backend_pid()").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first node never started its file")
+		}
+		time.Sleep(5 * time.Millisecond) // a poll interval, not synchronization
+	}
+	reps, err := apply()
+	if err != nil || reps[0].Outcome != migrate.AlreadyUpToDate || !reps[0].Waited {
+		t.Fatalf("the node that waited: %+v, %v", reps, err)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("the first node: %v", err)
 	}
 }

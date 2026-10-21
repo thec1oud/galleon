@@ -59,6 +59,9 @@ type fake struct {
 func (f *fake) Name() string { return f.name }
 
 func (f *fake) Status(ctx context.Context) (migrate.Status, error) {
+	if err := ctx.Err(); err != nil {
+		return migrate.Status{}, err // as a database call would
+	}
 	if f.statErr != nil {
 		return migrate.Status{}, f.statErr
 	}

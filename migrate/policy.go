@@ -69,7 +69,8 @@ type Policy struct {
 	// plan to check; and a migrator that can't plan can't be pinned.
 	Approved map[string]string
 	// LockTTL is the lease's time to live; the Runner renews it at a quarter
-	// of that while an apply runs. The default is 30s.
+	// of that while an apply runs. The default is 30s; NewRunner refuses
+	// one below MinLockTTL.
 	LockTTL time.Duration
 	// LockWait bounds how long a node waits for another node's apply
 	// before it gives up; zero waits as long as the context allows.

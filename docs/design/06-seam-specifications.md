@@ -181,7 +181,7 @@ type Counters interface {
 **Rules**
 1. **Mutual exclusion:** at most one holder of a key's lease at a time, *as judged by fencing token*. A protected resource that checks tokens MUST reject a lower token than one it has seen.
 2. Fencing tokens MUST strictly increase per key within an epoch, and a backend MUST keep its epoch across restarts unless its tokens restart too, in which case it MUST report a new one (`local` takes a random epoch per instance). A protected resource compares tokens only within an epoch; it lets a lease of an epoch it hasn't seen take over, records the epoch that was replaced, and refuses every later lease of a replaced epoch, whatever its token.
-3. `Lost()` MUST close before another node can acquire the same key, or the lease's TTL MUST be shorter than the window in which a holder can still act. The backend documents which guarantee it gives.
+3. `Lost()` MUST close before another node can acquire the same key, or the lease's TTL MUST be shorter than the window in which a holder can still act. The backend documents which guarantee it gives. A lease's TTL MUST NOT start before the `Acquire`, `TryAcquire` or `Renew` call that grants or extends it begins; it may start at any point during that call, so a holder times its deadline from before the call (after a long `Acquire`, from a `Renew` made at once).
 4. PubSub is **at-most-once**, with no ordering guarantee across publishers. Anything that needs at-least-once uses the outbox (§8), not PubSub.
 5. KV `Put` with `IfRevision` MUST be atomic compare-and-swap.
 6. `Capabilities()` MUST be honest: `local` reports `Scope: Process`; the others report `Scope: Cluster`.
