@@ -321,26 +321,45 @@ func longWait(t *testing.T, f Factory) {
 		t.Fatalf("acquire: ok=%v err=%v", ok, err)
 	}
 	const ttl = 300 * time.Millisecond
-	got := make(chan coord.Lease, 1)
-	failed := make(chan error, 1)
+	type result struct {
+		l      coord.Lease
+		waited time.Duration
+		err    error
+	}
+	got := make(chan result, 1) // buffered: the goroutine never blocks or touches t
+	asking := make(chan struct{})
 	waitCtx := ctx(t)
 	go func() {
+		start := time.Now()
+		close(asking)
 		l, err := ns[len(ns)-1].Locks().Acquire(waitCtx, "conformance/longwait", ttl)
-		if err != nil {
-			failed <- err
-			return
-		}
-		got <- l
+		got <- result{l, time.Since(start), err}
 	}()
-	time.Sleep(2 * ttl) // the holder works for longer than the waiter's TTL
+	<-asking
+	// The holder works for longer than the waiter's TTL; how long the
+	// waiter really waited is checked below.
+	time.Sleep(2 * ttl)
 	_ = held.Release(context.Background())
-	var l coord.Lease
+	var r result
 	select {
-	case l = <-got:
-	case err := <-failed:
-		t.Fatalf("waiting Acquire: %v", err)
+	case r = <-got:
 	case <-time.After(5 * time.Second):
+		// If the waiter acquires after all, release it so a shared store
+		// isn't left locked for later tests.
+		go func() {
+			if r := <-got; r.err == nil {
+				_ = r.l.Release(context.Background())
+			}
+		}()
 		t.Fatal("waiter was not woken by Release")
+	}
+	if r.err != nil {
+		t.Fatalf("waiting Acquire: %v", r.err)
+	}
+	l := r.l
+	if r.waited <= ttl {
+		_ = l.Release(context.Background())
+		t.Fatalf("the waiter waited %s, not longer than its TTL of %s: the test proves nothing", r.waited, ttl)
 	}
 	defer l.Release(context.Background())
 	select {
