@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -1011,5 +1012,47 @@ func ownDatabase(t *testing.T, replica bool) (string, string) {
 			t.Fatalf("the replica never had the test's database: %v", err)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// foreignLevel is a read consistency of another data module, which passes
+// the op plane's checks.
+type foreignLevel struct{}
+
+func (foreignLevel) ConsistencyLevel() string { return "foreign" }
+func (foreignLevel) Validate() error          { return nil }
+
+func TestACallWhoseOperationDeclaresAForeignConsistencyFails(t *testing.T) {
+	var logs strings.Builder
+	m, err := New(Config{Primary: Source{DSN: "postgres://app@primary/db"}}, Logger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lvl := data.Any
+	for _, c := range []op.ReadConsistency{foreignLevel{}, &lvl} {
+		d := &op.Descriptor{ID: "orders.list", Consistency: c}
+		for range 2 {
+			ran := false
+			_, err := m.track(context.Background(), &op.Call{Desc: d, Request: &op.Request{Header: http.Header{}}}, func(context.Context, *op.Call) (any, error) {
+				ran = true
+				return nil, nil
+			})
+			if e := errs.From(err); err == nil || e.Kind != errs.Internal || e.Code != data.CodeInvalidConsistency || ran {
+				t.Errorf("%T: %v, ran %v", c, err, ran)
+			}
+		}
+	}
+	if n := strings.Count(logs.String(), "declares a read consistency of type"); n != 1 {
+		t.Errorf("logged %d times, want once for the operation:\n%s", n, logs.String())
+	}
+	// A data.Level reaches the call's reads.
+	d := &op.Descriptor{ID: "orders.get", Consistency: data.ReadYourWrites}
+	if _, err := m.track(context.Background(), &op.Call{Desc: d, Request: &op.Request{Header: http.Header{}}}, func(ctx context.Context, _ *op.Call) (any, error) {
+		if l, ok := data.ConsistencyFrom(ctx); !ok || l != data.ReadYourWrites {
+			t.Errorf("the call's reads default to %v, %v", l, ok)
+		}
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

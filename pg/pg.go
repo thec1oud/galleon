@@ -79,6 +79,9 @@ type Manager struct {
 	keys    *keyring // nil without a token key
 	clock   clock.Clock
 	metrics *metrics
+	// foreignLevels is the operations already logged for declaring a read
+	// consistency that isn't a data.Level.
+	foreignLevels sync.Map
 	// wal is the primary's WAL page layout, which the primary's poller
 	// reads until it can; nil until then, and without replicas.
 	wal atomic.Pointer[walLayout]
@@ -293,7 +296,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		// primary's poller tries again until it can.
 		if m.wal.Load() == nil {
 			m.topo.layoutTried = m.topo.now()
-			if err := m.readWALLayout(ctx); err != nil {
+			if err := m.readWALLayout(ctx); err != nil && ctx.Err() == nil {
 				m.logger().WarnContext(ctx, "the primary's WAL layout can't be read, so a write ending at a WAL page may make its ReadYourWrites reads wait for more WAL; retrying", "error", err)
 			}
 		}

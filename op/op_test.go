@@ -117,6 +117,26 @@ func TestAdapterReturnsNilOutputOnError(t *testing.T) {
 	}
 }
 
+var lvl = data.Any
+
+func TestRegistrationTakesLevelValuesAndRefusesPointersToThem(t *testing.T) {
+	for _, c := range []op.ReadConsistency{nil, data.Primary, data.Any, data.BoundedStaleness(time.Second), data.ReadYourWrites.Wait(time.Second).OrFail()} {
+		b := op.Unary[In, Out]("orders.create").Public()
+		if c != nil {
+			b = b.Consistency(c)
+		}
+		d := b.Describe()
+		if bad := d.Check(); len(bad) != 0 {
+			t.Errorf("%v: %v", c, bad)
+		}
+	}
+	// A nil *data.Level is refused, not called.
+	d := op.Unary[In, Out]("orders.create").Public().Consistency((*data.Level)(nil)).Describe()
+	if bad := d.Check(); len(bad) != 1 || !strings.Contains(bad[0].Error(), "must be a level value") {
+		t.Errorf("a nil *data.Level: %v", bad)
+	}
+}
+
 func TestCheckReportsProblems(t *testing.T) {
 	cases := map[string]op.Descriptor{
 		"dotted lower snake case":  op.Unary[In, Out]("Orders").Public().Describe(),
@@ -126,7 +146,8 @@ func TestCheckReportsProblems(t *testing.T) {
 		"needs a protobuf service": op.Unary[In, Out]("orders.create").Public().RPC("", "Create").Describe(),
 		"a method name":            op.Unary[In, Out]("orders.create").Public().RPC("orders.v1.Orders", "Cre/ate").Describe(),
 		"positive limit":           op.Unary[In, Out]("orders.create").Public().RateLimit(0, time.Second).Describe(),
-		"its read consistency":     op.Unary[In, Out]("orders.create").Public().Consistency(data.BoundedStaleness(-time.Second)).Describe(),
+		"its read consistency:":    op.Unary[In, Out]("orders.create").Public().Consistency(data.BoundedStaleness(-time.Second)).Describe(),
+		"not a *data.Level":        op.Unary[In, Out]("orders.create").Public().Consistency(&lvl).Describe(),
 		"must be a struct":         {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[[]string](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
 		"no handler adapter":       {ID: "orders.create", Kind: op.KindUnary, Input: op.TypeOf[In](), Output: op.TypeOf[Out](), Security: op.Security{Public: true}},
 		"input and output types":   {ID: "orders.create", Kind: op.KindUnary, Security: op.Security{Public: true}, Adapt: op.Adapter[In, Out]()},
