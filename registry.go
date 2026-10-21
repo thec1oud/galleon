@@ -168,7 +168,8 @@ func Collect[T any](r *Registry, values ...T) {
 		r.app.collectionOrder = append(r.app.collectionOrder, c)
 	}
 	for _, v := range values {
-		if val, ok := any(v).(interface{ Validate() error }); ok {
+		// A nil pointer can't be validated: its Validate may dereference it.
+		if val, ok := any(v).(interface{ Validate() error }); ok && !isNil(reflect.ValueOf(&v).Elem()) {
 			if err := val.Validate(); err != nil {
 				r.errorf("Collect[%s]: %v", reflect.TypeFor[T](), err)
 				continue

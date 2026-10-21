@@ -98,6 +98,25 @@ func TestCollectedValuesAreValidatedAtBoot(t *testing.T) {
 	}
 }
 
+type checkedPtr struct{ ok bool }
+
+func (c *checkedPtr) Validate() error {
+	if !c.ok {
+		return errors.New("not ok")
+	}
+	return nil
+}
+
+func TestANilCollectedValueIsntValidated(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect(r, (*checkedPtr)(nil), &checkedPtr{ok: true})
+		return nil
+	})
+	if _, err := galleon.New(base(mod)...); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestACollectionCantBeReplaced(t *testing.T) {
 	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
 		galleon.Collect(r, tag("a"))
