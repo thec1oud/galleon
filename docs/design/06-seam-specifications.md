@@ -58,7 +58,7 @@ func (r *Registry) Middleware(mw func(http.Handler) http.Handler)
 func (r *Registry) Needs(caps ...coord.Capability)
 func (r *Registry) Gate(name string, check func(ctx context.Context) error)  // readiness gate
 func (r *Registry) Requires(modules ...string)
-func Collect[T any](r *Registry, values ...T)                        // contributions of several modules, provided as []T; Validate()d if they can
+func Collect[T any](r *Registry, values ...T)                        // contributions of several modules, provided as []T; Validate()d if they can; values nothing takes fail boot
 ```
 
 **Rules**
@@ -384,7 +384,7 @@ An ORM adapter MAY:
 
 **Rules** for Galleon's side:
 1. `QuerierFrom` MUST yield a handle only when the transaction in ctx writes; a read transaction, or a read view of a write one, MUST never yield a `Querier`. This guards the API, not SQL: a read view joined to a write transaction shares it, and the database doesn't refuse a write sent through its `Query`. Neither helper begins a transaction or chooses a source: with nothing in ctx they report absence, never a pool.
-2. `AfterCommit` MUST refuse (`Internal`, `data.propagation`) when ctx carries no write transaction, and MUST NOT run `fn` then. It refuses a handle that has ended (`data.tx_ended`) when the handle can tell, as `pg`'s can.
+2. `AfterCommit` MUST refuse (`Internal`, `data.propagation`) when ctx carries no write transaction, and MUST NOT run `fn` then. It refuses a handle that has ended (`data.tx_ended`) when the handle can tell (`data.Ender`, `Ended() bool`, which `pg`'s handles implement and wrappers should forward).
 3. The registry MUST fail boot on an invalid model (as it is collected, in `galleon.New`), two models with one name or one table, or a relation to a model that isn't registered (when it is built, at `Start`), and MUST NOT change after boot.
 4. A statement, batch or copy span whose ctx names a model carries it (`galleon.data.model`), and the registered model's table as `db.collection.name`; a copy keeps its own table, and transaction control statements name no model. No SQL text or argument is recorded for it beyond what statement spans already carry.
 

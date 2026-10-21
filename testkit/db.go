@@ -109,6 +109,10 @@ func DB(t testing.TB, opts ...DBOption) *Database {
 // PackageDSN is the DSN of the package's database, as Database.DSN is,
 // without the test's transaction DB opens, for tests that only connect to
 // it themselves. It skips the test when PostgresEnv is unset, as DB does.
+//
+// Unlike a DB's transaction, which is rolled back when the test ends, what
+// is written through it is committed, and every test of the package sees
+// it, so a test that uses it cleans up after itself.
 func PackageDSN(t testing.TB, opts ...DBOption) string {
 	t.Helper()
 	admin := adminDSN()
