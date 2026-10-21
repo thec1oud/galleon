@@ -92,11 +92,14 @@ func DevelopmentPolicy() Policy {
 	return Policy{Mode: ModeApply, MaxRisk: Manual, AllowUnknown: true}
 }
 
+// DefaultLockTTL is the LockTTL of a Policy that sets none.
+const DefaultLockTTL = 30 * time.Second
+
 func (p Policy) lockTTL() time.Duration {
 	if p.LockTTL > 0 {
 		return p.LockTTL
 	}
-	return 30 * time.Second
+	return DefaultLockTTL
 }
 
 // Ready reports whether a migrator in status s lets the node take traffic:
@@ -123,10 +126,32 @@ func (p Policy) Ready(name string, s Status) error {
 	return errs.New(errs.Unavailable, CodeNotReady, fmt.Sprintf("migrator %q: status reports no state", name))
 }
 
+// planRisk is the risk the policy takes plan pl to have: its steps'
+// highest, or Unknown when the status is pending but the plan is empty,
+// since what would be applied is in no plan.
+func planRisk(pl Plan, pending bool) Risk {
+	if len(pl.Steps()) == 0 && pending {
+		return Unknown
+	}
+	return pl.MaxRisk()
+}
+
 // check returns why the policy refuses plan pl of migrator name, or nil.
-func (p Policy) check(name string, pl Plan) error {
+// pending says the migrator's status is Pending.
+func (p Policy) check(name string, pl Plan, pending bool) error {
 	if len(pl.Steps()) == 0 {
-		return nil // nothing to apply: no plan to approve or refuse
+		if !pending {
+			return nil // nothing to apply: no plan to approve or refuse
+		}
+		// What would be applied is in no plan: an approval can't vouch
+		// for it, and its risk is unknown.
+		if want, pinned := p.Approved[name]; pinned {
+			return errs.New(errs.FailedPrecondition, CodeFingerprintMismatch, fmt.Sprintf("migrator %q: its status is pending, but its plan is empty, so it can't be checked against the approved fingerprint %s; nothing was applied", name, want))
+		}
+		if !Allowed(Unknown, p.MaxRisk, p.AllowUnknown) {
+			return errs.New(errs.FailedPrecondition, CodeRiskRefused, fmt.Sprintf("migrator %q: its status is pending, but its plan is empty, so what it would apply is of unknown risk, which needs approval (allow_unknown); nothing was applied", name))
+		}
+		return nil
 	}
 	if want, ok := p.Approved[name]; ok && want != pl.Fingerprint() {
 		return errs.New(errs.FailedPrecondition, CodeFingerprintMismatch, fmt.Sprintf("migrator %q: the plan's fingerprint is %s, but %s was approved; review the new plan and approve it", name, pl.Fingerprint(), want))

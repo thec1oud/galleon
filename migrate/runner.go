@@ -74,7 +74,7 @@ func NewRunner(cfg Config) (*Runner, error) {
 		seen[m.Name()] = true
 	}
 	if ttl := cfg.Policy.LockTTL; ttl < 0 || ttl > 0 && ttl < MinLockTTL {
-		return nil, fmt.Errorf("migrate: LockTTL is %s, but must be 0 (30s) or at least %s, so the lease can be renewed before its safety deadline", ttl, MinLockTTL)
+		return nil, fmt.Errorf("migrate: LockTTL is %s, but must be 0 (%s) or at least %s, so the lease can be renewed before its safety deadline", ttl, DefaultLockTTL, MinLockTTL)
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
@@ -191,6 +191,10 @@ type PlanReport struct {
 	// Err is why there is no plan; for a migrator without the capability,
 	// an Unimplemented error saying so.
 	Err error
+	// Risk is the risk the policy takes the plan to have: its steps'
+	// highest, or Unknown for an online plan that is empty although the
+	// status is Pending, since what Apply would do is in no plan.
+	Risk Risk
 	// Refused is why the policy would refuse the plan, or nil.
 	Refused error
 }
@@ -211,9 +215,24 @@ func (r *Runner) Plan(ctx context.Context, offline bool) []PlanReport {
 		} else {
 			err = errs.New(errs.Unimplemented, CodeNotSupported, fmt.Sprintf("plan offline: migrator %q can't plan without a database", m.Name()))
 		}
+		pending := false
+		if err == nil && !offline && len(pl.Steps()) == 0 {
+			// Apply would take an empty plan of a pending migrator as of
+			// unknown risk, so the plan says so too.
+			var st Status
+			st, err = m.Status(ctx)
+			if err != nil {
+				err = fmt.Errorf("plan: migrator %q: reading its status: %w", m.Name(), err)
+			}
+			pending = st.State == Pending
+		}
+		if err != nil {
+			pl = nil
+		}
 		rep.Plan, rep.Err = pl, err
 		if err == nil {
-			rep.Refused = r.policy.check(m.Name(), pl)
+			rep.Risk = planRisk(pl, pending)
+			rep.Refused = r.policy.check(m.Name(), pl, pending)
 		}
 		out = append(out, rep)
 	}
@@ -305,9 +324,9 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 	}()
 
 	ttl := r.policy.lockTTL()
-	// The coordination seam promises only that a lease's TTL starts during
-	// the call that grants or renews it, so the safety deadline is measured
-	// from before that call.
+	// The coordination seam promises only that a lease's TTL doesn't start
+	// before the call that grants or renews it, so the safety deadline is
+	// measured from before that call.
 	asked := r.clock.Now()
 	lease, ok, err := r.locker.TryAcquire(ctx, LockKey(name), ttl)
 	if err != nil {
@@ -317,21 +336,9 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 	if !ok {
 		rep.Waited = true
 		log.InfoContext(ctx, "another node is applying this migrator; waiting for it")
-		wctx, cancel := ctx, context.CancelFunc(func() {})
-		if r.policy.LockWait > 0 {
-			wctx, cancel = context.WithTimeout(ctx, r.policy.LockWait)
-		}
-		lease, err = r.locker.Acquire(wctx, LockKey(name), ttl)
-		cancel()
+		lease, asked, err = r.wait(ctx, name, ttl, log)
 		if err != nil {
 			rep.Outcome, rep.Err = Failed, fmt.Errorf("migrator %q: waiting for the migration lock: %w", name, err)
-			return rep
-		}
-		// The lease may have been granted at any point of a long wait, so
-		// renew it at once and measure the deadline from that renewal.
-		asked = r.clock.Now()
-		if err := r.renewAfterWait(ctx, lease, ttl); err != nil {
-			rep.Outcome, rep.Err = Failed, fmt.Errorf("migrator %q: renewing the migration lock it waited for: %w", name, err)
 			return rep
 		}
 	}
@@ -370,28 +377,18 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 			rep.Outcome, rep.Err = Failed, r.lost(actx, fmt.Errorf("migrator %q: planning: %w", name, err))
 			return rep
 		}
-		if err := r.policy.check(name, pl); err != nil {
+		risk := planRisk(pl, true)
+		span.SetAttributes(attrFingerprint.String(pl.Fingerprint()), attrRisk.String(risk.String()))
+		if err := r.policy.check(name, pl, true); err != nil {
 			rep.Outcome, rep.Err = Refused, err
 			return rep
 		}
-		// A pending database with an empty plan would apply something no
-		// plan shows: an approval can't vouch for it, and its risk is
-		// unknown.
 		if len(pl.Steps()) == 0 {
-			if want, pinned := r.policy.Approved[name]; pinned {
-				rep.Outcome, rep.Err = Refused, errs.New(errs.FailedPrecondition, CodeFingerprintMismatch, fmt.Sprintf("migrator %q: its status is pending, but its plan is empty, so it can't be checked against the approved fingerprint %s; nothing was applied", name, want))
-				return rep
-			}
-			if !Allowed(Unknown, r.policy.MaxRisk, r.policy.AllowUnknown) {
-				rep.Outcome, rep.Err = Refused, errs.New(errs.FailedPrecondition, CodeRiskRefused, fmt.Sprintf("migrator %q: its status is pending, but its plan is empty, so what it would apply is of unknown risk, which needs approval (allow_unknown); nothing was applied", name))
-				return rep
-			}
 			note := fmt.Sprintf("plan: migrator %q is pending with an empty plan, so its changes are treated as of unknown risk", name)
 			rep.Notes = append(rep.Notes, note)
 			log.WarnContext(ctx, note)
 		}
 		opts.Fingerprint = pl.Fingerprint()
-		span.SetAttributes(attrFingerprint.String(pl.Fingerprint()), attrRisk.String(pl.MaxRisk().String()))
 	} else {
 		note := fmt.Sprintf("plan: migrator %q can't plan, so its changes are treated as of unknown risk", name)
 		rep.Notes = append(rep.Notes, note)
@@ -512,23 +509,74 @@ func (r *Runner) hold(ctx context.Context, lease coord.Lease, granted time.Time,
 	}
 }
 
-// renewAfterWait renews a lease that a blocking Acquire granted, within
-// the safety deadline, and releases it if that fails.
-func (r *Runner) renewAfterWait(ctx context.Context, lease coord.Lease, ttl time.Duration) error {
-	_, safe := renewal(ttl)
-	rctx, cancel := context.WithTimeout(ctx, safe)
-	err := lease.Renew(rctx)
-	cancel()
-	if err == nil {
-		return nil
+// wait blocks for the migration lock, within LockWait, and returns the
+// lease with the time its safety deadline counts from. The lease may have
+// been granted at any point of a long wait, so it is renewed at once and
+// timed from that renewal; a lease the backend says was lost by then is
+// asked for again.
+func (r *Runner) wait(ctx context.Context, name string, ttl time.Duration, log *slog.Logger) (coord.Lease, time.Time, error) {
+	wctx, cancel := ctx, context.CancelFunc(func() {})
+	if r.policy.LockWait > 0 {
+		wctx, cancel = context.WithTimeout(ctx, r.policy.LockWait)
 	}
-	relctx, relcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer relcancel()
-	_ = lease.Release(relctx)
-	if errors.Is(err, coord.ErrLeaseLost) {
-		return errs.Wrap(err, errs.Unavailable, CodeLeaseLost, "the migration lease was lost as soon as it was granted")
+	defer cancel()
+	for {
+		lease, err := r.locker.Acquire(wctx, LockKey(name), ttl)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		renewed, err := r.renewAfterWait(ctx, lease, log)
+		if err == nil {
+			return lease, renewed, nil
+		}
+		if !errors.Is(err, coord.ErrLeaseLost) {
+			return nil, time.Time{}, fmt.Errorf("renewing the lease it waited for: %w", err)
+		}
+		log.WarnContext(ctx, "the migration lease was lost as soon as it was granted; asking for it again", "token", lease.Token())
 	}
-	return err
+}
+
+// renewAfterWait renews a lease that a blocking Acquire granted, and
+// returns when the renewal that succeeded began. Other errors than
+// coord.ErrLeaseLost are retried, at the renewal interval, until the
+// safety deadline after the first attempt. Nothing is done under the lease
+// until a renewal succeeds, so retrying risks nothing. On failure the
+// lease is released.
+func (r *Runner) renewAfterWait(ctx context.Context, lease coord.Lease, log *slog.Logger) (time.Time, error) {
+	every, safe := renewal(r.policy.lockTTL())
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	deadline := r.clock.AfterFunc(safe, cancel)
+	defer deadline.Stop()
+	for {
+		start := r.clock.Now()
+		err := lease.Renew(rctx)
+		if err == nil {
+			return start, nil
+		}
+		lost := errors.Is(err, coord.ErrLeaseLost)
+		if !lost && rctx.Err() != nil && ctx.Err() == nil {
+			err = errs.Wrap(err, errs.Unavailable, CodeLeaseLost, "the migration lease couldn't be renewed before its deadline")
+		}
+		if lost || rctx.Err() != nil {
+			relctx, relcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			if rerr := lease.Release(relctx); rerr != nil {
+				log.WarnContext(ctx, "releasing the migration lease failed; it expires on its own", "token", lease.Token(), "error", rerr)
+			}
+			relcancel()
+			return time.Time{}, err
+		}
+		log.WarnContext(ctx, "renewing the migration lease after waiting for it failed; retrying until its deadline", "token", lease.Token(), "error", err)
+		if r.renewed != nil {
+			r.renewed(err)
+		}
+		t := r.clock.NewTimer(every)
+		select {
+		case <-t.C():
+		case <-rctx.Done():
+		}
+		t.Stop()
+	}
 }
 
 // MinLockTTL is the smallest LockTTL a Runner accepts.

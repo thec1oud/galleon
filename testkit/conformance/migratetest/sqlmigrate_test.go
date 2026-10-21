@@ -598,7 +598,7 @@ func TestANodeThatWaitsLongerThanTheLeaseTTLSeesTheFirstNodesWork(t *testing.T) 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var n int
-		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(1.2)%' AND pid <> pg_backend_pid()").Scan(&n); err != nil {
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query LIKE '%pg_sleep(1.2)%' AND pid <> pg_backend_pid()").Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n > 0 {

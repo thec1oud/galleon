@@ -480,7 +480,7 @@ func TestALockTTLTooShortToRenewIsRejected(t *testing.T) {
 		p := dev
 		p.LockTTL = ttl
 		_, err := migrate.NewRunner(migrate.Config{Locker: newLocker(), Policy: p})
-		if err == nil || !strings.Contains(err.Error(), "must be 0 (30s) or at least 40ms") {
+		if want := fmt.Sprintf("must be 0 (%s) or at least %s", migrate.DefaultLockTTL, migrate.MinLockTTL); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("LockTTL %s: %v", ttl, err)
 		}
 	}
@@ -488,6 +488,31 @@ func TestALockTTLTooShortToRenewIsRejected(t *testing.T) {
 	p.LockTTL = migrate.MinLockTTL
 	if _, err := migrate.NewRunner(migrate.Config{Locker: newLocker(), Policy: p}); err != nil {
 		t.Errorf("LockTTL %s: %v", p.LockTTL, err)
+	}
+}
+
+func TestThePlanOfAPendingMigratorWithAnEmptyPlanIsOfUnknownRisk(t *testing.T) {
+	d := newDB()
+	m := emptyPlanner{&fake{db: d, name: "schema", steps: twoSafe}}
+	p := dev
+	p.AllowUnknown = false
+	plans := newRunner(t, newLocker(), p, m).Plan(context.Background(), false)
+	if plans[0].Err != nil || plans[0].Risk != migrate.Unknown || !hasCode(plans[0].Refused, migrate.CodeRiskRefused) {
+		t.Fatalf("without allow_unknown: %+v", plans[0])
+	}
+	var b strings.Builder
+	if err := migrate.WritePlans(&b, plans); err != nil || !strings.Contains(b.String(), "max risk unknown") {
+		t.Errorf("%q, %v", b.String(), err)
+	}
+	p.AllowUnknown = true
+	if plans := newRunner(t, newLocker(), p, m).Plan(context.Background(), false); plans[0].Refused != nil {
+		t.Errorf("with allow_unknown: %+v", plans[0])
+	}
+	// Up to date, an empty plan is just nothing to do.
+	d.applied["schema"] = len(twoSafe)
+	p.AllowUnknown = false
+	if plans := newRunner(t, newLocker(), p, m).Plan(context.Background(), false); plans[0].Refused != nil || plans[0].Risk != migrate.Safe {
+		t.Errorf("up to date: %+v", plans[0])
 	}
 }
 
@@ -501,7 +526,15 @@ func TestAPendingMigratorWithAnEmptyPlanIsOfUnknownRisk(t *testing.T) {
 		t.Fatalf("without allow_unknown: %+v, %v", reps[0], err)
 	}
 	p.AllowUnknown = true
-	reps, err = newRunner(t, newLocker(), p, emptyPlanner{m}).Apply(context.Background())
+	tp := &recorder{}
+	r, err := migrate.NewRunner(migrate.Config{Locker: newLocker(), Policy: p, TracerProvider: tp, Migrators: []migrate.Migrator{emptyPlanner{m}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reps, err = r.Apply(context.Background())
+	if v, _ := tp.named("migrate.apply")[0].attr("galleon.migrate.risk"); v != "unknown" {
+		t.Errorf("the apply span's risk is %q", v)
+	}
 	if err != nil || reps[0].Outcome != migrate.Applied {
 		t.Fatalf("with allow_unknown: %+v, %v", reps[0], err)
 	}
@@ -510,12 +543,19 @@ func TestAPendingMigratorWithAnEmptyPlanIsOfUnknownRisk(t *testing.T) {
 	}
 }
 
-func TestAWaitLongerThanTheSafetyDeadlineStillSeesTheOtherNodesWork(t *testing.T) {
-	d := newDB()
-	l := newLocker()
+type applied struct {
+	reps []migrate.ApplyReport
+	err  error
+}
+
+// waiting starts an apply of m that waits for another node's lock, on a
+// fake clock with a LockTTL of 2s (renewals every 500ms, a deadline 1.5s
+// after one starts). The other node holds the lock for longer than that
+// deadline, records m's changes, and releases it.
+func waiting(t *testing.T, l *locker, m *fake) (*clock.Fake, <-chan error, <-chan applied) {
+	t.Helper()
 	l.realTTL = time.Hour
-	m := &fake{db: d, name: "schema", steps: twoSafe}
-	other, err := l.Locker.Acquire(context.Background(), migrate.LockKey("schema"), time.Hour)
+	other, err := l.Locker.Acquire(context.Background(), migrate.LockKey(m.name), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,24 +566,27 @@ func TestAWaitLongerThanTheSafetyDeadlineStillSeesTheOtherNodesWork(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	type result struct {
-		reps []migrate.ApplyReport
-		err  error
-	}
-	done := make(chan result, 1)
+	renewed := make(chan error, 16)
+	migrate.OnRenewed(r, func(err error) { renewed <- err })
+	done := make(chan applied, 1)
 	go func() {
 		reps, err := r.Apply(context.Background())
-		done <- result{reps, err}
+		done <- applied{reps, err}
 	}()
 	until(t, "the runner waits for the lock", func() bool { return l.waiting() == 1 })
-	// The other node applies for longer than the 1.5s safety deadline.
 	fc.Advance(5 * time.Second)
-	d.mu.Lock()
-	d.applied["schema"] = len(twoSafe)
-	d.mu.Unlock()
+	m.db.mu.Lock()
+	m.db.applied[m.name] = len(m.steps)
+	m.db.mu.Unlock()
 	if err := other.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	return fc, renewed, done
+}
+
+func TestAWaitLongerThanTheSafetyDeadlineStillSeesTheOtherNodesWork(t *testing.T) {
+	l := newLocker()
+	_, _, done := waiting(t, l, &fake{db: newDB(), name: "schema", steps: twoSafe})
 	got := within(t, "the apply", done)
 	if got.err != nil || got.reps[0].Outcome != migrate.AlreadyUpToDate {
 		t.Fatalf("%+v, %v", got.reps, got.err)
@@ -552,6 +595,52 @@ func TestAWaitLongerThanTheSafetyDeadlineStillSeesTheOtherNodesWork(t *testing.T
 	defer l.mu.Unlock()
 	if l.renewals != 1 {
 		t.Errorf("renewed %d times after the wait, not once", l.renewals)
+	}
+}
+
+func TestALeaseLostAsSoonAsTheWaitEndsIsAskedForAgain(t *testing.T) {
+	l := newLocker()
+	l.renew = func(context.Context) error {
+		if l.renewals == 1 { // this is the first renewal
+			return coord.ErrLeaseLost
+		}
+		return nil
+	}
+	_, _, done := waiting(t, l, &fake{db: newDB(), name: "schema", steps: twoSafe})
+	got := within(t, "the apply", done)
+	if got.err != nil || got.reps[0].Outcome != migrate.AlreadyUpToDate {
+		t.Fatalf("%+v, %v", got.reps, got.err)
+	}
+	if n := l.waiting(); n != 2 {
+		t.Errorf("asked for the lock %d times after waiting, not twice", n)
+	}
+}
+
+func TestAFailedRenewalAfterTheWaitIsRetriedUntilTheDeadline(t *testing.T) {
+	l := newLocker()
+	l.flaky = 1
+	fc, renewed, done := waiting(t, l, &fake{db: newDB(), name: "schema", steps: twoSafe})
+	if err := within(t, "the first renewal", renewed); err == nil {
+		t.Fatal("the flaky renewal succeeded")
+	}
+	fc.BlockUntil(2) // the deadline and the retry's timer
+	fc.Advance(500 * time.Millisecond)
+	got := within(t, "the apply", done)
+	if got.err != nil || got.reps[0].Outcome != migrate.AlreadyUpToDate {
+		t.Fatalf("%+v, %v", got.reps, got.err)
+	}
+}
+
+func TestRenewalsAfterTheWaitThatKeepFailingGiveUpAtTheDeadline(t *testing.T) {
+	l := newLocker()
+	l.renewed = errors.New("timeout")
+	fc, renewed, done := waiting(t, l, &fake{db: newDB(), name: "schema", steps: twoSafe})
+	within(t, "the first renewal", renewed)
+	fc.BlockUntil(2)
+	fc.Advance(1500 * time.Millisecond)
+	got := within(t, "the apply", done)
+	if got.reps[0].Outcome != migrate.Failed || !hasCode(got.err, migrate.CodeLeaseLost) {
+		t.Fatalf("%+v, %v", got.reps, got.err)
 	}
 }
 

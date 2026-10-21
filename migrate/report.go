@@ -76,7 +76,7 @@ func WritePlans(w io.Writer, plans []PlanReport) error {
 			continue
 		}
 		steps := p.Plan.Steps()
-		fmt.Fprintf(&b, "%s: %d step(s), max risk %s, fingerprint %s\n", p.Name, len(steps), p.Plan.MaxRisk(), p.Plan.Fingerprint())
+		fmt.Fprintf(&b, "%s: %d step(s), max risk %s, fingerprint %s\n", p.Name, len(steps), p.Risk, p.Plan.Fingerprint())
 		for _, s := range steps {
 			fmt.Fprintf(&b, "  %s [%s] %s\n", s.ID, s.Risk, s.Description)
 		}

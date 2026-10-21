@@ -311,7 +311,7 @@ func (a *App) configureMigrations() {
 		policy.Mode = migrate.ModeVerify
 	}
 	if policy.LockTTL != 0 && policy.LockTTL < time.Second || policy.LockWait < 0 {
-		a.bootErrs = append(a.bootErrs, fmt.Errorf("migrate: the policy's LockTTL must be 0 (30s) or at least 1s, and its LockWait not negative; it has %s and %s", policy.LockTTL, policy.LockWait))
+		a.bootErrs = append(a.bootErrs, fmt.Errorf("migrate: the policy's LockTTL must be 0 (%s) or at least 1s, and its LockWait not negative; it has %s and %s", migrate.DefaultLockTTL, policy.LockTTL, policy.LockWait))
 	}
 	mg := &migrations{policy: policy, recheck: cfg.Recheck.get(5 * time.Second), applyTimeout: cfg.ApplyTimeout.get(10 * time.Minute), gates: map[string]*migrationGate{}, handle: a.migrationsHandle}
 	for name := range policy.Approved {
