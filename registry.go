@@ -145,6 +145,51 @@ func Supply[T any](r *Registry, value T) {
 	r.app.addProvider(r, p)
 }
 
+// Collect adds values to the app's collection of T, which the kernel
+// provides as []T: the values every module collected, in the order the
+// modules are installed and, within one, of the calls. Any module may add
+// to a collection; a module that consumes one calls Collect with no values,
+// so that []T is provided even when no module adds to it. Nothing else may
+// provide []T. Consumers must not modify the slice.
+//
+// An ORM adapter module, for one, registers its models with
+// galleon.Collect(r, models...), and the data module builds its model
+// registry from []data.ModelInfo.
+func Collect[T any](r *Registry, values ...T) {
+	typ := reflect.TypeFor[[]T]()
+	c, ok := r.app.collections[typ]
+	if !ok {
+		c = &collection{typ: typ, values: reflect.MakeSlice(typ, 0, len(values)), module: r.module, site: callerSite(2)}
+		r.app.collections[typ] = c
+		r.app.collectionOrder = append(r.app.collectionOrder, c)
+	}
+	for _, v := range values {
+		c.values = reflect.Append(c.values, reflect.ValueOf(&v).Elem())
+	}
+}
+
+// collection is the values modules collected of one type, which the kernel
+// provides as a slice.
+type collection struct {
+	typ          reflect.Type // []T
+	values       reflect.Value
+	module, site string // where it was first collected
+}
+
+// provideCollections provides each collection, once every module has
+// registered.
+func (a *App) provideCollections() {
+	for _, c := range a.collectionOrder {
+		if prev, ok := a.providers[c.typ]; ok {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("%s is provided by %s, but it is a collection (galleon.Collect, first by module %q, %s), which the kernel provides", c.typ, prev.describe(), c.module, c.site))
+			continue
+		}
+		p := &provider{typ: c.typ, module: kernelModule, site: c.site, value: c.values, built: true}
+		a.providers[c.typ] = p
+		a.providerOrder = append(a.providerOrder, p)
+	}
+}
+
 var errorType = reflect.TypeFor[error]()
 
 func callerSite(skip int) string {
