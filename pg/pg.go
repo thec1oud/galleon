@@ -79,6 +79,9 @@ type Manager struct {
 	keys    *keyring // nil without a token key
 	clock   clock.Clock
 	metrics *metrics
+	// foreignLevels is the operations already logged for declaring a read
+	// consistency that isn't a data.Level.
+	foreignLevels sync.Map
 	// wal is the primary's WAL page layout, which the primary's poller
 	// reads until it can; nil until then, and without replicas.
 	wal atomic.Pointer[walLayout]
