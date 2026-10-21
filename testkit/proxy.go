@@ -24,11 +24,12 @@ type Proxy struct {
 	ln     net.Listener
 	target string
 
-	mu    sync.Mutex
-	conns map[net.Conn]bool
-	cut   bool
-	msgs  []Message
-	wg    sync.WaitGroup
+	mu     sync.Mutex
+	conns  map[net.Conn]bool
+	cut    bool
+	msgs   []Message
+	opened int
+	wg     sync.WaitGroup
 }
 
 // Message is one message a client sent through a Proxy after its startup.
@@ -113,6 +114,14 @@ func (p *Proxy) Messages() []Message {
 	return append([]Message(nil), p.msgs...)
 }
 
+// Opened is how many connections clients have opened to the proxy since it
+// started, those it refused while cut and those closed since included.
+func (p *Proxy) Opened() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.opened
+}
+
 // Reset forgets the messages recorded so far.
 func (p *Proxy) Reset() {
 	p.mu.Lock()
@@ -130,6 +139,7 @@ func (p *Proxy) accept() {
 		}
 		n++
 		p.mu.Lock()
+		p.opened++
 		refuse := p.cut
 		if !refuse {
 			p.conns[client] = true
