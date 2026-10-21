@@ -43,9 +43,10 @@
 // (DPG-E058, DPG-E057) for a person to drop or rename, since neither is
 // DPG's to drop. That drop isn't in the plan, nor in
 // its fingerprint: it is DPG's, like its ledger's records, and runs only
-// when finishing a migration. A cancelled build may go on for a while on
-// the server; the drop waits for it, and a build that completes first
-// leaves a valid index, taken as built. Two statements DPG may run
+// when finishing a migration. A cancelled build may go on on the server:
+// pgx stops waiting and closes the connection without asking the server
+// to cancel the statement. The drop waits for it, and a build that
+// completes first leaves a valid index, taken as built. Two statements DPG may run
 // after a transaction still aren't: CREATE SUBSCRIPTION, and ALTER TABLE
 // ... DETACH PARTITION ... CONCURRENTLY, which a cancel leaves pending; a
 // person finishes those. See README.md.
@@ -65,8 +66,8 @@
 // connection made from it. For the same reason as the tracer, the
 // adapter's errors, including those an Observer is given, name statements
 // by their step IDs, not their SQL, and what DPG warns of
-// (Engine.Warnings) is in a status's or a result's Detail, with paths
-// relative to the project's directory.
+// (Engine.Warnings) is in a status's or a result's Detail, with the
+// project's paths relative to its root.
 //
 // The database's owner is role enough: the adapter needs no superuser.
 //
@@ -129,6 +130,9 @@ type Migrator struct {
 	cluster, database string
 	pool              *pgxpool.Pool
 	offline           migrate.Plan
+	// steps are the log's statements as New loaded it, for the errors of
+	// a call that fails before it loads the log itself.
+	steps []engine.Step
 }
 
 var (
@@ -156,7 +160,8 @@ func New(name, dir string, pool *pgxpool.Pool, opts ...Option) (*Migrator, error
 	if err != nil {
 		return nil, err
 	}
-	m.offline = planOf(e.PlanOffline().Steps)
+	m.steps = e.PlanOffline().Steps
+	m.offline = planOf(m.steps)
 	return m, nil
 }
 
@@ -192,36 +197,43 @@ func (m *Migrator) connect(ctx context.Context) (*pgx.Conn, error) {
 
 // session runs f on an engine over a connection of its own, and returns
 // its error as wrap does, with the statements of the log the engine loaded
-// for this call.
+// for this call, or, when it fails before loading it, of the log New
+// loaded.
 func (m *Migrator) session(ctx context.Context, f func(*engine.Engine, *pgx.Conn, redactor) error) error {
+	boot := redactor{steps: func() []engine.Step { return m.steps }}
 	conn, err := m.connect(ctx)
 	if err != nil {
-		return m.wrap(redactor{}, fmt.Errorf("dpg: migrator %q: connecting: %w", m.name, err))
+		return m.wrap(boot, fmt.Errorf("dpg: migrator %q: connecting: %w", m.name, err))
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
 	e, err := m.engine(conn)
 	if err != nil {
-		return m.wrap(redactor{}, err)
+		return m.wrap(boot, err)
 	}
 	defer e.Close(context.WithoutCancel(ctx))
-	r := redactorOf(e.PlanOffline().Steps)
+	r := redactor{steps: func() []engine.Step { return e.PlanOffline().Steps }}
 	return m.wrap(r, f(e, conn, r))
 }
 
-// warnings are what DPG warned of in this call, with the paths in them
-// made relative to the project's directory: a status or a result may be
-// shown to people who needn't know where the app runs from.
+// warnings are what DPG warned of in this call, with the paths of the
+// project's in them made relative to its root, which the engine
+// discovered from the directory New was given: a status or a result may
+// be shown to people who needn't know where the app runs from.
 func (m *Migrator) warnings(e *engine.Engine) []string {
-	var dirs []string
-	if abs, err := filepath.Abs(m.dir); err == nil {
-		dirs = append(dirs, abs)
+	ws := e.Warnings()
+	if len(ws) == 0 {
+		return nil
+	}
+	var roots []string
+	if abs, err := filepath.Abs(e.Root()); err == nil {
+		roots = append(roots, abs)
 		if real, err := filepath.EvalSymlinks(abs); err == nil && real != abs {
-			dirs = append(dirs, real)
+			roots = append(roots, real)
 		}
 	}
-	var out []string
-	for _, w := range e.Warnings() {
-		out = append(out, relative(w, dirs))
+	out := make([]string, len(ws))
+	for i, w := range ws {
+		out[i] = relative(w, roots)
 	}
 	return out
 }
@@ -231,21 +243,23 @@ func (m *Migrator) warnings(e *engine.Engine) []string {
 // parenthesis, to the next of those or a colon.
 var absPath = regexp.MustCompile(`(^|[\s"'(])((?:[A-Za-z]:)?[/\\][^\s"'():]*)`)
 
-// relative makes the absolute paths in msg relative to the first of dirs
-// they are in, or else leaves only their last element.
-func relative(msg string, dirs []string) string {
+// relative makes the paths in msg that are in one of roots relative to it,
+// spaces and all, and leaves only the last element of any other absolute
+// path: whole when the message starts with it ("<path>: <problem>", as
+// DPG's warnings are), else up to a space.
+func relative(msg string, roots []string) string {
+	for _, r := range roots {
+		msg = strings.ReplaceAll(msg, r+string(filepath.Separator), "")
+	}
+	if i := strings.Index(msg, ": "); i > 0 && filepath.IsAbs(msg[:i]) {
+		msg = filepath.Base(msg[:i]) + msg[i:]
+	}
 	return absPath.ReplaceAllStringFunc(msg, func(match string) string {
 		sub := absPath.FindStringSubmatch(match)
-		lead, p := sub[1], sub[2]
-		if !filepath.IsAbs(p) {
+		if !filepath.IsAbs(sub[2]) {
 			return match
 		}
-		for _, d := range dirs {
-			if rel, err := filepath.Rel(d, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				return lead + rel
-			}
-		}
-		return lead + filepath.Base(p)
+		return sub[1] + filepath.Base(sub[2])
 	})
 }
 
@@ -573,12 +587,13 @@ func (m *Migrator) stale(err error) error {
 // wrap names the migrator in an error, keeping what DPG's engine says
 // around it, and keeps SQL out of its message: a statement that failed (an
 // engine.StatementError) or that DPG's checks refused (an
-// engine.GateError) is named by its step ID, or as one of DPG's own (its
-// ledger's records, its guards, the drop of an invalid index before a
-// build) when it isn't a step of the log; a statement of the log that the
-// message quotes otherwise is replaced by its step ID too. The adapter's
-// own refusals are returned as they are. The error still wraps the
-// original, for errors.Is and errors.As.
+// engine.GateError) is named by its step ID, a guard DPG runs for a
+// migration as "a guard of migration <m>", and one of DPG's own (its
+// ledger's records, the drop of an invalid index before a build) as "a
+// statement of DPG's"; a statement of the log that the message quotes
+// otherwise is replaced by its step ID too. The adapter's own refusals
+// are returned as they are. The error still wraps the original, for
+// errors.Is and errors.As.
 func (m *Migrator) wrap(r redactor, err error) error {
 	if err == nil {
 		return nil
@@ -596,32 +611,38 @@ func (m *Migrator) wrap(r redactor, err error) error {
 	return &redacted{msg: msg, err: err}
 }
 
-// redactor takes SQL out of an error's message. It is made from the log
-// as each call loads it, so a log changed since New is still covered.
+// redactor takes SQL out of an error's message. Its statements are the
+// log's as the call loaded it, so a log changed since New is still
+// covered; they are only read when there is an error to redact.
 type redactor struct {
-	byLength []engine.Step // the log's statements with SQL, longest first
-}
-
-func redactorOf(steps []engine.Step) redactor {
-	var r redactor
-	for _, s := range steps {
-		if strings.TrimSpace(s.SQL) != "" {
-			r.byLength = append(r.byLength, s)
-		}
-	}
-	slices.SortStableFunc(r.byLength, func(a, b engine.Step) int { return len(b.SQL) - len(a.SQL) })
-	return r
+	steps func() []engine.Step
 }
 
 func (r redactor) redact(err error) string {
+	var byLength []engine.Step // the log's statements with SQL, longest first
+	if r.steps != nil {
+		for _, s := range r.steps() {
+			if strings.TrimSpace(s.SQL) != "" {
+				byLength = append(byLength, s)
+			}
+		}
+		slices.SortStableFunc(byLength, func(a, b engine.Step) int { return len(b.SQL) - len(a.SQL) })
+	}
+	return redactWith(err, byLength)
+}
+
+func redactWith(err error, byLength []engine.Step) string {
 	msg := err.Error()
 	var se *engine.StatementError
 	if errors.As(err, &se) {
 		named := "a statement of DPG's"
-		if se.Step != "" {
+		switch {
+		case se.Step != "":
 			named = "statement " + se.Step
+		case se.Migration != "":
+			named = "a guard of migration " + se.Migration
 		}
-		msg = strings.Replace(msg, se.Error(), "executor: "+named+": "+r.redact(se.Err), 1)
+		msg = strings.Replace(msg, se.Error(), "executor: "+named+": "+redactWith(se.Err, byLength), 1)
 	}
 	var ge *engine.GateError
 	if errors.As(err, &ge) {
@@ -633,7 +654,7 @@ func (r redactor) redact(err error) string {
 	}
 	// Any statement of the log an error quotes otherwise, longest first so
 	// that one statement inside another is replaced whole.
-	for _, s := range r.byLength {
+	for _, s := range byLength {
 		msg = strings.ReplaceAll(msg, s.SQL, "statement "+s.ID)
 	}
 	return msg

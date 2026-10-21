@@ -515,7 +515,9 @@ func TestConnectionsRunBeforeConnectButNotAfterConnectOrTheTracer(t *testing.T) 
 // What DPG warns of, here a snapshot of another format version, is in the
 // status's detail.
 func TestDPGsWarningsAreInTheStatus(t *testing.T) {
-	root := t.TempDir()
+	// A project whose path has a space, opened from its database's
+	// directory: the warning's path is relative to its root.
+	root := filepath.Join(t.TempDir(), "my project")
 	if err := os.CopyFS(root, os.DirFS(dir("base"))); err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +530,7 @@ func TestDPGsWarningsAreInTheStatus(t *testing.T) {
 	if err := os.WriteFile(p, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	m, err := dpg.New("schema", root, poolOf(t, database(t)))
+	m, err := dpg.New("schema", filepath.Join(root, "c", "app"), poolOf(t, database(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +541,7 @@ func TestDPGsWarningsAreInTheStatus(t *testing.T) {
 	}
 	// Its path is the project's own, not where the app runs from.
 	rel := filepath.Join(".dpg", "snapshots", "c", "app.json")
-	if !strings.Contains(st.Detail, "warning: "+rel+": ") || strings.Contains(st.Detail, root) {
+	if !strings.Contains(st.Detail, "warning: "+rel+": ") || strings.Contains(st.Detail, "my project") {
 		t.Errorf("the warning's path: %s", st.Detail)
 	}
 	// In a result too: of a refusal, of an apply, of one with nothing to do.
@@ -547,7 +549,7 @@ func TestDPGsWarningsAreInTheStatus(t *testing.T) {
 	refused.Fingerprint = "sha256:none"
 	for i, opts := range []migrate.ApplyOptions{refused, under(lease{"e", 1}), under(lease{"e", 2})} {
 		res, err := m.Apply(ctx, opts)
-		if (err != nil) != (i == 0) || !strings.Contains(res.Detail, "warning: "+rel+": ") || strings.Contains(res.Detail, root) {
+		if (err != nil) != (i == 0) || !strings.Contains(res.Detail, "warning: "+rel+": ") || strings.Contains(res.Detail, "my project") {
 			t.Errorf("apply %d: %+v, %v", i, res, err)
 		}
 	}
@@ -597,6 +599,27 @@ func TestAnIndexBuildCancelledPartWayIsRebuiltByTheNextApply(t *testing.T) {
 	err = <-done
 	if err == nil || strings.Contains(err.Error(), "CREATE") || strings.Contains(err.Error(), "--resume") {
 		t.Fatalf("the cancelled apply: %v", err)
+	}
+	// The cancel only stops the client waiting: pgx closes the connection
+	// rather than send the server a cancel request, so the build may go on
+	// (as the package's docs say). Stop it on the server too, as a
+	// statement timeout or a person would, to leave it cancelled part way.
+	const builds = "FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND query LIKE 'CREATE INDEX CONCURRENTLY%' AND state = 'active'"
+	if _, err := pool.Exec(ctx, "SELECT pg_cancel_backend(pid) "+builds); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) "+builds).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the index build didn't stop")
+		}
+		time.Sleep(5 * time.Millisecond) // a poll interval, not synchronization
 	}
 	if err := blocker.Rollback(ctx); err != nil {
 		t.Fatal(err)

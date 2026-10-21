@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/dpg/pkg/dpg/engine"
 
@@ -140,7 +142,9 @@ func TestMaxSafetyIsTheMostTheOptionsAllow(t *testing.T) {
 func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 	create := `CREATE INDEX CONCURRENTLY "a_x" ON "public"."a" ("x");`
 	m := &Migrator{name: "schema"}
-	r := redactorOf([]engine.Step{{ID: "m1/1", SQL: `CREATE TABLE "a" ("x" int);`}, {ID: "m1/2", SQL: create}, {ID: "m1/3", SQL: `CREATE TABLE "a" ("x" int);` + " -- longer"}, {ID: "m1/4", SQL: " "}})
+	steps := []engine.Step{{ID: "m1/1", SQL: `CREATE TABLE "a" ("x" int);`}, {ID: "m1/2", SQL: create}, {ID: "m1/3", SQL: `CREATE TABLE "a" ("x" int);` + " -- longer"}, {ID: "m1/4", SQL: " "}}
+	read := 0
+	r := redactor{steps: func() []engine.Step { read++; return steps }}
 	pgErr := &pgconn.PgError{Severity: "ERROR", Code: "42P07", Message: `relation "a_x" already exists`}
 	stale := errs.New(errs.FailedPrecondition, CodeStaleToken, `dpg: migrator "schema": the lease's fencing token 1 is stale`)
 	for _, c := range []struct {
@@ -168,6 +172,11 @@ func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 			`dpg: migrator "schema": engine: c/app: migration m9: executor: statement m9/1: ERROR: relation "a_x" already exists (SQLSTATE 42P07)`,
 		},
 		{
+			// A guard of a migration's, which runs twice, so is no step.
+			fmt.Errorf("engine: c/app: migration m1: %w", &engine.StatementError{Migration: "m1", SQL: "DO $dpg$ BEGIN RAISE EXCEPTION 'DPG-E055: table public.a changed'; END $dpg$;", Err: errors.New("ERROR: DPG-E055: table public.a changed (SQLSTATE P0001)")}),
+			`dpg: migrator "schema": engine: c/app: migration m1: executor: a guard of migration m1: ERROR: DPG-E055: table public.a changed (SQLSTATE P0001)`,
+		},
+		{
 			// Refused by DPG's own check of safety.
 			fmt.Errorf("engine: c/app: %w", &engine.GateError{Reason: "DPG-E025: migration m1 contains destructive operations; re-run with --allow-destructive to proceed", Step: "m1/9", SQL: `DROP TABLE "secret";`}),
 			`dpg: migrator "schema": engine: c/app: DPG-E025: migration m1 contains destructive operations; re-run with --allow-destructive to proceed; first: statement m1/9`,
@@ -192,8 +201,12 @@ func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 	if m.wrap(r, stale) != error(stale) {
 		t.Error("the adapter's own error was wrapped")
 	}
+	before := read
 	if m.wrap(r, nil) != nil {
 		t.Error("no error was wrapped")
+	}
+	if read != before {
+		t.Error("the log's statements were read without an error to redact")
 	}
 	got := m.wrap(r, fmt.Errorf("engine: c/app: migration m1: %w", stale))
 	if e := errs.From(got); e == nil || e.Code != CodeStaleToken || !strings.Contains(got.Error(), "engine: c/app: migration m1: ") {
@@ -218,17 +231,44 @@ func TestWarningsAreAddedToTheDetail(t *testing.T) {
 }
 
 func TestWarningsNameNoAbsolutePath(t *testing.T) {
-	dir := filepath.Join(string(filepath.Separator)+"srv", "app", "schema")
-	other := filepath.Join(string(filepath.Separator)+"home", "x", "snap.json")
-	inside := filepath.Join(dir, ".dpg", "snapshots", "c", "app.json")
+	sep := string(filepath.Separator)
+	root := filepath.Join(sep+"srv", "my app", "schema")
+	inside := filepath.Join(root, ".dpg", "snapshots", "c", "app.json")
+	rel := filepath.Join(".dpg", "snapshots", "c", "app.json")
+	elsewhere := filepath.Join(sep+"home", "x y", "snap shot.json")
 	for msg, want := range map[string]string{
-		inside + ": written by dpg 9.0.0, format 9.0.0": filepath.Join(".dpg", "snapshots", "c", "app.json") + ": written by dpg 9.0.0, format 9.0.0",
-		"reading " + other + " (skipped)":               "reading snap.json (skipped)",
-		"a/b and c:d stay":                              "a/b and c:d stay",
-		`"` + inside + `"`:                              `"` + filepath.Join(".dpg", "snapshots", "c", "app.json") + `"`,
+		inside + ": written by dpg 9.0.0, format 9.0.0":                      rel + ": written by dpg 9.0.0, format 9.0.0",
+		elsewhere + ": written by dpg 9.0.0":                                 "snap shot.json: written by dpg 9.0.0",
+		"reading " + filepath.Join(sep+"home", "x", "s.json") + " (skipped)": "reading s.json (skipped)",
+		"a/b and c:d stay": "a/b and c:d stay",
+		`"` + inside + `"`: `"` + rel + `"`,
+		filepath.Join(sep+"srv", "my app", "schema-old", "x") + ": y": "x: y",
 	} {
-		if got := relative(msg, []string{dir}); got != want {
+		if got := relative(msg, []string{root}); got != want {
 			t.Errorf("relative(%q) = %q, want %q", msg, got, want)
 		}
+	}
+}
+
+// A call that fails before it loads the log, connecting say, is redacted
+// with the log New loaded.
+func TestAFailedConnectionIsRedactedWithTheLogNewLoaded(t *testing.T) {
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig("postgres://u@127.0.0.1:1/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.BeforeConnect = func(context.Context, *pgx.ConnConfig) error {
+		return errors.New(`refused: CREATE TABLE "a" ("x" int);`)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	m := &Migrator{name: "schema", pool: pool, steps: []engine.Step{{ID: "m1/1", SQL: `CREATE TABLE "a" ("x" int);`}}}
+	_, err = m.Status(ctx)
+	if err == nil || !strings.Contains(err.Error(), "connecting: refused: statement m1/1") || strings.Contains(err.Error(), "CREATE") {
+		t.Errorf("%v", err)
 	}
 }
