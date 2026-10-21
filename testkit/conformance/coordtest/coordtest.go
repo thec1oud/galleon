@@ -48,6 +48,7 @@ func Run(t *testing.T, f Factory) {
 		t.Run("ExpiryClosesLost", func(t *testing.T) { expiry(t, f) })
 		t.Run("RenewKeepsTheLease", func(t *testing.T) { renew(t, f) })
 		t.Run("AcquireWaitsAndHonoursContext", func(t *testing.T) { acquireWaits(t, f) })
+		t.Run("ALeaseWaitedForLongerThanItsTTLIsHeld", func(t *testing.T) { longWait(t, f) })
 	})
 	t.Run("LeaderElection", func(t *testing.T) {
 		need(t, f, coord.LeaderElection)
@@ -201,6 +202,7 @@ func mutualExclusion(t *testing.T, f Factory) {
 func fencing(t *testing.T, f Factory) {
 	ns := nodes(t, f)
 	var last uint64
+	epoch := ""
 	for i := range 6 {
 		l, err := ns[i%len(ns)].Locks().Acquire(ctx(t), "conformance/fence", 5*time.Second)
 		if err != nil {
@@ -209,6 +211,12 @@ func fencing(t *testing.T, f Factory) {
 		if l.Token() <= last {
 			t.Fatalf("token %d is not greater than %d", l.Token(), last)
 		}
+		// Tokens compare within an epoch, so every node's leases on one
+		// store share it.
+		if l.Epoch() == "" || (epoch != "" && l.Epoch() != epoch) {
+			t.Fatalf("epoch %q after %q: one store's tokens must share a non-empty epoch", l.Epoch(), epoch)
+		}
+		epoch = l.Epoch()
 		if l.Key() != "conformance/fence" {
 			t.Fatalf("Key() = %q", l.Key())
 		}
@@ -300,6 +308,67 @@ func acquireWaits(t *testing.T, f Factory) {
 			}
 		}()
 		t.Fatal("waiter was not woken by Release")
+	}
+}
+
+// longWait checks rule 3's start of the TTL: a lease that Acquire returns
+// after a wait longer than its TTL has its whole TTL ahead of it, so it
+// can be renewed, and isn't lost.
+func longWait(t *testing.T, f Factory) {
+	ns := nodes(t, f)
+	held, ok, err := ns[0].Locks().TryAcquire(ctx(t), "conformance/longwait", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	const ttl = 300 * time.Millisecond
+	type result struct {
+		l      coord.Lease
+		waited time.Duration
+		err    error
+	}
+	got := make(chan result, 1) // buffered: the goroutine never blocks or touches t
+	asking := make(chan struct{})
+	waitCtx := ctx(t)
+	go func() {
+		start := time.Now()
+		close(asking)
+		l, err := ns[len(ns)-1].Locks().Acquire(waitCtx, "conformance/longwait", ttl)
+		got <- result{l, time.Since(start), err}
+	}()
+	<-asking
+	// The holder works for longer than the waiter's TTL; how long the
+	// waiter really waited is checked below.
+	time.Sleep(2 * ttl)
+	_ = held.Release(context.Background())
+	var r result
+	select {
+	case r = <-got:
+	case <-time.After(5 * time.Second):
+		// If the waiter acquires after all, release it so a shared store
+		// isn't left locked for later tests.
+		go func() {
+			if r := <-got; r.err == nil {
+				_ = r.l.Release(context.Background())
+			}
+		}()
+		t.Fatal("waiter was not woken by Release")
+	}
+	if r.err != nil {
+		t.Fatalf("waiting Acquire: %v", r.err)
+	}
+	l := r.l
+	if r.waited <= ttl {
+		_ = l.Release(context.Background())
+		t.Fatalf("the waiter waited %s, not longer than its TTL of %s: the test proves nothing", r.waited, ttl)
+	}
+	defer l.Release(context.Background())
+	select {
+	case <-l.Lost():
+		t.Fatal("Acquire returned a lease that was already lost")
+	default:
+	}
+	if err := l.Renew(ctx(t)); err != nil {
+		t.Fatalf("Renew right after a wait longer than the TTL: %v", err)
 	}
 }
 
