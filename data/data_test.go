@@ -85,6 +85,18 @@ func TestAfterCommitRegistersWithTheWriteTransactionInContext(t *testing.T) {
 	}
 }
 
+type endedWriteTx struct{ fakeWriteTx }
+
+func (*endedWriteTx) Ended() bool { return true }
+
+func TestAfterCommitRefusesAHandleThatHasEnded(t *testing.T) {
+	w := &endedWriteTx{}
+	err := data.AfterCommit(data.With(context.Background(), w), func(context.Context) { t.Fatal("ran") })
+	if errs.KindOf(err) != errs.Internal || errs.From(err).Code != data.CodeTxEnded || len(w.after) != 0 {
+		t.Fatalf("got %v, %d registered", err, len(w.after))
+	}
+}
+
 func TestAfterCommitRefusesWithoutAWriteTransactionAndNeverRunsFn(t *testing.T) {
 	ran := false
 	fn := func(context.Context) { ran = true }

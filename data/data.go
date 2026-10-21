@@ -168,14 +168,15 @@ func ReaderFrom(ctx context.Context) (Reader, bool) {
 // once its root commits, as WriteTx.AfterCommit does: the way an ORM fires
 // a side effect of a change, such as a hook, an event or a cache
 // invalidation, so that it never fires for a change that rolls back, and
-// fires once for a closure that was retried. The handle in ctx must still
-// be open: one that has ended has no commit ahead of it, and package pg's
-// drops fn.
+// fires once for a closure that was retried.
 //
 // Without a write transaction in ctx, none or a read one, it refuses with
 // Internal and CodePropagation, and fn never runs: there is no commit to
 // wait for, and running fn at once would fire the side effect as if a
-// commit had happened. A nil fn is refused the same way.
+// commit had happened. A nil fn is refused the same way. A handle that has
+// ended, committed or rolled back, has no commit ahead of it either: when
+// it can tell, as package pg's can, AfterCommit refuses with Internal and
+// CodeTxEnded.
 func AfterCommit(ctx context.Context, fn func(ctx context.Context)) error {
 	tx, ok := From(ctx).(WriteTx)
 	switch {
@@ -184,6 +185,12 @@ func AfterCommit(ctx context.Context, fn func(ctx context.Context)) error {
 	case !ok:
 		return errs.New(errs.Internal, CodePropagation, "data.AfterCommit needs a write transaction in ctx; without one there is no commit to run the callback after")
 	}
+	if e, ok := tx.(ender); ok && e.Ended() {
+		return errs.New(errs.Internal, CodeTxEnded, "data.AfterCommit was called with a transaction that has ended; its commit won't come")
+	}
 	tx.AfterCommit(fn)
 	return nil
 }
+
+// ender is a handle that can tell whether it has ended.
+type ender interface{ Ended() bool }

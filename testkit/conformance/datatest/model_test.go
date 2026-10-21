@@ -14,6 +14,7 @@ import (
 	"github.com/thec1oud/galleon"
 	"github.com/thec1oud/galleon/coord/local"
 	"github.com/thec1oud/galleon/data"
+	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/testkit"
 	"github.com/thec1oud/galleon/testkit/conformance/datatest"
 )
@@ -230,5 +231,29 @@ func TestAnInvalidModelFailsBootNamingItsModule(t *testing.T) {
 		galleon.Deploy(galleon.SingleNode), galleon.Modules(models(data.ModelInfo{Name: "x", Schema: "s", Table: "t"})))...)
 	if err == nil || !strings.Contains(err.Error(), `module "orm" (`) || !strings.Contains(err.Error(), `model "x": it has no primary key columns`) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestAfterCommitRefusesAPgHandleThatHasEnded(t *testing.T) {
+	db := testkit.DB(t)
+	ctx := context.Background()
+	for name, end := range map[string]func(data.WriteTx) error{
+		"committed":   func(w data.WriteTx) error { return w.Commit(ctx) },
+		"rolled back": func(w data.WriteTx) error { return w.Rollback(ctx) },
+	} {
+		w, err := db.Manager().BeginWrite(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := data.AfterCommit(data.With(ctx, w), func(context.Context) {}); err != nil {
+			t.Fatalf("%s: an open handle was refused: %v", name, err)
+		}
+		if err := end(w); err != nil {
+			t.Fatal(err)
+		}
+		err = data.AfterCommit(data.With(ctx, w), func(context.Context) { t.Errorf("%s: ran", name) })
+		if err == nil || errs.From(err).Code != data.CodeTxEnded {
+			t.Errorf("%s: got %v", name, err)
+		}
 	}
 }

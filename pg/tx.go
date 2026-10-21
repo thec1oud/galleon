@@ -791,7 +791,11 @@ func (t *readTx) Begin(ctx context.Context) (data.ReadTx, error) {
 	}
 	return &readTx{c}, nil
 }
-func (t *readTx) Commit(ctx context.Context) error   { return t.h.commit(ctx) }
+func (t *readTx) Commit(ctx context.Context) error { return t.h.commit(ctx) }
+
+// Ended reports whether the handle has committed or rolled back, so
+// data.AfterCommit can refuse it.
+func (t *readTx) Ended() bool                        { return t.h.state != open }
 func (t *readTx) Rollback(ctx context.Context) error { return t.h.rollback(ctx) }
 
 func (t *writeTx) Exec(ctx context.Context, sql string, args ...any) (data.CommandTag, error) {
