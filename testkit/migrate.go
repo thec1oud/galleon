@@ -3,6 +3,7 @@ package testkit
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,11 +30,12 @@ func NewMigrationStore() *MigrationStore {
 	return &MigrationStore{applied: map[string][]FakeStep{}, fence: map[string]fence{}, progress: map[string]int{}, calls: map[string]int{}, changes: map[string]int{}}
 }
 
-// fence is a migrator's fencing record: tokens compare within an epoch, and
-// another epoch takes over.
+// fence is a migrator's fencing record: tokens compare within an epoch, a
+// new epoch takes over, and the epochs it took over from are refused.
 type fence struct {
-	epoch string
-	token uint64
+	epoch      string
+	token      uint64
+	superseded []string
 }
 
 // staleLocked reports why lease l can't apply, or nil.
@@ -42,7 +44,20 @@ func (s *MigrationStore) staleLocked(name string, l coord.Lease) error {
 	if f.epoch == l.Epoch() && l.Token() < f.token {
 		return errs.New(errs.FailedPrecondition, "testkit.stale_token", fmt.Sprintf("fencing token %d is below %d in epoch %q", l.Token(), f.token, f.epoch))
 	}
+	if slices.Contains(f.superseded, l.Epoch()) {
+		return errs.New(errs.FailedPrecondition, "testkit.stale_epoch", fmt.Sprintf("epoch %q was superseded by %q", l.Epoch(), f.epoch))
+	}
 	return nil
+}
+
+// raiseLocked moves the fence of name to lease l, which isn't stale.
+func (s *MigrationStore) raiseLocked(name string, l coord.Lease) {
+	f := s.fence[name]
+	if f.epoch != l.Epoch() && f.epoch != "" {
+		f.superseded = append(f.superseded, f.epoch)
+	}
+	f.epoch, f.token = l.Epoch(), l.Token()
+	s.fence[name] = f
 }
 
 // FakeStep is one change of a fake migrator's build.
@@ -261,7 +276,7 @@ func (m *FakeMigrator) Apply(ctx context.Context, opts migrate.ApplyOptions) (mi
 			}
 		}
 		if err == nil {
-			s.fence[m.name] = fence{epoch: opts.Lock.Epoch(), token: opts.Lock.Token()}
+			s.raiseLocked(m.name, opts.Lock)
 		}
 	}
 	s.mu.Unlock()

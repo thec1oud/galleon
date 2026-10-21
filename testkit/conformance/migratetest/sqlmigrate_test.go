@@ -36,6 +36,9 @@ func sqlBuilds(b migratetest.Build) fstest.MapFS {
 	switch b {
 	case migratetest.Next:
 		files["0003_create_c.sql"] = &fstest.MapFile{Data: []byte("-- galleon:risk safe\nCREATE TABLE c (id int);\n")}
+	case migratetest.Last:
+		files["0003_create_c.sql"] = &fstest.MapFile{Data: []byte("-- galleon:risk safe\nCREATE TABLE c (id int);\n")}
+		files["0004_create_d.sql"] = &fstest.MapFile{Data: []byte("-- galleon:risk safe\nCREATE TABLE d (id int);\n")}
 	case migratetest.Risky:
 		files["0003_drop_a.sql"] = &fstest.MapFile{Data: []byte("-- galleon:risk destructive\nDROP TABLE a;\n")}
 	case migratetest.Edited:
@@ -250,21 +253,27 @@ func TestTheFenceIsRecordedInTheDatabase(t *testing.T) {
 	if st, err := other.Status(ctx); err != nil || st.State != migrate.Pending {
 		t.Fatalf("status of another migrator in the table: %+v, %v", st, err)
 	}
-	stale := migrate.ApplyOptions{Lock: pastLease{}, MaxRisk: migrate.Manual, AllowUnknown: true}
+	stale := migrate.ApplyOptions{Lock: pastLease, MaxRisk: migrate.Manual, AllowUnknown: true}
 	if _, err := other.Apply(ctx, stale); err != nil {
 		t.Fatalf("another migrator's fence isn't its own: %v", err)
 	}
 }
 
-// pastLease is a lease with the lowest token.
-type pastLease struct{}
+// fixedLease is a lease of a given epoch and token.
+type fixedLease struct {
+	epoch string
+	token uint64
+}
 
-func (pastLease) Key() string                   { return "" }
-func (pastLease) Token() uint64                 { return 1 }
-func (pastLease) Epoch() string                 { return "past" }
-func (pastLease) Renew(context.Context) error   { return nil }
-func (pastLease) Release(context.Context) error { return nil }
-func (pastLease) Lost() <-chan struct{}         { return nil }
+// pastLease is a lease with the lowest token.
+var pastLease = fixedLease{epoch: "past", token: 1}
+
+func (fixedLease) Key() string                   { return "" }
+func (l fixedLease) Token() uint64               { return l.token }
+func (l fixedLease) Epoch() string               { return l.epoch }
+func (fixedLease) Renew(context.Context) error   { return nil }
+func (fixedLease) Release(context.Context) error { return nil }
+func (fixedLease) Lost() <-chan struct{}         { return nil }
 
 func TestStatusNamesWhatDriftedAndWhatIsAhead(t *testing.T) {
 	ctx := context.Background()
@@ -419,6 +428,66 @@ func TestTwoAppsMigrateOnePostgresDatabaseOnce(t *testing.T) {
 
 // The fence outlives the in-process backend's token counter: a new
 // process's backend starts at token 1 again, under a new epoch.
+func TestALeaseOfASupersededEpochIsRefusedWhateverItsToken(t *testing.T) {
+	ctx := context.Background()
+	pool := schemaPool(t)
+	files := fstest.MapFS{"0001_a.sql": {Data: []byte("CREATE TABLE a (id int);")}}
+	apply := func(epoch string, token uint64, version, table string) error {
+		files[version] = &fstest.MapFile{Data: []byte("CREATE TABLE " + table + " (id int);")}
+		_, err := newSQL(t, "schema", files, pool).Apply(ctx, migrate.ApplyOptions{Lock: fixedLease{epoch, token}, MaxRisk: migrate.Manual, AllowUnknown: true})
+		return err
+	}
+	if err := apply("e1", 5, "0001_a.sql", "a"); err != nil {
+		t.Fatalf("e1/5: %v", err)
+	}
+	if err := apply("e2", 1, "0002_b.sql", "b"); err != nil {
+		t.Fatalf("e2/1 of a new epoch: %v", err)
+	}
+	err := apply("e1", 3, "0003_c.sql", "c")
+	if !hasCode(err, sqlmigrate.CodeStaleEpoch) || !strings.Contains(err.Error(), `epoch "e1" is stale`) {
+		t.Fatalf("e1/3 after e2 applied: got %v, want %s", err, sqlmigrate.CodeStaleEpoch)
+	}
+	if exists(t, pool, "c") {
+		t.Fatal("the superseded epoch applied 0003")
+	}
+	if err := apply("e2", 2, "0003_c.sql", "c"); err != nil {
+		t.Fatalf("e2/2: %v", err)
+	}
+	if !exists(t, pool, "c") {
+		t.Error("e2/2 didn't apply 0003")
+	}
+	// Within an epoch, tokens still compare.
+	err = apply("e2", 1, "0004_d.sql", "d")
+	if !hasCode(err, sqlmigrate.CodeStaleToken) || exists(t, pool, "d") {
+		t.Fatalf("e2/1 after e2/2: got %v, want %s", err, sqlmigrate.CodeStaleToken)
+	}
+}
+
+func TestAFencingTableWithoutEpochsGainsThem(t *testing.T) {
+	ctx := context.Background()
+	pool := schemaPool(t)
+	// The fencing table as a build before epochs made it.
+	if _, err := pool.Exec(ctx, `CREATE TABLE galleon_migrations_fence (migrator text PRIMARY KEY, token bigint NOT NULL);
+INSERT INTO galleon_migrations_fence VALUES ('schema', 9)`); err != nil {
+		t.Fatal(err)
+	}
+	m := newSQL(t, "schema", sqlBuilds(migratetest.Base), pool)
+	if _, err := m.Apply(ctx, migrate.ApplyOptions{Lock: fixedLease{"e1", 1}, MaxRisk: migrate.Manual, AllowUnknown: true}); err != nil {
+		t.Fatalf("applying over the old fencing table: %v", err)
+	}
+	var (
+		epoch      string
+		token      int64
+		superseded []string
+	)
+	if err := pool.QueryRow(ctx, "SELECT epoch, token, superseded FROM galleon_migrations_fence WHERE migrator = 'schema'").Scan(&epoch, &token, &superseded); err != nil {
+		t.Fatal(err)
+	}
+	if epoch != "e1" || token != 1 || len(superseded) != 1 || superseded[0] != "" {
+		t.Errorf("the fence holds %q/%d, superseding %q", epoch, token, superseded)
+	}
+}
+
 func TestARestartedProcessAppliesAfterAHigherTokenWasRecorded(t *testing.T) {
 	ctx := context.Background()
 	pool := schemaPool(t)

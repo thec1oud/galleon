@@ -17,6 +17,8 @@ func fakeBuilds(b migratetest.Build) []testkit.FakeStep {
 		return []testkit.FakeStep{one, two, {ID: "3", Risk: migrate.Safe, Content: "create c"}}
 	case migratetest.Risky:
 		return []testkit.FakeStep{one, two, {ID: "3", Risk: migrate.Destructive, Content: "drop a"}}
+	case migratetest.Last:
+		return []testkit.FakeStep{one, two, {ID: "3", Risk: migrate.Safe, Content: "create c"}, {ID: "4", Risk: migrate.Safe, Content: "create d"}}
 	case migratetest.Edited:
 		one.Content = "create a differently"
 		return []testkit.FakeStep{one, two}

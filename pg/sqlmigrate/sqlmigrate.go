@@ -51,14 +51,20 @@
 // Each file is applied in its own transaction, together with its record.
 // The transaction first raises the migrator's fencing row (the table name
 // with "_fence" appended) to the lease's epoch and token, and fails if the
-// row holds the same epoch with a higher token: a node that paused past its
-// lease, while another took the lock, can't apply anything once it resumes.
-// Tokens compare only within one coordination epoch (coord.Lease.Epoch). A
-// lease of another epoch, such as one from a new process on the in-process
-// backend, whose tokens start again at 1, takes the row over. So fencing
-// protects within one epoch: a cluster backend keeps one for good, and the
-// in-process backend, whose epoch is per process, serves a single node,
-// which the kernel's multi-node check enforces.
+// lease is stale: a node that paused past its lease, while another took the
+// lock, can't apply anything once it resumes. Tokens compare only within
+// one coordination epoch (coord.Lease.Epoch): the row refuses a lower token
+// of its epoch (CodeStaleToken). A lease of a new epoch, such as one from a
+// new process on the in-process backend, whose tokens start again at 1,
+// takes the row over, and the epoch it replaces is recorded as superseded
+// in the row; a lease of a superseded epoch is refused whatever its token
+// (CodeStaleEpoch), so the old process can't take the row back. Epochs
+// aren't ordered otherwise: the first lease of an epoch the row hasn't seen
+// wins it. A cluster backend keeps one epoch for good; the in-process
+// backend, whose epoch is per process, serves a single node, which the
+// kernel's multi-node check enforces. A fencing table made by an earlier
+// version, without the epoch or superseded columns, gains them when the
+// migrator first runs.
 //
 // The migrator is a migrate.Planner, OfflinePlanner and Verifier.
 package sqlmigrate
@@ -97,6 +103,9 @@ const (
 	// CodeStaleToken: a holder with a higher fencing token has applied
 	// since this lease was granted.
 	CodeStaleToken = "sqlmigrate.stale_token"
+	// CodeStaleEpoch: a holder of a later coordination epoch has applied
+	// since this lease was granted.
+	CodeStaleEpoch = "sqlmigrate.stale_epoch"
 	// CodeNoLock: Apply was called without a lease.
 	CodeNoLock = "sqlmigrate.no_lock"
 	// CodeNotPending: the database isn't Pending, so there's nothing Apply
@@ -550,10 +559,27 @@ func (m *Migrator) ensureTables(ctx context.Context) error {
 	PRIMARY KEY (migrator, version)
 );
 CREATE TABLE IF NOT EXISTS `+m.fence().Sanitize()+` (
-	migrator text   PRIMARY KEY,
-	epoch    text   NOT NULL,
-	token    bigint NOT NULL
+	migrator   text   PRIMARY KEY,
+	epoch      text   NOT NULL,
+	token      bigint NOT NULL,
+	superseded text[] NOT NULL DEFAULT '{}'
 )`)
+		if err != nil {
+			return err
+		}
+		// A fencing table made before epochs, or before superseded epochs
+		// were kept, gains the columns; its rows get the empty epoch, which
+		// the next lease supersedes. The table is altered only then: ALTER
+		// waits for every lock on it, such as another migrator's file that
+		// holds its fencing row.
+		var have int
+		err = tx.QueryRow(ctx, `SELECT count(*) FROM pg_attribute WHERE attrelid = $1::regclass AND attname IN ('epoch', 'superseded') AND NOT attisdropped`, m.fence().Sanitize()).Scan(&have)
+		if err != nil || have == 2 {
+			return err
+		}
+		_, err = tx.Exec(ctx, `ALTER TABLE `+m.fence().Sanitize()+`
+	ADD COLUMN IF NOT EXISTS epoch      text   NOT NULL DEFAULT '',
+	ADD COLUMN IF NOT EXISTS superseded text[] NOT NULL DEFAULT '{}'`)
 		return err
 	})
 	if err != nil {
@@ -562,26 +588,39 @@ CREATE TABLE IF NOT EXISTS `+m.fence().Sanitize()+` (
 	return nil
 }
 
-// raiseFence moves the fencing row to the lease's epoch and token, and
-// fails if the row holds the same epoch with a higher token. Another epoch
-// takes the row over: its tokens come from another counter. The row stays
-// locked until tx ends, so the files of two holders never interleave.
+// raiseFence moves the fencing row to the lease's epoch and token, or
+// fails if the lease is stale: the row holds its epoch with a higher token,
+// or its epoch has been superseded. A lease of a new epoch takes the row
+// over, since its tokens come from another counter, and the epoch it
+// replaces is kept as superseded, so a holder of that epoch can never take
+// the row back. The row stays locked until tx ends, so the files of two
+// holders never interleave.
 func (m *Migrator) raiseFence(ctx context.Context, tx pgx.Tx, l fencing) error {
-	rows, err := tx.Query(ctx, `INSERT INTO `+m.fence().Sanitize()+` AS f (migrator, epoch, token) VALUES ($1, $2, $3)
-ON CONFLICT (migrator) DO UPDATE SET epoch = EXCLUDED.epoch, token = EXCLUDED.token
-	WHERE f.epoch <> EXCLUDED.epoch OR f.token <= EXCLUDED.token
-RETURNING token`, m.name, l.epoch, l.token)
+	table := m.fence().Sanitize()
+	tag, err := tx.Exec(ctx, `INSERT INTO `+table+` (migrator, epoch, token) VALUES ($1, $2, $3) ON CONFLICT (migrator) DO NOTHING`, m.name, l.epoch, l.token)
+	if err != nil || tag.RowsAffected() == 1 {
+		return err
+	}
+	var (
+		epoch      string
+		token      int64
+		superseded []string
+	)
+	err = tx.QueryRow(ctx, `SELECT epoch, token, superseded FROM `+table+` WHERE migrator = $1 FOR UPDATE`, m.name).Scan(&epoch, &token, &superseded)
 	if err != nil {
 		return err
 	}
-	got, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		return err
+	switch {
+	case epoch == l.epoch && token > l.token:
+		return errs.New(errs.FailedPrecondition, CodeStaleToken, fmt.Sprintf("sqlmigrate: migrator %q: the lease's fencing token %d is stale: a holder of token %d in its epoch has applied since", m.name, l.token, token))
+	case epoch == l.epoch:
+		_, err = tx.Exec(ctx, `UPDATE `+table+` SET token = $2 WHERE migrator = $1`, m.name, l.token)
+	case slices.Contains(superseded, l.epoch):
+		return errs.New(errs.FailedPrecondition, CodeStaleEpoch, fmt.Sprintf("sqlmigrate: migrator %q: the lease's epoch %q is stale: a holder of epoch %q has applied since", m.name, l.epoch, epoch))
+	default:
+		_, err = tx.Exec(ctx, `UPDATE `+table+` SET epoch = $2, token = $3, superseded = array_append(superseded, epoch) WHERE migrator = $1`, m.name, l.epoch, l.token)
 	}
-	if len(got) == 0 {
-		return errs.New(errs.FailedPrecondition, CodeStaleToken, fmt.Sprintf("sqlmigrate: migrator %q: the lease's fencing token %d is stale: a later holder of its epoch has applied since", m.name, l.token))
-	}
-	return nil
+	return err
 }
 
 // applyFile applies f, unless it has been recorded since the status was

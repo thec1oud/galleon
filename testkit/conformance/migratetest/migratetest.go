@@ -43,10 +43,12 @@ const (
 	Risky
 	// Edited is Base with its first change's source edited.
 	Edited
+	// Last is Next plus a fourth change, of Safe risk.
+	Last
 )
 
 func (b Build) String() string {
-	return [...]string{"Base", "Next", "Risky", "Edited"}[b]
+	return [...]string{"Base", "Next", "Risky", "Edited", "Last"}[b]
 }
 
 // Factory makes the migrators under test.
@@ -61,8 +63,9 @@ type Factory struct {
 	// newer build migrated, and Drifted, for an edited change.
 	Ahead, Drift bool
 	// Fencing claims that Apply refuses a lease whose token is below one
-	// it has already applied under in the same epoch, and lets a lease of
-	// another epoch take over.
+	// it has already applied under in the same epoch, lets a lease of a
+	// new epoch take over, and then refuses every lease of the epoch it
+	// took over from.
 	Fencing bool
 }
 
@@ -86,6 +89,12 @@ func Run(t *testing.T, f Factory) {
 			t.Skip("the adapter doesn't claim fencing")
 		}
 		newEpoch(t, f)
+	})
+	t.Run("ASupersededEpochCantApply", func(t *testing.T) {
+		if !f.Fencing {
+			t.Skip("the adapter doesn't claim fencing")
+		}
+		supersededEpoch(t, f)
 	})
 	t.Run("AheadIsDetected", func(t *testing.T) {
 		if !f.Ahead {
@@ -389,6 +398,32 @@ func newEpoch(t *testing.T, f Factory) {
 		t.Fatalf("a restarted process can't apply: %v", err)
 	}
 	want(t, ctx, build(Next), migrate.UpToDate, "after the restarted process applied")
+}
+
+// Once a new epoch has taken the fence over, a holder of the old one, such
+// as the process before a restart that resumed after a pause, can't take it
+// back, whatever its token.
+func supersededEpoch(t *testing.T, f Factory) {
+	ctx := ctxFor(t)
+	build := open(t, f)
+	all := migrate.ApplyOptions{MaxRisk: migrate.Manual, AllowUnknown: true, Lock: epochLease("first", 5)}
+	if _, err := build(Base).Apply(ctx, all); err != nil {
+		t.Fatal(err)
+	}
+	all.Lock = epochLease("second", 1)
+	if _, err := build(Next).Apply(ctx, all); err != nil {
+		t.Fatalf("a lease of a new epoch can't apply: %v", err)
+	}
+	all.Lock = epochLease("first", 7)
+	if _, err := build(Last).Apply(ctx, all); err == nil {
+		t.Fatal("a lease of the superseded epoch applied")
+	}
+	want(t, ctx, build(Last), migrate.Pending, "after the superseded epoch tried")
+	all.Lock = epochLease("second", 2)
+	if _, err := build(Last).Apply(ctx, all); err != nil {
+		t.Fatalf("the new epoch's next lease can't apply: %v", err)
+	}
+	want(t, ctx, build(Last), migrate.UpToDate, "after the new epoch's next lease applied")
 }
 
 func ahead(t *testing.T, f Factory) {
