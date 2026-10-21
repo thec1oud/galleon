@@ -78,6 +78,12 @@ func TestTheRegistryRefusesDuplicatesAndDanglingRelations(t *testing.T) {
 			t.Errorf("%s: got %v", want, err)
 		}
 	}
+	broken := customer()
+	broken.Key = nil
+	_, err := data.NewModels(order(), broken)
+	if err == nil || !strings.Contains(err.Error(), "no primary key") || strings.Contains(err.Error(), "isn't registered") {
+		t.Errorf("a relation to a model refused already must not be reported again: %v", err)
+	}
 	listed := customer()
 	listed.Columns = []string{"id", "name"}
 	o := order()

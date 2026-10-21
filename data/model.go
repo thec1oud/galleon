@@ -134,9 +134,9 @@ func (m ModelInfo) clone() ModelInfo {
 // changes afterwards, so it is safe for concurrent use. A nil *Models has no
 // models.
 //
-// Modules register models with galleon.Collect(r, models...), and the data
-// module (pg.Module) builds the registry from them, failing boot when one
-// is invalid or two share a name or a table.
+// Modules register models with galleon.Collect(r, models...), which checks
+// each with Validate, and the data module (pg.Module) builds the registry
+// from them, failing Start when two share a name or a table.
 type Models struct {
 	byName map[string]ModelInfo
 	names  []string // sorted
@@ -148,8 +148,10 @@ type Models struct {
 func NewModels(models ...ModelInfo) (*Models, error) {
 	r := &Models{byName: map[string]ModelInfo{}}
 	tables := map[[2]string]string{}
+	refused := map[string]bool{} // models already reported, which relations to them needn't repeat
 	var errs []error
 	for _, m := range models {
+		refused[m.Name] = true
 		if err := m.Validate(); err != nil {
 			errs = append(errs, err)
 			continue
@@ -164,12 +166,16 @@ func NewModels(models ...ModelInfo) (*Models, error) {
 			continue
 		}
 		tables[table] = m.Name
+		delete(refused, m.Name)
 		r.byName[m.Name] = m.clone()
 		r.names = append(r.names, m.Name)
 	}
 	for _, name := range r.names {
 		for _, rel := range r.byName[name].Relations {
 			to, ok := r.byName[rel.Model]
+			if !ok && refused[rel.Model] {
+				continue
+			}
 			if !ok {
 				errs = append(errs, fmt.Errorf("model %q: relation %q refers to model %q, which isn't registered", name, rel.Name, rel.Model))
 				continue
