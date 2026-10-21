@@ -184,6 +184,7 @@ func (m *Manager) enclosing(ctx context.Context) (h *handle, foreign bool) {
 }
 
 func (m *Manager) begin(ctx context.Context, write bool, o data.Options, closure bool) (*handle, error) {
+	ctx = control(ctx)
 	if o.Retry != nil && !closure {
 		return nil, misuse(data.CodePropagation, "data.Retry applies to the Read and Write closures; a pair never retries (use data.Retry(p).Do to rerun one)")
 	}
@@ -478,6 +479,7 @@ func (h *handle) join(write bool) *handle {
 }
 
 func (h *handle) nest(ctx context.Context, write bool) (*handle, error) {
+	ctx = control(ctx)
 	if h.state != open {
 		return nil, errEnded
 	}
@@ -557,7 +559,7 @@ func (h *handle) commit(ctx context.Context) error {
 		h.parent.forget(h)
 		return nil
 	case nestedKind:
-		err := h.tx.Commit(h.root.stmtCtx(ctx))
+		err := h.tx.Commit(h.root.stmtCtx(control(ctx)))
 		h.parent.forget(h)
 		p := h.parent.owner()
 		if err != nil {
@@ -573,9 +575,9 @@ func (h *handle) commit(ctx context.Context) error {
 	}
 	var err error
 	if h.root.write && h.root.conn != nil {
-		err = h.root.commitWrite(h.root.stmtCtx(ctx), h.tx)
+		err = h.root.commitWrite(h.root.stmtCtx(control(ctx)), h.tx)
 	} else {
-		err = h.tx.Commit(h.root.stmtCtx(ctx))
+		err = h.tx.Commit(h.root.stmtCtx(control(ctx)))
 	}
 	if err != nil {
 		// The transaction has ended either way.
@@ -667,7 +669,7 @@ func (h *handle) rollback(ctx context.Context) error {
 	// A cancelled ctx would fail the rollback and cost the connection.
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	err := h.tx.Rollback(h.root.stmtCtx(dctx))
+	err := h.tx.Rollback(h.root.stmtCtx(control(dctx)))
 	if h.kind == nestedKind {
 		h.parent.forget(h)
 		if err != nil {
@@ -706,6 +708,15 @@ func run(ctx context.Context, fns []func(context.Context)) {
 	for _, fn := range fns {
 		fn(ctx)
 	}
+}
+
+// control is ctx for the statements that begin, end or configure a
+// transaction, which serve no model, whatever model ctx names.
+func control(ctx context.Context) context.Context {
+	if _, ok := data.ModelFrom(ctx); ok {
+		return data.ForModel(ctx, "")
+	}
+	return ctx
 }
 
 func (r *root) stmtCtx(ctx context.Context) context.Context {

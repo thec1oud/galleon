@@ -53,11 +53,11 @@ func (t *queryTracer) attrs(conn *pgx.Conn) []attribute.KeyValue {
 }
 
 // model adds the model ctx names to attrs, and with table, its table as
-// the collection when the model is registered. Statements that control
-// the transaction, such as BEGIN or SAVEPOINT, serve no model.
-func (t *queryTracer) model(ctx context.Context, op string, attrs []attribute.KeyValue, table bool) []attribute.KeyValue {
+// the collection when the model is registered. The statements that begin,
+// end or configure a transaction run without one (see control).
+func (t *queryTracer) model(ctx context.Context, attrs []attribute.KeyValue, table bool) []attribute.KeyValue {
 	name, ok := data.ModelFrom(ctx)
-	if !ok || txControl[op] {
+	if !ok {
 		return attrs
 	}
 	attrs = append(attrs, attrModel.String(name))
@@ -70,14 +70,9 @@ func (t *queryTracer) model(ctx context.Context, op string, attrs []attribute.Ke
 	return attrs
 }
 
-// txControl is the first keywords of the statements that begin, end or
-// configure a transaction.
-var txControl = map[string]bool{"BEGIN": true, "START": true, "COMMIT": true, "END": true, "ROLLBACK": true,
-	"SAVEPOINT": true, "RELEASE": true, "SET": true}
-
 func (t *queryTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
 	op := operation(d.SQL)
-	attrs := t.model(ctx, op, append(t.attrs(conn), semconv.DBQueryText(d.SQL)), true)
+	attrs := t.model(ctx, append(t.attrs(conn), semconv.DBQueryText(d.SQL)), true)
 	name := "postgresql"
 	if op != "" {
 		attrs = append(attrs, semconv.DBOperationName(op))
@@ -92,7 +87,7 @@ func (t *queryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, d pgx.Trac
 }
 
 func (t *queryTracer) TraceBatchStart(ctx context.Context, conn *pgx.Conn, d pgx.TraceBatchStartData) context.Context {
-	attrs := t.model(ctx, "BATCH", append(t.attrs(conn), semconv.DBOperationName("BATCH")), true)
+	attrs := t.model(ctx, append(t.attrs(conn), semconv.DBOperationName("BATCH")), true)
 	if d.Batch != nil {
 		attrs = append(attrs, semconv.DBOperationBatchSize(d.Batch.Len()))
 	}
@@ -114,7 +109,7 @@ func (t *queryTracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, d pgx.Trac
 
 func (t *queryTracer) TraceCopyFromStart(ctx context.Context, conn *pgx.Conn, d pgx.TraceCopyFromStartData) context.Context {
 	// A copy names its own table, whatever the model's.
-	attrs := t.model(ctx, "COPY", append(t.attrs(conn), semconv.DBOperationName("COPY"), semconv.DBCollectionName(d.TableName.Sanitize())), false)
+	attrs := t.model(ctx, append(t.attrs(conn), semconv.DBOperationName("COPY"), semconv.DBCollectionName(d.TableName.Sanitize())), false)
 	ctx, _ = t.m.tracer().Start(ctx, "COPY "+d.TableName.Sanitize(), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 	return ctx
 }

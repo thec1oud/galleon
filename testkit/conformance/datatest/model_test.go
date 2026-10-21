@@ -70,8 +70,20 @@ func modelSpans(t *testing.T, m data.Manager, tp *datatest.Recorder, schema, mod
 			if err := w.SendBatch(ctx, b).Close(); err != nil {
 				return err
 			}
-			_, err := w.CopyFrom(ctx, data.Identifier{schema, "items"}, []string{"id", "v"}, pgx.CopyFromRows([][]any{{20 + i, "copied"}}))
-			return err
+			if _, err := w.CopyFrom(ctx, data.Identifier{schema, "items"}, []string{"id", "v"}, pgx.CopyFromRows([][]any{{20 + i, "copied"}})); err != nil {
+				return err
+			}
+			// Savepoints released and rolled back.
+			for _, end := range []func(data.WriteTx) error{func(sp data.WriteTx) error { return sp.Commit(ctx) }, func(sp data.WriteTx) error { return sp.Rollback(ctx) }} {
+				sp, err := w.BeginWrite(ctx)
+				if err != nil {
+					return err
+				}
+				if err := end(sp); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -113,13 +125,15 @@ func TestStatementSpansNameTheModelAndItsTable(t *testing.T) {
 			t.Errorf("%s without a model: the collection is %q, want %q", kind, got, want)
 		}
 	}
-	control := tp.Find(func(s *datatest.Span) bool { return s.Name() == "BEGIN" })
-	if len(control) == 0 {
-		t.Fatalf("no BEGIN span among %v", tp.Names())
-	}
-	for _, s := range control {
-		if s.Attr("galleon.data.model") != "" || s.Attr("db.collection.name") != "" {
-			t.Errorf("a BEGIN span names the model or its table: %q, %q", s.Attr("galleon.data.model"), s.Attr("db.collection.name"))
+	for _, name := range []string{"BEGIN", "SAVEPOINT", "RELEASE", "ROLLBACK"} {
+		control := tp.Find(func(s *datatest.Span) bool { return s.Name() == name })
+		if len(control) == 0 {
+			t.Fatalf("no %s span among %v", name, tp.Names())
+		}
+		for _, s := range control {
+			if s.Attr("galleon.data.model") != "" || s.Attr("db.collection.name") != "" {
+				t.Errorf("a %s span names the model or its table: %q, %q", name, s.Attr("galleon.data.model"), s.Attr("db.collection.name"))
+			}
 		}
 	}
 }
