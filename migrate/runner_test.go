@@ -665,7 +665,7 @@ func TestRetryingTheRenewalAfterTheWaitStopsAtTheLockWait(t *testing.T) {
 	blocked(t, fc, 3)
 	fc.Advance(500 * time.Millisecond)
 	got := within(t, "the apply", done)
-	if got.reps[0].Outcome != migrate.Failed || !strings.Contains(got.err.Error(), "renewing the lease it was granted after waiting: lock_wait (1s) passed") || !errors.Is(got.err, context.DeadlineExceeded) {
+	if got.reps[0].Outcome != migrate.Failed || !strings.Contains(got.err.Error(), `migrator "schema": renewing the migration lock it was granted after waiting: lock_wait (1s) passed`) || !errors.Is(got.err, context.DeadlineExceeded) {
 		t.Fatalf("%+v, %v", got.reps, got.err)
 	}
 }
@@ -906,5 +906,40 @@ func TestAnEmptyPlanWhoseStatusCantBeReadIsUnplanned(t *testing.T) {
 	plans := newRunner(t, newLocker(), p, m).Plan(context.Background(), false)
 	if !plans[0].Unplanned || plans[0].MaxRisk() != migrate.Unknown || !hasCode(plans[0].Refused, migrate.CodeRiskRefused) || plans[0].StatusErr == nil {
 		t.Fatalf("%+v", plans[0])
+	}
+}
+
+func TestAPinnedEmptyPlanWhoseStatusCantBeReadIsRefusedForThatReason(t *testing.T) {
+	m := emptyPlanner{&fake{db: newDB(), name: "schema", steps: twoSafe, statErr: errBoom}}
+	p := dev
+	p.Approved = map[string]string{"schema": "a-reviewed-plan"}
+	plans := newRunner(t, newLocker(), p, m).Plan(context.Background(), false)
+	r := plans[0].Refused
+	if !hasCode(r, migrate.CodeFingerprintMismatch) || !errors.Is(r, errBoom) || !strings.Contains(r.Error(), "couldn't be read") || strings.Contains(r.Error(), "its status is pending") {
+		t.Fatalf("%v", r)
+	}
+}
+
+func TestTheDeadlineErrorAfterAWaitNamesTheLastRealFailure(t *testing.T) {
+	l := newLocker()
+	hanging := make(chan struct{})
+	l.renew = func(ctx context.Context) error {
+		if l.renewals == 1 { // this is the first renewal
+			return errors.New("partitioned")
+		}
+		close(hanging)
+		<-ctx.Done() // the deadline cuts this one off
+		return ctx.Err()
+	}
+	sleeping := make(chan time.Duration, 4)
+	fc, renewed, done := waitingFor(t, l, &fake{db: newDB(), name: "schema", steps: twoSafe}, 0, 5*time.Second, sleeping)
+	within(t, "the first renewal", renewed)
+	within(t, "the pause before retrying", sleeping)
+	fc.Advance(500 * time.Millisecond)
+	within(t, "the second renewal", hanging)
+	fc.Advance(time.Second) // 1.5s after the first attempt
+	got := within(t, "the apply", done)
+	if !hasCode(got.err, migrate.CodeLeaseLost) || !strings.Contains(got.err.Error(), "partitioned") || strings.Contains(got.err.Error(), "context canceled") {
+		t.Fatalf("%+v, %v", got.reps, got.err)
 	}
 }

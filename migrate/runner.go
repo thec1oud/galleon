@@ -193,12 +193,13 @@ type PlanReport struct {
 	// Err is why there is no plan; for a migrator without the capability,
 	// an Unimplemented error saying so.
 	Err error
-	// Unplanned reports that the status is Pending but the online plan is
-	// empty: what Apply would do is in no plan, so its risk is Unknown.
+	// Unplanned reports that the online plan is empty while the status is
+	// Pending, or couldn't be read and so may be: what Apply would do is
+	// in no plan, so its risk is Unknown.
 	Unplanned bool
 	// StatusErr is why the migrator's status couldn't be read after it
-	// planned. The plan is kept, but whether it is unplanned, drifted or
-	// ahead isn't known.
+	// planned. The plan is kept; whether the database has drifted or is
+	// ahead isn't known, and an empty plan counts as Unplanned.
 	StatusErr error
 	// Refused is why the policy would refuse the plan, or nil.
 	Refused error
@@ -236,7 +237,7 @@ func (r *Runner) Plan(ctx context.Context, offline bool) []PlanReport {
 		}
 		rep.Plan = pl
 		if offline {
-			rep.Refused = r.policy.check(m.Name(), pl, false)
+			rep.Refused = r.policy.check(m.Name(), pl, false, nil)
 			out = append(out, rep)
 			continue
 		}
@@ -245,13 +246,15 @@ func (r *Runner) Plan(ctx context.Context, offline bool) []PlanReport {
 		if err != nil {
 			rep.StatusErr = fmt.Errorf("plan: migrator %q: reading its status: %w", m.Name(), err)
 		}
-		// A status that can't be read may be pending: an empty plan is
-		// then unplanned, as Apply would find it, and fails closed.
+		// A status that can't be read may be pending, so an empty plan is
+		// then unplanned and fails closed: refused unless allow_unknown, or
+		// pinned. Apply, which reads the status under the lock, fails
+		// outright on such an error.
 		pending := err != nil || st.State == Pending
 		rep.Unplanned = unplanned(pl, pending)
 		rep.Refused = r.stateRefusal(m.Name(), st, err)
 		if rep.Refused == nil {
-			rep.Refused = r.policy.check(m.Name(), pl, pending)
+			rep.Refused = r.policy.check(m.Name(), pl, pending, rep.StatusErr)
 		}
 		out = append(out, rep)
 	}
@@ -370,7 +373,7 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 		log.InfoContext(ctx, "another node is applying this migrator; waiting for it")
 		lease, asked, err = r.wait(ctx, name, ttl, log)
 		if err != nil {
-			rep.Outcome, rep.Err = Failed, fmt.Errorf("migrator %q: waiting for the migration lock: %w", name, err)
+			rep.Outcome, rep.Err = Failed, fmt.Errorf("migrator %q: %w", name, err)
 			return rep
 		}
 	}
@@ -411,7 +414,7 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 		}
 		risk := planRisk(pl, true)
 		span.SetAttributes(attrFingerprint.String(pl.Fingerprint()), attrRisk.String(risk.String()))
-		if err := r.policy.check(name, pl, true); err != nil {
+		if err := r.policy.check(name, pl, true, nil); err != nil {
 			rep.Outcome, rep.Err = Refused, err
 			return rep
 		}
@@ -558,9 +561,9 @@ func (r *Runner) wait(ctx context.Context, name string, ttl time.Duration, log *
 		lease, err := r.locker.Acquire(wctx, LockKey(name), ttl)
 		if err != nil {
 			if wctx.Err() != nil {
-				return nil, time.Time{}, fmt.Errorf("waiting for another node's apply: %w", context.Cause(wctx))
+				return nil, time.Time{}, fmt.Errorf("waiting for the migration lock, which another node holds: %w", context.Cause(wctx))
 			}
-			return nil, time.Time{}, err
+			return nil, time.Time{}, fmt.Errorf("waiting for the migration lock: %w", err)
 		}
 		renewed, err := r.renewAfterWait(wctx, lease, log)
 		switch {
@@ -568,13 +571,13 @@ func (r *Runner) wait(ctx context.Context, name string, ttl time.Duration, log *
 			return lease, renewed, nil
 		case wctx.Err() != nil:
 			// The lease was granted: the wait ended while renewing it.
-			return nil, time.Time{}, fmt.Errorf("renewing the lease it was granted after waiting: %w", context.Cause(wctx))
+			return nil, time.Time{}, fmt.Errorf("renewing the migration lock it was granted after waiting: %w", context.Cause(wctx))
 		case !errors.Is(err, coord.ErrLeaseLost):
-			return nil, time.Time{}, fmt.Errorf("renewing the lease it waited for: %w", err)
+			return nil, time.Time{}, fmt.Errorf("renewing the migration lock it was granted after waiting: %w", err)
 		}
 		log.WarnContext(ctx, "the migration lease was lost as soon as it was granted; asking for it again", "token", lease.Token())
 		if err := r.sleep(wctx, every); err != nil {
-			return nil, time.Time{}, fmt.Errorf("pausing before asking for the lease again: %w", err)
+			return nil, time.Time{}, fmt.Errorf("pausing before asking for the migration lock again: %w", err)
 		}
 	}
 }
@@ -621,7 +624,9 @@ func (r *Runner) renewAfterWait(ctx context.Context, lease coord.Lease, log *slo
 		}
 		start := r.clock.Now()
 		err := lease.Renew(rctx)
-		last = err
+		if rctx.Err() == nil {
+			last = err // not one the deadline or ctx cut off
+		}
 		if err == nil {
 			return start, nil
 		}

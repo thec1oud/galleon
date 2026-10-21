@@ -141,14 +141,25 @@ func planRisk(pl Plan, pending bool) Risk {
 }
 
 // check returns why the policy refuses plan pl of migrator name, or nil.
-// pending says the migrator's status is Pending.
-func (p Policy) check(name string, pl Plan, pending bool) error {
+// pending says the migrator's status is Pending, or may be: statusErr,
+// when set, is why it couldn't be read, and becomes the refusal's cause.
+func (p Policy) check(name string, pl Plan, pending bool, statusErr error) error {
 	if unplanned(pl, pending) {
+		state := "its status is pending"
+		if statusErr != nil {
+			state = "its status couldn't be read, so it may be pending"
+		}
+		refuse := func(code, msg string) error {
+			if statusErr != nil {
+				return errs.Wrap(statusErr, errs.FailedPrecondition, code, msg)
+			}
+			return errs.New(errs.FailedPrecondition, code, msg)
+		}
 		if want, pinned := p.Approved[name]; pinned {
-			return errs.New(errs.FailedPrecondition, CodeFingerprintMismatch, fmt.Sprintf("migrator %q: its status is pending, but its plan is empty, so it can't be checked against the approved fingerprint %s; nothing was applied", name, want))
+			return refuse(CodeFingerprintMismatch, fmt.Sprintf("migrator %q: %s, but its plan is empty, so it can't be checked against the approved fingerprint %s; nothing was applied", name, state, want))
 		}
 		if !Allowed(Unknown, p.MaxRisk, p.AllowUnknown) {
-			return errs.New(errs.FailedPrecondition, CodeRiskRefused, fmt.Sprintf("migrator %q: its status is pending, but its plan is empty, so what it would apply is of unknown risk, which needs approval (allow_unknown); nothing was applied", name))
+			return refuse(CodeRiskRefused, fmt.Sprintf("migrator %q: %s, but its plan is empty, so what it would apply is of unknown risk, which needs approval (allow_unknown); nothing was applied", name, state))
 		}
 		return nil
 	}
