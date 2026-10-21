@@ -245,6 +245,7 @@ func TestARecordedHandleThatHasEndedIsRefusedByAfterCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = w.Rollback(context.Background()) })
 	rec := (&recording{}).writer(w)
 	if err := data.AfterCommit(data.With(ctx, rec), func(context.Context) {}); err != nil {
 		t.Fatalf("an open recorded handle was refused: %v", err)
