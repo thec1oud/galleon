@@ -48,6 +48,7 @@ func Run(t *testing.T, f Factory) {
 		t.Run("ExpiryClosesLost", func(t *testing.T) { expiry(t, f) })
 		t.Run("RenewKeepsTheLease", func(t *testing.T) { renew(t, f) })
 		t.Run("AcquireWaitsAndHonoursContext", func(t *testing.T) { acquireWaits(t, f) })
+		t.Run("ALeaseWaitedForLongerThanItsTTLIsHeld", func(t *testing.T) { longWait(t, f) })
 	})
 	t.Run("LeaderElection", func(t *testing.T) {
 		need(t, f, coord.LeaderElection)
@@ -307,6 +308,48 @@ func acquireWaits(t *testing.T, f Factory) {
 			}
 		}()
 		t.Fatal("waiter was not woken by Release")
+	}
+}
+
+// longWait checks rule 3's start of the TTL: a lease that Acquire returns
+// after a wait longer than its TTL has its whole TTL ahead of it, so it
+// can be renewed, and isn't lost.
+func longWait(t *testing.T, f Factory) {
+	ns := nodes(t, f)
+	held, ok, err := ns[0].Locks().TryAcquire(ctx(t), "conformance/longwait", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	const ttl = 300 * time.Millisecond
+	got := make(chan coord.Lease, 1)
+	failed := make(chan error, 1)
+	waitCtx := ctx(t)
+	go func() {
+		l, err := ns[len(ns)-1].Locks().Acquire(waitCtx, "conformance/longwait", ttl)
+		if err != nil {
+			failed <- err
+			return
+		}
+		got <- l
+	}()
+	time.Sleep(2 * ttl) // the holder works for longer than the waiter's TTL
+	_ = held.Release(context.Background())
+	var l coord.Lease
+	select {
+	case l = <-got:
+	case err := <-failed:
+		t.Fatalf("waiting Acquire: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter was not woken by Release")
+	}
+	defer l.Release(context.Background())
+	select {
+	case <-l.Lost():
+		t.Fatal("Acquire returned a lease that was already lost")
+	default:
+	}
+	if err := l.Renew(ctx(t)); err != nil {
+		t.Fatalf("Renew right after a wait longer than the TTL: %v", err)
 	}
 }
 

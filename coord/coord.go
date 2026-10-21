@@ -96,7 +96,12 @@ type Locker interface {
 	TryAcquire(ctx context.Context, key string, ttl time.Duration) (lease Lease, ok bool, err error)
 }
 
-// Lease is a held lock.
+// Lease is a held lock. Its TTL never starts before the call that grants
+// or renews it begins: TryAcquire's and Renew's start during the call, and
+// Acquire's no earlier than the moment the lease is granted, however long
+// it waited, so Acquire never returns a lease that has already expired. A
+// holder measures its deadline from before the call that last granted or
+// renewed the lease.
 type Lease interface {
 	Key() string
 	// Token is a fencing token, strictly increasing per key within its
