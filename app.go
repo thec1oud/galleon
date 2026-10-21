@@ -154,6 +154,7 @@ type App struct {
 
 	collections     map[reflectType]*collection
 	collectionOrder []*collection
+	collected       bool // the collections are provided; Collect is closed
 
 	configRaw    map[string]json.RawMessage
 	configOwners map[string]string

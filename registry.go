@@ -152,15 +152,21 @@ func Supply[T any](r *Registry, value T) {
 // so that []T is provided even when no module adds to it. Nothing else may
 // provide []T. Consumers must not modify the slice.
 //
-// A value whose type has a Validate() error method is checked as it is
-// collected, and one that fails it fails boot, naming the module and the
-// line, as a config section does.
+// A value with a Validate() error method, on T or on *T, is checked as it
+// is collected, and one that fails it fails boot, naming the module and the
+// line, as a config section does. A nil pointer isn't checked.
+//
+// Collect belongs in Register: once New has provided the collections, it
+// panics rather than drop the values.
 //
 // An ORM adapter module, for one, registers its models with
 // galleon.Collect(r, models...), and the data module builds its model
 // registry from []data.ModelInfo.
 func Collect[T any](r *Registry, values ...T) {
 	typ := reflect.TypeFor[[]T]()
+	if r.app.collected {
+		panic(fmt.Sprintf("galleon: Collect[%s] (module %q, %s) called after boot: the collection is already provided; collect in Register", reflect.TypeFor[T](), r.module, callerSite(2)))
+	}
 	c, ok := r.app.collections[typ]
 	if !ok {
 		c = &collection{typ: typ, values: reflect.MakeSlice(typ, 0, len(values)), module: r.module, site: callerSite(2)}
@@ -168,8 +174,7 @@ func Collect[T any](r *Registry, values ...T) {
 		r.app.collectionOrder = append(r.app.collectionOrder, c)
 	}
 	for _, v := range values {
-		// A nil pointer can't be validated: its Validate may dereference it.
-		if val, ok := any(v).(interface{ Validate() error }); ok && !isNil(reflect.ValueOf(&v).Elem()) {
+		if val := validator(&v); val != nil {
 			if err := val.Validate(); err != nil {
 				r.errorf("Collect[%s]: %v", reflect.TypeFor[T](), err)
 				continue
@@ -177,6 +182,20 @@ func Collect[T any](r *Registry, values ...T) {
 		}
 		c.values = reflect.Append(c.values, reflect.ValueOf(&v).Elem())
 	}
+}
+
+// validator returns *v as a Validator, through T's methods or *T's, or nil
+// when it has neither, or is a nil pointer, whose Validate may dereference
+// it, held in an interface or not.
+func validator[T any](v *T) Validator {
+	if rv := reflect.ValueOf(any(*v)); !rv.IsValid() || rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return nil
+	}
+	if val, ok := any(*v).(Validator); ok {
+		return val
+	}
+	val, _ := any(v).(Validator)
+	return val
 }
 
 // collection is the values modules collected of one type, which the kernel
@@ -188,14 +207,17 @@ type collection struct {
 }
 
 // provideCollections provides each collection, once every module has
-// registered.
+// registered. Each slice is full to its capacity, so a consumer that
+// appends to it gets a copy rather than writing into another's.
 func (a *App) provideCollections() {
+	a.collected = true
 	for _, c := range a.collectionOrder {
 		if prev, ok := a.providers[c.typ]; ok {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("%s is provided by %s, but it is a collection (galleon.Collect, first by module %q, %s), which the kernel provides", c.typ, prev.describe(), c.module, c.site))
 			continue
 		}
-		p := &provider{typ: c.typ, module: kernelModule, site: c.site, value: c.values, built: true}
+		n := c.values.Len()
+		p := &provider{typ: c.typ, module: kernelModule, site: c.site, value: c.values.Slice3(0, n, n), built: true}
 		a.providers[c.typ] = p
 		a.providerOrder = append(a.providerOrder, p)
 	}

@@ -3,6 +3,7 @@ package galleon_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -114,6 +115,80 @@ func TestANilCollectedValueIsntValidated(t *testing.T) {
 	})
 	if _, err := galleon.New(base(mod)...); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// pchecker is an interface collection whose values may be nil pointers.
+type pchecker interface{ Validate() error }
+
+func TestANilPointerInAnInterfaceCollectionIsntValidated(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect[pchecker](r, (*checkedPtr)(nil), nil, &checkedPtr{ok: true})
+		return nil
+	})
+	if _, err := galleon.New(base(mod)...); err != nil {
+		t.Fatal(err)
+	}
+	bad := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect[pchecker](r, &checkedPtr{})
+		return nil
+	})
+	if _, err := galleon.New(base(bad)...); err == nil || !strings.Contains(err.Error(), "not ok") {
+		t.Fatalf("an invalid value in an interface collection: %v", err)
+	}
+}
+
+func TestAValueWhoseValidateHasAPointerReceiverIsValidated(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect(r, checkedPtr{ok: true}, checkedPtr{})
+		return nil
+	})
+	_, err := galleon.New(base(mod)...)
+	if err == nil || !strings.Contains(err.Error(), "Collect[galleon_test.checkedPtr]: not ok") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestCollectAfterBootPanicsRatherThanDropTheValues(t *testing.T) {
+	var reg *galleon.Registry
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		reg = r
+		galleon.Collect[tag](r)
+		return nil
+	})
+	if _, err := galleon.New(base(mod)...); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if p := recover(); p == nil || !strings.Contains(fmt.Sprint(p), "Collect[galleon_test.tag] (module \"orders\", ") || !strings.Contains(fmt.Sprint(p), "called after boot") {
+			t.Fatalf("got %v", p)
+		}
+	}()
+	galleon.Collect(reg, tag("late"))
+}
+
+func TestAConsumerAppendingToACollectionDoesntChangeAnothers(t *testing.T) {
+	type second struct{ all []tag }
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect(r, tag("a"), tag("b"))
+		galleon.Collect(r, tag("c")) // grows the slice past its length
+		galleon.Provide[*tags](r, func(all []tag) *tags { return &tags{all: append(all, "mine")} })
+		galleon.Provide[*second](r, func(all []tag, _ *tags) *second { return &second{all: append(all, "theirs")} })
+		return nil
+	})
+	app, err := galleon.New(base(mod)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer app.Shutdown(context.Background())
+	if got := galleon.MustResolve[*tags](app).all; !slices.Equal(got, []tag{"a", "b", "c", "mine"}) {
+		t.Fatalf("the first consumer has %v", got)
+	}
+	if got := galleon.MustResolve[[]tag](app); !slices.Equal(got, []tag{"a", "b", "c"}) {
+		t.Fatalf("the collection is %v", got)
 	}
 }
 
