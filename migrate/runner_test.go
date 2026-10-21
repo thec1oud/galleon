@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thec1oud/galleon/clock"
+	"github.com/thec1oud/galleon/coord"
 	"github.com/thec1oud/galleon/coord/local"
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/migrate"
@@ -454,28 +456,128 @@ func TestAPinnedMigratorWithNothingPendingHasNoMismatch(t *testing.T) {
 	}
 }
 
-func TestOneFailedRenewalIsRetriedUntilTheDeadline(t *testing.T) {
-	d := newDB()
-	l := newLocker()
-	l.flaky = 1
-	m := &fake{db: d, name: "schema", steps: twoSafe, block: make(chan struct{}), started: make(chan struct{})}
+// held starts an apply of m that holds its lease on a fake clock, with a
+// LockTTL of 2s: the Runner renews every 500ms and gives up 1.5s after the
+// last renewal began. It returns the clock, the renewals the Runner has
+// handled, and the apply's result.
+func held(t *testing.T, l *locker, m *fake) (*clock.Fake, <-chan error, <-chan error) {
+	t.Helper()
+	l.realTTL = time.Hour
+	fc := clock.NewFake(time.Unix(0, 0))
 	p := dev
-	p.LockTTL = 60 * time.Millisecond
+	p.LockTTL = 2 * time.Second
+	r, err := migrate.NewRunner(migrate.Config{Locker: l, Migrators: []migrate.Migrator{m}, Policy: p, Clock: fc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewed := make(chan error, 16)
+	migrate.OnRenewed(r, func(err error) { renewed <- err })
 	done := make(chan error, 1)
 	go func() {
-		_, err := newRunner(t, l, p, m).Apply(context.Background())
+		_, err := r.Apply(context.Background())
 		done <- err
 	}()
-	<-m.started
-	// Let the failed renewal and a good one happen before finishing.
-	until(t, "the flaky renewal fails and another succeeds", func() bool {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		return l.flaky == 0 && l.renewals >= 2
-	})
+	select {
+	case <-m.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the apply never started")
+	}
+	return fc, renewed, done
+}
+
+// within waits for a value from c, failing the test after a long deadline.
+func within[T any](t *testing.T, what string, c <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-c:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		panic("unreachable")
+	}
+}
+
+func TestOneFailedRenewalIsRetriedUntilTheDeadline(t *testing.T) {
+	l := newLocker()
+	l.flaky = 1
+	m := &fake{db: newDB(), name: "schema", steps: twoSafe, block: make(chan struct{}), started: make(chan struct{})}
+	fc, renewed, done := held(t, l, m)
+	fc.Advance(500 * time.Millisecond)
+	if err := within(t, "the first renewal", renewed); err == nil {
+		t.Fatal("the flaky renewal succeeded")
+	}
+	fc.Advance(500 * time.Millisecond)
+	if err := within(t, "the second renewal", renewed); err != nil {
+		t.Fatalf("the second renewal failed: %v", err)
+	}
+	// Past the deadline the grant set, but well inside the one the good
+	// renewal set.
+	fc.Advance(600 * time.Millisecond)
 	close(m.block)
-	if err := <-done; err != nil {
+	if err := within(t, "the apply", done); err != nil {
 		t.Fatalf("one failed renewal cancelled the apply: %v", err)
+	}
+}
+
+func TestARenewalThatSaysTheLeaseIsLostCancelsTheApplyAtOnce(t *testing.T) {
+	l := newLocker()
+	// The backend says the lease is gone, but Lost never closes.
+	l.renew = func(context.Context) error { return coord.ErrLeaseLost }
+	m := &fake{db: newDB(), name: "schema", steps: twoSafe, block: make(chan struct{}), started: make(chan struct{})}
+	fc, _, done := held(t, l, m)
+	fc.Advance(500 * time.Millisecond) // one renewal, far from the deadline
+	if err := within(t, "the apply", done); !hasCode(err, migrate.CodeLeaseLost) {
+		t.Fatalf("got %v, want %s", err, migrate.CodeLeaseLost)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.renewals != 1 {
+		t.Errorf("renewed %d times after the lease was lost", l.renewals)
+	}
+}
+
+func TestRenewalsThatKeepFailingCancelTheApplyBeforeTheLeaseExpires(t *testing.T) {
+	l := newLocker()
+	l.renewed = errors.New("timeout")
+	m := &fake{db: newDB(), name: "schema", steps: twoSafe, block: make(chan struct{}), started: make(chan struct{})}
+	fc, renewed, done := held(t, l, m)
+	for range 2 {
+		fc.Advance(500 * time.Millisecond)
+		within(t, "a failed renewal", renewed)
+	}
+	fc.Advance(499 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("cancelled before the deadline: %v", err)
+	default:
+	}
+	// 1.5s after the grant: a renewal interval short of the 2s TTL.
+	fc.Advance(time.Millisecond)
+	if err := within(t, "the apply", done); !hasCode(err, migrate.CodeLeaseLost) {
+		t.Fatalf("got %v, want %s", err, migrate.CodeLeaseLost)
+	}
+}
+
+func TestARenewalThatHangsIsCutOffAtTheDeadline(t *testing.T) {
+	l := newLocker()
+	hanging := make(chan struct{})
+	returned := make(chan error, 1)
+	l.renew = func(ctx context.Context) error {
+		close(hanging)
+		<-ctx.Done()
+		returned <- ctx.Err()
+		return ctx.Err()
+	}
+	m := &fake{db: newDB(), name: "schema", steps: twoSafe, block: make(chan struct{}), started: make(chan struct{})}
+	fc, _, done := held(t, l, m)
+	fc.Advance(500 * time.Millisecond)
+	within(t, "the renewal to start", hanging)
+	fc.Advance(time.Second) // the deadline, 1.5s after the grant
+	if err := within(t, "the apply", done); !hasCode(err, migrate.CodeLeaseLost) {
+		t.Fatalf("got %v, want %s", err, migrate.CodeLeaseLost)
+	}
+	if err := within(t, "the renewal to return", returned); err == nil {
+		t.Fatal("the renewal returned without its context ending")
 	}
 }
 
@@ -493,7 +595,7 @@ func TestLosingTheLeaseAfterApplyCommittedReportsApplied(t *testing.T) {
 	if err != nil || reps[0].Outcome != migrate.Applied {
 		t.Fatalf("%+v, %v", reps[0], err)
 	}
-	if len(reps[0].Notes) != 1 || !strings.Contains(reps[0].Notes[0], "lost after the apply finished") {
+	if len(reps[0].Notes) != 1 || !strings.Contains(reps[0].Notes[0], "lost before Apply returned") {
 		t.Errorf("notes %v", reps[0].Notes)
 	}
 }

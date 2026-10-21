@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/coord"
 	"github.com/thec1oud/galleon/errs"
 )
@@ -31,6 +32,10 @@ type Config struct {
 	Logger         *slog.Logger
 	TracerProvider trace.TracerProvider
 	MeterProvider  metric.MeterProvider
+	// Clock times lease renewals and the deadline the Runner cancels an
+	// apply by. It must keep the coordination backend's time; the default
+	// is the system clock, which the in-process backend keeps too.
+	Clock clock.Clock
 }
 
 // Runner applies migrators exactly once across the cluster, under the
@@ -45,6 +50,9 @@ type Runner struct {
 	log       *slog.Logger
 	tracer    trace.Tracer
 	metrics   *metrics
+	clock     clock.Clock
+	// renewed, set by tests, is called after each renewal is handled.
+	renewed func(err error)
 }
 
 // NewRunner checks cfg and returns its Runner.
@@ -71,7 +79,11 @@ func NewRunner(cfg Config) (*Runner, error) {
 	if cfg.TracerProvider == nil {
 		cfg.TracerProvider = noop.NewTracerProvider()
 	}
+	if cfg.Clock == nil {
+		cfg.Clock = clock.System()
+	}
 	return &Runner{
+		clock:     cfg.Clock,
 		locker:    cfg.Locker,
 		migrators: append([]Migrator(nil), cfg.Migrators...),
 		policy:    cfg.Policy,
@@ -290,6 +302,9 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 	}()
 
 	ttl := r.policy.lockTTL()
+	// The lease's TTL runs from when the backend granted it, at the
+	// latest, so the safety deadline is measured from before asking.
+	asked := r.clock.Now()
 	lease, ok, err := r.locker.TryAcquire(ctx, LockKey(name), ttl)
 	if err != nil {
 		rep.Outcome, rep.Err = Failed, fmt.Errorf("migrator %q: taking the migration lock: %w", name, err)
@@ -302,6 +317,7 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 		if r.policy.LockWait > 0 {
 			wctx, cancel = context.WithTimeout(ctx, r.policy.LockWait)
 		}
+		asked = r.clock.Now()
 		lease, err = r.locker.Acquire(wctx, LockKey(name), ttl)
 		cancel()
 		if err != nil {
@@ -310,7 +326,7 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 		}
 	}
 	span.SetAttributes(attrToken.Int64(int64(lease.Token())))
-	actx, stop := r.hold(ctx, lease, log)
+	actx, stop := r.hold(ctx, lease, asked, log)
 	defer stop()
 
 	// Read under the lock: a node that waited sees what the holder did,
@@ -374,7 +390,7 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 	if r.lost(actx, nil) != nil {
 		// Apply returned success, so its changes are committed: the lease
 		// ended after them, and what is applied stays applied.
-		note := "the migration lease was lost after the apply finished; its changes are committed"
+		note := "the migration lease was lost before Apply returned; Apply reported success, so its changes are taken as committed"
 		rep.Notes = append(rep.Notes, note)
 		log.WarnContext(ctx, note, "token", lease.Token())
 	}
@@ -395,48 +411,73 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 }
 
 // hold keeps lease renewed until stop is called, and returns a context
-// that is cancelled, with errLeaseLost as its cause, if the lease is lost:
-// when the backend says so, or when renewing has failed until the lease's
-// deadline has passed. A renewal that fails is retried at every tick until
-// then, so one failed round trip doesn't cancel an apply. stop releases the
-// lease.
-func (r *Runner) hold(ctx context.Context, lease coord.Lease, log *slog.Logger) (context.Context, func()) {
+// that is cancelled, with errLeaseLost as its cause, as soon as the lease
+// may no longer be held:
+//
+//   - the backend closes Lost, or a Renew reports coord.ErrLeaseLost;
+//   - or the safety deadline passes: a TTL after the start of the last
+//     successful renewal (or of the request that granted the lease), less
+//     one renewal interval, so the apply stops strictly before a backend
+//     that relies on the TTL alone could grant the lease to another node.
+//
+// Any other Renew error is retried at the next tick, until that deadline. A
+// timer, not the ticker, enforces it, and each Renew runs with the returned
+// context, so a Renew that hangs is cut off at the deadline too. stop
+// releases the lease.
+func (r *Runner) hold(ctx context.Context, lease coord.Lease, granted time.Time, log *slog.Logger) (context.Context, func()) {
 	actx, cancel := context.WithCancelCause(ctx)
+	ttl := r.policy.lockTTL()
+	// Renewing four times a TTL, and stopping one interval short of it,
+	// leaves two retries after a failed renewal before the deadline.
+	every := max(ttl/4, minRenewInterval)
+	safe := max(ttl-every, ttl/2) // how long after a renewal starts the lease is surely held
+	deadline := r.clock.AfterFunc(r.clock.Until(granted.Add(safe)), func() {
+		if actx.Err() == nil {
+			log.ErrorContext(ctx, "the migration lease couldn't be renewed before its deadline; cancelling the apply", "token", lease.Token())
+		}
+		cancel(errLeaseLost)
+	})
+	ticker := r.clock.NewTicker(every)
 	done := make(chan struct{})
 	exited := make(chan struct{})
-	ttl := r.policy.lockTTL()
-	every := max(ttl/3, minRenewInterval)
 	go func() {
 		defer close(exited)
-		t := time.NewTicker(every)
-		defer t.Stop()
-		renewed := time.Now()
+		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
+				return
+			case <-actx.Done():
 				return
 			case <-lease.Lost():
 				log.ErrorContext(ctx, "the migration lease was lost while applying; cancelling the apply", "token", lease.Token())
 				cancel(errLeaseLost)
 				return
-			case <-t.C:
+			case <-ticker.C():
+				start := r.clock.Now()
 				err := lease.Renew(actx)
-				if err == nil {
-					renewed = time.Now()
-					continue
-				}
-				if time.Since(renewed) >= ttl {
-					log.ErrorContext(ctx, "renewing the migration lease failed until its deadline; cancelling the apply", "token", lease.Token(), "error", err)
+				switch {
+				case err == nil:
+					deadline.Reset(r.clock.Until(start.Add(safe)))
+				case errors.Is(err, coord.ErrLeaseLost):
+					log.ErrorContext(ctx, "the backend says the migration lease is lost; cancelling the apply", "token", lease.Token())
 					cancel(errLeaseLost)
 					return
+				case actx.Err() != nil:
+					return // the deadline cut the renewal off
+				default:
+					log.WarnContext(ctx, "renewing the migration lease failed; retrying until its deadline", "token", lease.Token(), "error", err)
 				}
-				log.WarnContext(ctx, "renewing the migration lease failed; retrying until its deadline", "token", lease.Token(), "error", err)
+				if r.renewed != nil {
+					r.renewed(err)
+				}
 			}
 		}
 	}()
 	return actx, func() {
 		close(done)
 		<-exited
+		deadline.Stop()
 		cancel(nil)
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer rcancel()

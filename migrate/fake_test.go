@@ -1,6 +1,7 @@
 package migrate_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"slices"
@@ -149,9 +150,15 @@ type locker struct {
 	renewed  error // what Renew returns
 	flaky    int   // how many Renews fail before they succeed again
 	renewals int   // Renews called
+	// realTTL, when set, is the TTL the wrapped Locker grants instead, so
+	// a test on a fake clock isn't cut short by real time.
+	realTTL time.Duration
+	// renew, when set, is what Renew does instead.
+	renew func(ctx context.Context) error
 }
 
 func (l *locker) TryAcquire(ctx context.Context, key string, ttl time.Duration) (coord.Lease, bool, error) {
+	ttl = cmp.Or(l.realTTL, ttl)
 	in, ok, err := l.Locker.TryAcquire(ctx, key, ttl)
 	if !ok || err != nil {
 		return in, ok, err
@@ -163,7 +170,7 @@ func (l *locker) Acquire(ctx context.Context, key string, ttl time.Duration) (co
 	l.mu.Lock()
 	l.waits++
 	l.mu.Unlock()
-	in, err := l.Locker.Acquire(ctx, key, ttl)
+	in, err := l.Locker.Acquire(ctx, key, cmp.Or(l.realTTL, ttl))
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +215,11 @@ func (l *lease) lose()                 { l.once.Do(func() { close(l.lost) }) }
 func (l *lease) Lost() <-chan struct{} { return l.lost }
 func (l *lease) Renew(ctx context.Context) error {
 	l.l.mu.Lock()
+	if f := l.l.renew; f != nil {
+		l.l.renewals++
+		l.l.mu.Unlock()
+		return f(ctx)
+	}
 	err := l.l.renewed
 	l.l.renewals++
 	if l.l.flaky > 0 {
