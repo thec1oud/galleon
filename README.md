@@ -10,8 +10,8 @@ This repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each mod
 
 | Module | Path | Contents |
 |---|---|---|
-| `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness, node identity, OpenTelemetry and slog), the clock seam, roles and the process supervisor, the error model, coordination interfaces and the in-process `local` backend, the operation model and HTTP/RPC transport, the outbound client, and the data plane (`data` interfaces, `pg` on pgx) |
-| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`), `testkit.DB`, a Postgres database per package with a transaction per test, `testkit.Replica`, its view on a streaming replica, and `testkit.Proxy` |
+| `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness, node identity, OpenTelemetry and slog), the clock seam, roles and the process supervisor, the error model, coordination interfaces and the in-process `local` backend, the operation model and HTTP/RPC transport, the outbound client, the data plane (`data` interfaces, `pg` on pgx), and the migration seam (`migrate`, with the built-in `pg/sqlmigrate`) |
+| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`, `conformance/migratetest`), a fake migrator (`testkit.MigrationStore`), `testkit.DB`, a Postgres database per package with a transaction per test, `testkit.Replica`, its view on a streaming replica, and `testkit.Proxy` |
 
 Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `coord-pg`, `jobs`, `web`, `realtime`, `http3`, `adapters/*`, `cmd/galleon`.
 
@@ -68,3 +68,7 @@ Tests that need Postgres skip unless `GALLEON_TEST_POSTGRES` holds the DSN of a 
 ## Data plane status
 
 Package `pg` routes reads to streaming replicas by read consistency (`Primary`, `Any`, `BoundedStaleness(d)`, `ReadYourWrites` with wait and fail policies), tracks each replica's lag in the background, and carries read-your-writes across requests and nodes with signed causal tokens in the `Galleon-Consistency` header (see [§7.1, §7.4 and §7.5](docs/design/05-architecture.md#71-sources-and-topology)). Not built yet: `Snapshot` reads, sharing lag readings through coordination, replicas of named sources, the token cookie, and `WAIT FOR LSN` on PostgreSQL 19.
+
+## Migrations status
+
+Package `migrate` is the tool-neutral migration seam: a required `Migrator` core plus optional `Planner`, `OfflinePlanner`, `Verifier`, `Backgrounder` and `Completion`. A module registers a migrator with `galleon.Migrator`, and the kernel applies each one exactly once across the cluster under the coordination lock (with its fencing token), in declared order, gates readiness on its status (`migrate.<name>`), and enforces the deploy policy: the highest risk allowed, what Unknown risk means, and approved plan fingerprints. Boot modes are `off`, `verify` (the Production profile's default) and `apply` (the Development and Test profiles'), set with `galleon.Environment` and the `migrate` config section. `pg/sqlmigrate` is the built-in migrator: numbered SQL files from an `fs.FS`. See [§7.7](docs/design/05-architecture.md#77-migrations-j3-d12) and [§6.3](docs/design/06-seam-specifications.md#63-migrations). Not built yet: running background tasks (they need the job system), and the `app migrate status|plan|apply` command, for which `App.Migrations()` is the Go API meanwhile.

@@ -358,7 +358,59 @@ An ORM adapter MAY:
 
 ### 6.3 Migrations
 
-As defined in part 4, Round 3: a core of `Name`, `Status` and `Apply`, plus the optional `Planner`, `OfflinePlanner`, `Verifier`, `Backgrounder` and `Completion`. Conformance is listed there.
+```go
+package migrate // no driver dependency
+
+type Migrator interface {
+    Name() string                                          // [a-z0-9_.-]+, unique per app
+    Status(ctx context.Context) (Status, error)
+    Apply(ctx context.Context, opts ApplyOptions) (Result, error)
+}
+
+type State uint8   // UpToDate, Pending, Drifted, Ahead
+type Status struct{ State State; Expected, Current, Detail string }
+type Risk uint8    // Unknown (the zero value), Safe, Caution, Destructive, Manual; ordered Safe < … < Manual < Unknown
+
+type ApplyOptions struct {
+    Lock         coord.Lease // held; Token() is the fencing token
+    MaxRisk      Risk
+    AllowUnknown bool        // whether Unknown steps may run
+    Fingerprint  string      // the plan checked or approved; "" for a migrator that can't plan
+    Observer     Observer    // may be nil: use opts.Step(ctx, s)
+}
+type Observer interface{ Step(ctx context.Context, s StepInfo) (context.Context, func(err error)) }
+type Result struct{ Applied []StepInfo; Detail string }
+
+// Optional capabilities, found by type assertion:
+type Planner interface{ Plan(ctx) (Plan, error) }                 // Plan: Steps, MaxRisk, Fingerprint
+type OfflinePlanner interface{ PlanOffline(ctx) (Plan, error) }
+type Verifier interface{ Verify(ctx) (Drift, error) }             // Drift{Differences []string}
+type Backgrounder interface{ BackgroundTasks(ctx) ([]BackgroundTask, error) }
+type BackgroundTask interface{ ID() string; Step(ctx, cursor []byte) (next []byte, done bool, err error) }
+type Completion interface{ Done(ctx, id string) (bool, error) }
+
+// The kernel side: galleon.Migrator(r, name, ctor, MigrateAfter(…) | MigrateOrder(n)),
+// migrate.Runner (Status, Plan, Apply, ApplyOne, Done) and migrate.Policy.
+```
+
+Two changes from part 4's sketch: `ApplyOptions.Lock` is the held lease rather than a `Locker`, since the Runner takes the lock before calling any migrator code, and `AllowUnknown` sits beside `MaxRisk`, because whether Unknown may run is its own policy, not a point on the scale.
+
+**Rules**
+1. `Apply` MUST NOT run without `opts.Lock`, and MUST stop when ctx ends. The Runner never calls it without a held lease, and cancels ctx if the lease is lost or can't be renewed.
+2. A migrator that classifies risk MUST refuse, before changing anything, changes with a step that `opts` doesn't allow (above `MaxRisk`, or Unknown without `AllowUnknown`). A `Planner` MUST refuse a plan whose fingerprint isn't `opts.Fingerprint`, when that is set.
+3. `Apply` on an up-to-date database MUST change nothing, and `Status` MUST be `UpToDate` after an `Apply` that returned without error. The Runner reads `Status` under the lock before applying, and again after.
+4. A migrator that claims fencing MUST refuse a lease whose token is below one it has applied under, as recorded with the change itself.
+5. `Status` SHOULD NOT change the database (sqlmigrate's own tests check that it creates nothing).
+6. `Ahead` and `Drifted` MUST NOT be applied over: `Apply` refuses them, as does the Runner.
+7. A `BackgroundTask`'s `Step` MUST be safe to repeat from the same cursor, since a step interrupted before its cursor is saved runs again.
+8. Several migrators MUST run in their declared order, and the first failure MUST stop the rest.
+9. Spans, logs and metric attributes MUST NOT hold SQL text or secrets: a step's ID and risk are recorded, its description only with the debug setting.
+
+The kernel's behaviour around any migrator (the lock, the readiness gate, boot modes, the per-environment policy, fingerprint pinning, observability and the operator surface) is described in [part 5, §7.7](05-architecture.md#77-migrations-j3-d12).
+
+**Conformance** (`testkit/conformance/migratetest`): an empty database is `Pending`; `Apply` twice changes nothing the second time; four concurrent nodes under one lock run `Apply` exactly once; `Status` is `UpToDate` after `Apply`; a plan above `MaxRisk` is refused by the Runner, and by the migrator itself when it can plan, with nothing applied; `Apply` without a lease is refused; and, where claimed, a stale lease is refused (fencing), `Ahead` and `Drifted` are detected and not applied over, plans are stable across nodes and pinned fingerprints are enforced (`Planner`), offline plans don't depend on the database (`OfflinePlanner`), `Verify` finds the edited change (`Verifier`), and a background task resumes on another node from a saved cursor, repeating a step safely, until `Done` (`Backgrounder`, `Completion`).
+
+**Ships with:** `pg/sqlmigrate` (numbered SQL files from an `fs.FS`; `Planner` and `Verifier`, fencing, Ahead and Drifted), which passes the suite against real Postgres; `testkit.MigrationStore` and `FakeMigrator` (every capability, shared state across nodes, hooks to block or fail a step), and `testkit.CoreOnly` to hide its capabilities, which pass it too. **Deferred:** running background tasks, which needs the job system (§9); the `migrate` CLI (phase 8), for which the Go API stands in.
 
 ---
 

@@ -162,7 +162,7 @@ galleon.Provide(r, NewOrderRepo, galleon.Scope(galleon.Singleton))
 - **Introspection:** `galleon config` and the ops endpoint show effective values and their sources, with secrets redacted (B2).
 - **Dynamic values:** fields marked `Dynamic[T]` can change at runtime. They propagate cluster-wide through coordination, and subscribers are notified (B3).
 - **Secrets:** a `secrets` seam (env, file, Vault, cloud secret managers). Rotation notifies subscribers, and secrets are never logged (B4).
-- **Environment profiles** (`dev`, `test`, `prod`) change only safe defaults, such as detailed error pages. They never change semantics.
+- **Environment profiles** (`dev`, `test`, `prod`) change only safe defaults, such as detailed error pages. They never change semantics. **As built:** `galleon.Environment(galleon.Production | Development | Test)`, Production by default; so far it sets only the migration policy's defaults (§7.7).
 
 ---
 
@@ -463,14 +463,37 @@ Your ORM (and sqlc, bun, ent, GORM) gets its `Querier` from context, or explicit
 
 ### 7.7 Migrations (J3, D12)
 
-The tool-neutral seam from part 4, Round 3: a required core of `Name`, `Status` and `Apply`, and optional capabilities `Planner`, `OfflinePlanner`, `Verifier`, `Backgrounder` and `Completion`. The kernel supplies:
-- the cluster lock with fencing,
-- the readiness gate,
-- the risk policy per environment,
-- background tasks on the job system,
-- one `galleon migrate` CLI.
+The tool-neutral seam from part 4, Round 3, in package `migrate` (no driver dependency): a required core of `Name`, `Status` and `Apply`, and optional capabilities `Planner`, `OfflinePlanner`, `Verifier`, `Backgrounder` and `Completion`, found by type assertion. `Risk` is one scale, `Safe < Caution < Destructive < Manual < Unknown`; its zero value is `Unknown`, so an unclassified step is never taken for safe. dpg plugs in through `adapters/dpg`; the built-in default is `pg/sqlmigrate`.
 
-dpg plugs in through `adapters/dpg`.
+```go
+galleon.Migrator(r, "orders", func(m *pg.Manager) (migrate.Migrator, error) {
+    return sqlmigrate.New("orders", ordersSQL, m.Pool(""))
+}, galleon.MigrateAfter("billing")) // or galleon.MigrateOrder(n)
+```
+
+A module registers a migrator with a constructor, which the kernel calls once every provider has started, so it can take a started data plane. Migrators run in a declared order: after the ones named in `MigrateAfter`, then by order key, then by name, never by registration order. A registered migrator declares `coord.Locks` for its module, so a process-scoped backend is refused for several nodes as for any other need.
+
+The kernel's `migrate.Runner` supplies the rest:
+- **Exactly once across the cluster.** Each migrator applies under the lease `galleon/migrate/<name>`, renewed at a third of its TTL (`lock_ttl`, 30s). The lease itself, with its fencing token, is `ApplyOptions.Lock`: part 4 sketched a `Locker` there, but the Runner takes the lock before any migrator code runs, so a migrator can't run without one. Losing the lease, or failing to renew it, cancels the apply's context and reports `migrate.lease_lost`. A node that finds the lock held waits for it (`lock_wait` bounds the wait), then reads `Status` under the lock, and applies nothing that another node applied: a database that is already up to date is never passed to `Apply`. After `Apply`, `Status` is read again, and anything other than `UpToDate` is a failure.
+- **Readiness.** Each migrator is a readiness gate, `migrate.<name>`. `UpToDate` passes, `Ahead` passes only with `tolerate_ahead` (for the old nodes of a rolling deploy), and `Pending` and `Drifted` fail, with the reason in `/readyz` (verbose) and a log line at every change of verdict. The gate reads `Status` at most once per `recheck` interval (5s), so probes don't each query the database, and a verifying node becomes ready on its own once another node applies.
+- **Boot modes.** `off` checks nothing and registers no gate; `verify` gates readiness on the status found, and never applies; `apply` applies every migrator in order under the lock, after the providers start and before `OnStart` hooks, then gates on the status read again. A failed or refused apply at boot fails `Start` (principle 10). The mode is set by the profile and the `migrate` config section (`<APP>_MIGRATE_MODE` in the environment).
+- **The deploy policy, per environment.** `galleon.Environment(galleon.Production | Development | Test)` picks the defaults; it is the first environment profile (§3.5), and changes only defaults:
+
+  | Profile | Mode | Max risk | Unknown risk |
+  |---|---|---|---|
+  | Production (the default) | verify | Caution | refused unless `allow_unknown` |
+  | Development, Test (testkit's) | apply | Manual | allowed |
+
+  The `migrate` section overrides any of them (`mode`, `max_risk`, `allow_unknown`, `tolerate_ahead`, `approve`, `lock_ttl`, `lock_wait`, `recheck`, `apply_timeout`, `debug`), as does `galleon.MigrationPolicy` in code. A `Planner`'s plan with a step above the maximum, or of Unknown risk without `allow_unknown`, is refused before anything is applied, and the migrator is told the same limits and the plan's fingerprint, so it applies exactly what was checked. A migrator that isn't a `Planner` is said to be one that can't plan, and is treated as all Unknown. `approve` pins the plan CI approved per migrator (`schema=<fingerprint>,…`): another plan is refused with `migrate.fingerprint_mismatch`, and a migrator that can't plan can't be pinned.
+- **Observability.** A span `migrate.apply` per migrator and `migrate.step` per step, a log record for each, carrying the migrator, step ID, risk, outcome and fencing token; metrics `galleon.migrate.applies` (by outcome), `galleon.migrate.failures` (by error code), `galleon.migrate.apply.duration` and `galleon.migrate.steps` (by risk and result). Step descriptions, which may hold SQL, are recorded only with `debug`.
+- **An operator surface.** `App.Migrations()`, also provided to dependency injection as `*galleon.Migrations`, runs status (with drift and background tasks), plan (online or offline) and apply, and answers `Done(migrator, id)` for app code waiting on a backfill. `migrate.WriteStatus`, `WritePlans` and `WriteApply` render them for people, and say plainly when a capability is missing (`plan: migrator "x" can't plan`).
+
+`pg/sqlmigrate` reads numbered files (`0001_create_orders.sql`) from an `fs.FS`, records each applied version and its SHA-256 in `galleon_migrations` (per migrator), and applies each file in its own transaction with its record, unless the file says `-- galleon:no-transaction` (for `CREATE INDEX CONCURRENTLY`). An edited file, or a recorded version the build lacks below its latest, is `Drifted`; recorded versions above its latest are `Ahead`. It is a `Planner`, whose steps carry the risk a file declares (`-- galleon:risk caution`) and are Unknown otherwise, and a `Verifier`. Each file's transaction first raises the migrator's fencing row to the lease's token, and fails if the row holds a higher one, so a holder that paused past its lease applies nothing once it resumes.
+
+**As built, and deferred:**
+- **Background tasks aren't run yet.** `Backgrounder`, `BackgroundTask` and `Completion` are defined, status lists each task and whether it is done, and `Done` answers app code; running the tasks, as durable, lease-protected jobs that resume from a saved cursor on any node, comes with the job system (phase 6, §10.1). The conformance suite already checks that a task resumes from a saved cursor and that repeating a step is safe.
+- **The CLI comes in phase 8 (§15).** The app has no command-line entry point yet, so there is no `app migrate status|plan|apply`; the Go API above is what it will call, and what tests use. Approved fingerprints come from config or the environment until then, rather than flags.
+- **Ops endpoints** (§13) don't exist yet; the reports above are what they will show.
 
 ### 7.8 Caching (J10)
 
