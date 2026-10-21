@@ -149,7 +149,9 @@ func From(ctx context.Context) ReadTx {
 // QuerierFrom returns the transaction ctx carries as a Querier, for an ORM
 // or query builder that takes its handle from ctx. It reports false unless
 // the enclosing transaction writes: a read transaction, or a read view of a
-// write one, is never a Querier. Like ReaderFrom, it never begins a
+// write one, is never a Querier. That guards the API, not SQL: a read view
+// shares its write transaction, so a write sent through its Query isn't
+// refused by the database. Like ReaderFrom, it never begins a
 // transaction or chooses a source: with no transaction in ctx, there is no
 // handle, and no pool to fall back to.
 func QuerierFrom(ctx context.Context) (Querier, bool) {

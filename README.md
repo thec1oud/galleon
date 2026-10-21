@@ -11,7 +11,7 @@ This repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each mod
 | Module | Path | Contents |
 |---|---|---|
 | `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness, node identity, OpenTelemetry and slog), the clock seam, roles and the process supervisor, the error model, coordination interfaces and the in-process `local` backend, the operation model and HTTP/RPC transport, the outbound client, the data plane (`data` interfaces, `pg` on pgx), and the migration seam (`migrate`, with the built-in `pg/sqlmigrate`) |
-| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`, `conformance/migratetest`, `conformance/ormtest`), a fake migrator (`testkit.MigrationStore`), `testkit.DB`, a Postgres database per package with a transaction per test, `testkit.Replica`, its view on a streaming replica, and `testkit.Proxy` |
+| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`, `conformance/migratetest`, `conformance/ormtest`), a fake migrator (`testkit.MigrationStore`), `testkit.DB`, a Postgres database per package with a transaction per test (`testkit.PackageDSN` for the database alone), `testkit.Replica`, its view on a streaming replica, and `testkit.Proxy` |
 
 Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `coord-pg`, `jobs`, `web`, `realtime`, `http3`, `adapters/*`, `cmd/galleon`.
 
