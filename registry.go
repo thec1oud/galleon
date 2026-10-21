@@ -152,6 +152,10 @@ func Supply[T any](r *Registry, value T) {
 // so that []T is provided even when no module adds to it. Nothing else may
 // provide []T. Consumers must not modify the slice.
 //
+// A value whose type has a Validate() error method is checked as it is
+// collected, and one that fails it fails boot, naming the module and the
+// line, as a config section does.
+//
 // An ORM adapter module, for one, registers its models with
 // galleon.Collect(r, models...), and the data module builds its model
 // registry from []data.ModelInfo.
@@ -164,6 +168,12 @@ func Collect[T any](r *Registry, values ...T) {
 		r.app.collectionOrder = append(r.app.collectionOrder, c)
 	}
 	for _, v := range values {
+		if val, ok := any(v).(interface{ Validate() error }); ok {
+			if err := val.Validate(); err != nil {
+				r.errorf("Collect[%s]: %v", reflect.TypeFor[T](), err)
+				continue
+			}
+		}
 		c.values = reflect.Append(c.values, reflect.ValueOf(&v).Elem())
 	}
 }

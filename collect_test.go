@@ -2,6 +2,7 @@ package galleon_test
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -72,6 +73,38 @@ func TestACollectionCantAlsoBeProvided(t *testing.T) {
 	})
 	_, err := galleon.New(base(mod)...)
 	if err == nil || !strings.Contains(err.Error(), "[]galleon_test.tag is provided by") || !strings.Contains(err.Error(), `a collection (galleon.Collect, first by module "orders", `) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+type checked string
+
+func (c checked) Validate() error {
+	if c == "" {
+		return errors.New("empty")
+	}
+	return nil
+}
+
+func TestCollectedValuesAreValidatedAtBoot(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect(r, checked("fine"), checked(""))
+		return nil
+	})
+	_, err := galleon.New(base(mod)...)
+	if err == nil || !strings.Contains(err.Error(), `module "orders" (`) || !strings.Contains(err.Error(), "collect_test.go:") ||
+		!strings.Contains(err.Error(), "Collect[galleon_test.checked]: empty") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestACollectionCantBeReplaced(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect(r, tag("a"))
+		return nil
+	})
+	_, err := galleon.New(append(base(mod), galleon.Replace([]tag{"b"}))...)
+	if err == nil || !strings.Contains(err.Error(), "[]galleon_test.tag is a collection") {
 		t.Fatalf("got %v", err)
 	}
 }

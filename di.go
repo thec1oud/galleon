@@ -214,6 +214,10 @@ func (a *App) applyReplacements() {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): nothing provides %s%s", r.typ, r.site, r.typ, suggest(r.typ, a.providers)))
 			continue
 		}
+		if _, ok := a.collections[r.typ]; ok {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("Replace[%s] (%s): %s is a collection, which the kernel builds from what modules add with galleon.Collect; add to it instead, or replace what is built from it", r.typ, r.site, r.typ))
+			continue
+		}
 		if p.module == kernelModule {
 			hint := ""
 			if opt, ok := kernelOptions[r.typ]; ok {
