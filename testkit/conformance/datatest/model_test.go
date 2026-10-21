@@ -125,7 +125,23 @@ func TestStatementSpansNameTheModelAndItsTable(t *testing.T) {
 			t.Errorf("%s without a model: the collection is %q, want %q", kind, got, want)
 		}
 	}
-	for _, name := range []string{"BEGIN", "SAVEPOINT", "RELEASE", "ROLLBACK"} {
+	// A read transaction's commit, and a failed write transaction's, which
+	// pgx sends as COMMIT and the database rolls back, run with the model
+	// in ctx too.
+	m, marked := testkit.Get[data.Manager](h), data.ForModel(context.Background(), "item")
+	if err := m.Read(marked, func(ctx context.Context, r data.ReadTx) error {
+		var n int
+		return r.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Write(marked, func(ctx context.Context, w data.WriteTx) error {
+		_, _ = w.Exec(ctx, "SELECT 1/0")
+		return nil
+	}); err == nil {
+		t.Fatal("a failed transaction committed")
+	}
+	for _, name := range []string{"BEGIN", "SAVEPOINT", "RELEASE", "ROLLBACK", "COMMIT"} {
 		control := tp.Find(func(s *datatest.Span) bool { return s.Name() == name })
 		if len(control) == 0 {
 			t.Fatalf("no %s span among %v", name, tp.Names())
