@@ -131,15 +131,14 @@ func (p *Proxy) Reset() {
 
 func (p *Proxy) accept() {
 	defer p.wg.Done()
-	n := 0
 	for {
 		client, err := p.ln.Accept()
 		if err != nil {
 			return
 		}
-		n++
 		p.mu.Lock()
 		p.opened++
+		n := p.opened
 		refuse := p.cut
 		if !refuse {
 			p.conns[client] = true

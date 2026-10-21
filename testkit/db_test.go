@@ -382,3 +382,10 @@ func TestDBModuleTelemetryIsInPlaceForProvidersThatStartWithIt(t *testing.T) {
 		t.Fatalf("the write at start went unrecorded among %v", tp.Names())
 	}
 }
+
+func TestPackageDSNIsTheDatabaseDBUsesWithoutATransaction(t *testing.T) {
+	dsn := testkit.PackageDSN(t)
+	if db := testkit.DB(t); db.DSN() != dsn {
+		t.Fatalf("PackageDSN is %s, DB's %s", dsn, db.DSN())
+	}
+}
