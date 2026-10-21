@@ -398,7 +398,9 @@ func TestTheTrackerStopsWithTheManagerAndStartsAgain(t *testing.T) {
 		buf = buf[:runtime.Stack(buf, true)]
 		n := 0
 		for _, g := range strings.Split(string(buf), "\n\n") {
-			if strings.Contains(g, "galleon/pg.(*topology).") {
+			// One in WaitGroup.Done has done its work and is returning: Stop
+			// has been released by that Done.
+			if strings.Contains(g, "galleon/pg.(*topology).") && !strings.Contains(g, "sync.(*WaitGroup).Done") {
 				n++
 			}
 		}
@@ -941,10 +943,16 @@ func TestAWriteEndingAtAWALPageIsReadOnTheReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Release()
-	var block int64
-	if err := conn.QueryRow(ctx, "SELECT current_setting('wal_block_size')::int8").Scan(&block); err != nil {
+	// The layout the Manager reads, from the same query. The padding below
+	// sizes WAL records for 8-byte alignment, which every 64-bit build has.
+	var block, seg, align int64
+	if err := conn.QueryRow(ctx, "SELECT wal_block_size, bytes_per_wal_segment, max_data_alignment FROM pg_control_init()").Scan(&block, &seg, &align); err != nil {
 		t.Fatal(err)
 	}
+	if align != 8 {
+		t.Skipf("the primary aligns WAL to %d bytes; this test can only force a page boundary at 8", align)
+	}
+	short, long := (20+align-1)/align*align, (36+align-1)/align*align
 	insert := func() int64 {
 		t.Helper()
 		var lsn int64
@@ -978,7 +986,12 @@ func TestAWriteEndingAtAWALPageIsReadOnTheReplica(t *testing.T) {
 		after := insert()
 		size := after - before
 		if after/block != before/block {
-			size -= 24 // it crossed into a page, and its header
+			// It crossed into a page, and its header.
+			if after/seg != before/seg {
+				size -= long
+			} else {
+				size -= short
+			}
 		}
 		for range 20 {
 			at := insert()
@@ -1004,7 +1017,7 @@ func TestAWriteEndingAtAWALPageIsReadOnTheReplica(t *testing.T) {
 		}
 		cctx := pg.CausalContext(ctx)
 		write(cctx, id)
-		if after := insert(); after != at+size+24 && after != at+size+40 {
+		if after := insert(); after != at+size+short && after != at+size+long {
 			id++
 			continue // something else wrote too, or this write grew
 		}

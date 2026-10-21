@@ -6,12 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/galleon/data"
 	"github.com/thec1oud/galleon/op"
@@ -33,8 +34,9 @@ type causal struct {
 	pending atomic.Uint64
 	// wrote is set once a root write transaction has committed something.
 	wrote atomic.Bool
-	// reissue is set once a token of unknownFloor is clamped, so the
-	// response carries the clamped floor in its place.
+	// reissue is set once the clamp lowers a token, of unknownFloor or one
+	// past the primary, so the response carries the clamped floor in its
+	// place.
 	reissue atomic.Bool
 }
 
@@ -101,8 +103,10 @@ func (m *Manager) floor(ctx context.Context) uint64 {
 			// replicas. If the primary can't be asked, the token stands,
 			// and an unknown one sends the reads to the primary.
 			if cur, err := m.primaryLSN(ctx); err == nil {
-				clamped = min(tok, cur)
-				if tok == unknownFloor {
+				if cur < tok {
+					// The client's token is past the primary: send it
+					// the clamped floor in its place.
+					clamped = cur
 					c.reissue.Store(true)
 				}
 			}
@@ -142,22 +146,32 @@ const (
 	longPageHeader  = 36
 )
 
-// readWALLayout reads the primary's WAL layout. The headers are aligned to
-// the server's MAXALIGN, 8 on every 64-bit build, which pg_control_init
-// tells where it may be called.
-func readWALLayout(ctx context.Context, pool *pgxpool.Pool) (walLayout, error) {
-	var block, seg int64
-	err := pool.QueryRow(ctx, "SELECT current_setting('wal_block_size')::int8, (SELECT setting::int8 FROM pg_settings WHERE name = 'wal_segment_size')").Scan(&block, &seg)
-	if err != nil {
-		return walLayout{}, err
+// walLayoutSQL reads the primary's WAL layout. MAXALIGN, which sizes the
+// page headers, is only told by pg_control_init, so a primary that doesn't
+// let it be called gets no layout, and its positions stay as they are.
+const walLayoutSQL = "SELECT wal_block_size, bytes_per_wal_segment, max_data_alignment FROM pg_control_init()"
+
+// parseWALLayout reads walLayoutSQL's row as text.
+func parseWALLayout(row [][]byte) (walLayout, error) {
+	if len(row) != 3 {
+		return walLayout{}, errors.New("no WAL layout")
 	}
-	if block <= 0 || seg < block || seg%block != 0 {
-		return walLayout{}, fmt.Errorf("a WAL block size of %d and segment size of %d", block, seg)
+	var v [3]int64
+	for i, b := range row {
+		n, err := strconv.ParseInt(string(b), 10, 64)
+		if err != nil {
+			return walLayout{}, fmt.Errorf("a WAL layout of %q: %w", b, err)
+		}
+		v[i] = n
 	}
-	align := int64(8)
-	var a int64
-	if pool.QueryRow(ctx, "SELECT max_data_alignment FROM pg_control_init()").Scan(&a) == nil && a > 0 {
-		align = a
+	return newWALLayout(v[0], v[1], v[2])
+}
+
+// newWALLayout is the layout of pages of block bytes in segments of seg,
+// aligned to align, refusing anything Postgres couldn't have.
+func newWALLayout(block, seg, align int64) (walLayout, error) {
+	if block <= 0 || seg < block || seg%block != 0 || align <= 0 || align&(align-1) != 0 || align > 64 {
+		return walLayout{}, fmt.Errorf("a WAL layout of %d-byte pages, %d-byte segments and %d-byte alignment", block, seg, align)
 	}
 	up := func(n int64) uint64 { return uint64((n + align - 1) / align * align) }
 	return walLayout{block: uint64(block), seg: uint64(seg), short: up(shortPageHeader), long: up(longPageHeader)}, nil
@@ -308,19 +322,38 @@ func (m *Manager) takeToken(ctx context.Context, call *op.Call, c *causal) {
 }
 
 // giveToken sets the response's token once the call has committed a write,
-// or has clamped a token of unknownFloor, so the client stops bringing back
-// a floor that sends its reads to the primary. A response with a token is the answer for one client, so it is marked
-// "Cache-Control: private, no-store", unless the call set its own: a cache
-// that kept it would hand one client's token to others, or replay a stale
-// one.
+// or has clamped the token it brought, so the client stops bringing back a
+// floor past the primary's.
+//
+// A response with a token is the answer for one client: a shared cache
+// that kept it would hand one client's token to others. It gets
+// "Cache-Control: private, no-store" unless the call set a Cache-Control
+// of its own, which is kept if it lets only private caches store the
+// response, and replaced with "private, no-store" if it lets shared ones
+// (public, or s-maxage).
 func (m *Manager) giveToken(call *op.Call, c *causal) {
 	if m.keys == nil || call.Response == nil || call.Response.Header == nil || !(c.wrote.Load() || c.reissue.Load()) {
 		return
 	}
 	// unknownFloor is signed as it is (see commitWrite): the next request
 	// clamps it to the primary's position.
-	call.Response.Header.Set(ConsistencyHeader, m.keys.sign(c.lsn.Load(), m.clock.Now()))
-	if call.Response.Header.Get("Cache-Control") == "" {
-		call.Response.Header.Set("Cache-Control", "private, no-store")
+	h := call.Response.Header
+	h.Set(ConsistencyHeader, m.keys.sign(c.lsn.Load(), m.clock.Now()))
+	if cc := h.Values("Cache-Control"); len(cc) == 0 || sharedCacheable(cc) {
+		h.Set("Cache-Control", "private, no-store")
 	}
+}
+
+// sharedCacheable reports whether Cache-Control values let a shared cache
+// store the response.
+func sharedCacheable(values []string) bool {
+	for _, v := range values {
+		for d := range strings.SplitSeq(v, ",") {
+			name, _, _ := strings.Cut(strings.TrimSpace(d), "=")
+			if strings.EqualFold(name, "public") || strings.EqualFold(name, "s-maxage") {
+				return true
+			}
+		}
+	}
+	return false
 }

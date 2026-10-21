@@ -77,6 +77,9 @@ type topology struct {
 	rr       atomic.Uint64
 	primary  history
 	now      func() time.Time
+	// layoutRetry is how long the primary's poller waits to try the WAL
+	// layout again after it couldn't read it.
+	layoutRetry time.Duration
 
 	life   sync.Mutex
 	cancel context.CancelFunc
@@ -332,7 +335,11 @@ func (p *poller) query(ctx context.Context, sql string) ([][]byte, error) {
 		err = errors.New("the tracker's query returned no row")
 	}
 	if err != nil {
-		p.close()
+		// An error the server sent leaves the connection good; any other
+		// may not have.
+		if _, sent := errors.AsType[*pgconn.PgError](err); !sent {
+			p.close()
+		}
 		return nil, err
 	}
 	return res[0].Rows[0], nil
@@ -371,9 +378,15 @@ func (t *topology) every(ctx context.Context, fn func(ctx context.Context)) {
 
 const primarySQL = "SELECT pg_current_wal_lsn()::text"
 
+// defaultLayoutRetry is how often the primary's poller tries again to
+// read the WAL layout after it couldn't.
+const defaultLayoutRetry = 5 * time.Second
+
 func (t *topology) pollPrimary(ctx context.Context, m *Manager, src *source) {
 	p := t.newPoller(src)
 	defer p.close()
+	var next time.Time // when to try the layout again
+	warned := false
 	t.every(ctx, func(qctx context.Context) {
 		row, err := p.query(qctx, primarySQL)
 		if err != nil {
@@ -382,6 +395,23 @@ func (t *topology) pollPrimary(ctx context.Context, m *Manager, src *source) {
 		if lsn, err := parseLSN(string(row[0])); err == nil {
 			t.primary.add(sample{at: t.now(), lsn: lsn})
 		}
+		if m.wal.Load() != nil || t.now().Before(next) {
+			return
+		}
+		row, err = p.query(qctx, walLayoutSQL)
+		var w walLayout
+		if err == nil {
+			w, err = parseWALLayout(row)
+		}
+		if err != nil {
+			next = t.now().Add(t.layoutRetry)
+			if !warned && ctx.Err() == nil {
+				warned = true
+				m.logger().WarnContext(ctx, "the primary's WAL layout can't be read, so a write ending at a WAL page may make its ReadYourWrites reads wait for more WAL; retrying", "error", err)
+			}
+			return
+		}
+		m.wal.Store(&w)
 	})
 }
 

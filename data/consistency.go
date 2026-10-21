@@ -58,7 +58,7 @@ var (
 // polling, so even a caught-up replica may be about a poll behind, and up
 // to the tracker's staleness bound when polls are slow: a d below about
 // one poll reads the primary, and a d of zero always does. A negative d
-// is refused when the read begins.
+// fails the read with InvalidArgument when it begins.
 func BoundedStaleness(d time.Duration) Level {
 	return Level{kind: BoundedStalenessKind, bound: d}
 }
@@ -200,7 +200,8 @@ type consistencyKey struct{}
 
 // WithConsistency returns a ctx whose reads default to l when they don't
 // ask for a level themselves. The data module sets it from the operation's
-// descriptor.
+// descriptor. A read with an l that fails Validate fails with
+// InvalidArgument and CodeInvalidConsistency.
 func WithConsistency(ctx context.Context, l Level) context.Context {
 	return context.WithValue(ctx, consistencyKey{}, l)
 }
