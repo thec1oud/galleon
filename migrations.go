@@ -1,7 +1,9 @@
 package galleon
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -41,15 +43,20 @@ func (e Env) String() string {
 }
 
 // Environment sets the app's environment profile. The default is Production.
+// It can only be set in code for now: no config section or environment
+// variable chooses it.
 func Environment(e Env) Option { return func(s *settings) { s.env = e } }
 
 // Env returns the app's environment profile.
 func (a *App) Env() Env { return a.settings.env }
 
-// MigrationPolicy replaces the profile's migration policy. The "migrate"
-// config section still overrides each field it sets.
-func MigrationPolicy(p migrate.Policy) Option {
-	return func(s *settings) { s.migratePolicy = &p }
+// MigrationPolicy adjusts the profile's migration policy in code: edit
+// changes only the fields it sets, and the rest keep the profile's
+// defaults, so MigrationPolicy(func(p *migrate.Policy) { p.Mode =
+// migrate.ModeApply }) in Production still refuses what Production refuses.
+// The "migrate" config section then overrides each field it sets.
+func MigrationPolicy(edit func(p *migrate.Policy)) Option {
+	return func(s *settings) { s.migratePolicy = append(s.migratePolicy, edit) }
 }
 
 // MigratorOption configures a migrator's registration.
@@ -139,16 +146,20 @@ type migrateSection struct {
 	AllowUnknown  bool   `json:"allow_unknown"`
 	TolerateAhead bool   `json:"tolerate_ahead"`
 	// Approve pins approved plan fingerprints, as name=fingerprint pairs
-	// separated by commas.
-	Approve  string        `json:"approve"`
-	LockTTL  time.Duration `json:"lock_ttl"`
-	LockWait time.Duration `json:"lock_wait"`
+	// separated by commas: each the online plan's, of the changes pending
+	// on the database (see migrate.Policy.Approved).
+	Approve string `json:"approve"`
+	// The durations are strings with a unit, such as "30s" or "10m".
+	// LockTTL is at least 1s (the default is 30s); LockWait is 0, waiting as
+	// long as the apply may, or at least 1s.
+	LockTTL  durationText `json:"lock_ttl"`
+	LockWait durationText `json:"lock_wait"`
 	// Recheck is how often the readiness gate reads each migrator's status
-	// again; the default is 5s.
-	Recheck time.Duration `json:"recheck"`
-	// ApplyTimeout bounds applying at boot, waiting for the lock included;
-	// the default is 10m.
-	ApplyTimeout time.Duration `json:"apply_timeout"`
+	// again: at least 100ms, and 5s by default.
+	Recheck durationText `json:"recheck"`
+	// ApplyTimeout bounds applying at boot, waiting for the lock included:
+	// at least 1s, and 10m by default.
+	ApplyTimeout durationText `json:"apply_timeout"`
 	// Debug records step descriptions, which may hold SQL, in spans and logs.
 	Debug bool `json:"debug"`
 }
@@ -170,12 +181,53 @@ func (s *migrateSection) Validate() error {
 	if _, err := parseApprovals(s.Approve); err != nil {
 		errs = append(errs, err)
 	}
-	for name, d := range map[string]time.Duration{"lock_ttl": s.LockTTL, "lock_wait": s.LockWait, "recheck": s.Recheck, "apply_timeout": s.ApplyTimeout} {
-		if d < 0 {
-			errs = append(errs, fmt.Errorf("%s must not be negative", name))
+	for _, d := range []struct {
+		name string
+		v    durationText
+		min  time.Duration
+		zero bool // 0 is allowed, meaning no limit
+	}{
+		{"lock_ttl", s.LockTTL, time.Second, false},
+		{"lock_wait", s.LockWait, time.Second, true},
+		{"recheck", s.Recheck, 100 * time.Millisecond, false},
+		{"apply_timeout", s.ApplyTimeout, time.Second, false},
+	} {
+		if d.v == "" {
+			continue
+		}
+		v, err := time.ParseDuration(string(d.v))
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s: %q is not a duration: write it with a unit, such as \"30s\"", d.name, string(d.v)))
+		case v == 0 && d.zero:
+		case v < d.min:
+			errs = append(errs, fmt.Errorf("%s must be at least %s, not %s", d.name, d.min, v))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// durationText is a duration in config: a string with a unit, such as
+// "30s". A bare JSON number is kept as its text, so Validate can say which
+// field lacks a unit rather than guessing it means nanoseconds.
+type durationText string
+
+func (d *durationText) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		s = string(b)
+	}
+	*d = durationText(s)
+	return nil
+}
+
+// get returns the duration, or def when it is unset. Validate has checked it.
+func (d durationText) get(def time.Duration) time.Duration {
+	if d == "" {
+		return def
+	}
+	v, _ := time.ParseDuration(string(d))
+	return v
 }
 
 func parseApprovals(s string) (map[string]string, error) {
@@ -208,17 +260,22 @@ type migrations struct {
 // configureMigrations orders the registered migrators, loads the policy
 // and registers their gates. It runs in New, after modules register.
 func (a *App) configureMigrations() {
+	kernel := &Registry{app: a, module: kernelModule}
 	if len(a.migratorRegs) == 0 {
+		// The section is the kernel's, so it is claimed and checked even
+		// in an app without migrators, such as one that has none yet.
+		if _, ok := a.configRaw["migrate"]; ok {
+			Config[migrateSection](kernel, "migrate")
+		}
 		return
 	}
 	policy := migrate.ProductionPolicy()
 	if a.settings.env != Production {
 		policy = migrate.DevelopmentPolicy()
 	}
-	if a.settings.migratePolicy != nil {
-		policy = *a.settings.migratePolicy
+	for _, edit := range a.settings.migratePolicy {
+		edit(&policy)
 	}
-	kernel := &Registry{app: a, module: kernelModule}
 	before := len(a.configReport)
 	cfg := Config[migrateSection](kernel, "migrate")
 	set := map[string]bool{}
@@ -243,10 +300,10 @@ func (a *App) configureMigrations() {
 		policy.Approved, _ = parseApprovals(cfg.Approve)
 	}
 	if set["lock_ttl"] {
-		policy.LockTTL = cfg.LockTTL
+		policy.LockTTL = cfg.LockTTL.get(0)
 	}
 	if set["lock_wait"] {
-		policy.LockWait = cfg.LockWait
+		policy.LockWait = cfg.LockWait.get(0)
 	}
 	if set["debug"] {
 		policy.Debug = cfg.Debug
@@ -254,13 +311,10 @@ func (a *App) configureMigrations() {
 	if policy.Mode == 0 {
 		policy.Mode = migrate.ModeVerify
 	}
-	mg := &migrations{policy: policy, recheck: 5 * time.Second, applyTimeout: 10 * time.Minute, gates: map[string]*migrationGate{}, handle: a.migrationsHandle}
-	if cfg.Recheck > 0 {
-		mg.recheck = cfg.Recheck
+	if policy.LockTTL != 0 && policy.LockTTL < time.Second || policy.LockWait < 0 {
+		a.bootErrs = append(a.bootErrs, fmt.Errorf("migrate: the policy's LockTTL must be 0 (30s) or at least 1s, and its LockWait not negative; it has %s and %s", policy.LockTTL, policy.LockWait))
 	}
-	if cfg.ApplyTimeout > 0 {
-		mg.applyTimeout = cfg.ApplyTimeout
-	}
+	mg := &migrations{policy: policy, recheck: cfg.Recheck.get(5 * time.Second), applyTimeout: cfg.ApplyTimeout.get(10 * time.Minute), gates: map[string]*migrationGate{}, handle: a.migrationsHandle}
 	for name := range policy.Approved {
 		if !slices.ContainsFunc(a.migratorRegs, func(m *migratorReg) bool { return m.name == name }) {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("migrate: a fingerprint is approved for migrator %q, which isn't registered (typo?)", name))
@@ -308,10 +362,7 @@ func orderMigrators(regs []*migratorReg) ([]*migratorReg, error) {
 		return nil, errors.Join(errs...)
 	}
 	less := func(x, y *migratorReg) int {
-		if x.order != y.order {
-			return x.order - y.order
-		}
-		return strings.Compare(x.name, y.name)
+		return cmp.Or(cmp.Compare(x.order, y.order), cmp.Compare(x.name, y.name))
 	}
 	var ready, out []*migratorReg
 	for _, m := range regs {
@@ -396,7 +447,14 @@ func (a *App) startMigrations(ctx context.Context) error {
 			g.set(m, runner.Policy())
 		}
 	}
-	mg.handle.set(runner)
+	refresh := func(ctx context.Context) {
+		for _, g := range mg.gates {
+			gctx, cancel := context.WithTimeout(ctx, a.settings.gateTimeout)
+			g.refresh(gctx)
+			cancel()
+		}
+	}
+	mg.handle.set(runner, refresh)
 	switch mg.policy.Mode {
 	case migrate.ModeOff:
 		return nil
@@ -409,11 +467,7 @@ func (a *App) startMigrations(ctx context.Context) error {
 	}
 	// Seed every gate now: the status after the apply, or, verifying, the
 	// status as found.
-	for _, g := range mg.gates {
-		gctx, cancel := context.WithTimeout(ctx, a.settings.gateTimeout)
-		g.refresh(gctx)
-		cancel()
-	}
+	refresh(ctx)
 	return nil
 }
 
@@ -485,14 +539,15 @@ func (g *migrationGate) refreshLocked(ctx context.Context) {
 // code waiting on a background task. The kernel provides it, so a
 // constructor can take it; it works once the app has started.
 type Migrations struct {
-	mu     sync.Mutex
-	runner *migrate.Runner
+	mu      sync.Mutex
+	runner  *migrate.Runner
+	refresh func(ctx context.Context) // rereads every gate
 }
 
-func (m *Migrations) set(r *migrate.Runner) {
+func (m *Migrations) set(r *migrate.Runner, refresh func(ctx context.Context)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.runner = r
+	m.runner, m.refresh = r, refresh
 }
 
 // Runner returns the app's migration runner, or an error before Start or
@@ -525,13 +580,19 @@ func (m *Migrations) Plan(ctx context.Context, offline bool) ([]migrate.PlanRepo
 }
 
 // Apply applies every migrator in order under the cluster lock, whatever
-// the boot mode, and stops at the first failure.
+// the boot mode, and stops at the first failure. Then this app's readiness
+// gates read every status again, rather than at their next recheck.
 func (m *Migrations) Apply(ctx context.Context) ([]migrate.ApplyReport, error) {
 	r, err := m.Runner()
 	if err != nil {
 		return nil, err
 	}
-	return r.Apply(ctx)
+	reps, err := r.Apply(ctx)
+	m.mu.Lock()
+	refresh := m.refresh
+	m.mu.Unlock()
+	refresh(ctx)
+	return reps, err
 }
 
 // Done asks migrator name whether its task or change id is finished.

@@ -49,7 +49,8 @@ type Policy struct {
 	// Mode is what the kernel does at boot. The Runner itself ignores it.
 	Mode Mode
 	// MaxRisk is the riskiest step a deploy may apply. A plan with a step
-	// above it is refused before anything is applied.
+	// above it is refused before anything is applied. The zero value means
+	// Safe, the most restrictive.
 	MaxRisk Risk
 	// AllowUnknown lets steps of Unknown risk run, and migrators that can't
 	// plan apply at all, since all their changes are Unknown. Production
@@ -59,9 +60,12 @@ type Policy struct {
 	// TolerateAhead counts a database newer than this build as ready, for
 	// the old nodes of a rolling deploy.
 	TolerateAhead bool
-	// Approved pins, per migrator, the fingerprint of the plan CI approved.
-	// Apply refuses any other plan, and a migrator that can't plan can't be
-	// pinned.
+	// Approved pins, per migrator, the fingerprint of the plan CI approved:
+	// the online plan, of the changes pending on the database, as
+	// Runner.Plan(ctx, false) and WritePlans report it. An offline plan
+	// covers the whole build, so its fingerprint differs. Apply refuses any
+	// other plan; a migrator with nothing pending has no plan to check; and
+	// a migrator that can't plan can't be pinned.
 	Approved map[string]string
 	// LockTTL is the lease's time to live; the Runner renews it at a third
 	// of that while an apply runs. The default is 30s.
@@ -119,6 +123,9 @@ func (p Policy) Ready(name string, s Status) error {
 
 // check returns why the policy refuses plan pl of migrator name, or nil.
 func (p Policy) check(name string, pl Plan) error {
+	if len(pl.Steps()) == 0 {
+		return nil // nothing to apply: no plan to approve or refuse
+	}
 	if want, ok := p.Approved[name]; ok && want != pl.Fingerprint() {
 		return errs.New(errs.FailedPrecondition, CodeFingerprintMismatch, fmt.Sprintf("migrator %q: the plan's fingerprint is %s, but %s was approved; review the new plan and approve it", name, pl.Fingerprint(), want))
 	}
@@ -131,7 +138,7 @@ func (p Policy) check(name string, pl Plan) error {
 	if len(refused) == 0 {
 		return nil
 	}
-	why := fmt.Sprintf("the maximum risk is %s", p.MaxRisk)
+	why := fmt.Sprintf("the maximum risk is %s", Ceiling(p.MaxRisk))
 	if !p.AllowUnknown {
 		why += ", and unknown risk needs approval (allow_unknown)"
 	}

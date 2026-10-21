@@ -173,7 +173,7 @@ func TestProductionVerifiesAndKeepsAPendingNodeOutOfTraffic(t *testing.T) {
 	})
 	var logs bytes.Buffer
 	lockedLogs := &syncWriter{w: &logs}
-	opts := append(base(mod), galleon.Logger(slog.New(slog.NewTextHandler(lockedLogs, nil))), galleon.ConfigJSON([]byte(`{"migrate": {"recheck": 1, "allow_unknown": true}}`)))
+	opts := append(base(mod), galleon.Logger(slog.New(slog.NewTextHandler(lockedLogs, nil))), galleon.ConfigJSON([]byte(`{"migrate": {"allow_unknown": true}}`)))
 	app, err := galleon.New(opts...)
 	if err != nil {
 		t.Fatal(err)
@@ -336,7 +336,12 @@ func TestBadMigrateConfigFailsBoot(t *testing.T) {
 		`{"migrate": {"max_risk": "unknown"}}`:   "max_risk can't be unknown",
 		`{"migrate": {"approve": "schema"}}`:     "not name=fingerprint",
 		`{"migrate": {"approve": "scheme=ab"}}`:  `migrator "scheme", which isn't registered`,
-		`{"migrate": {"lock_ttl": -1}}`:          "lock_ttl must not be negative",
+		`{"migrate": {"lock_ttl": 30}}`:          `lock_ttl: "30" is not a duration: write it with a unit, such as "30s"`,
+		`{"migrate": {"lock_ttl": "30"}}`:        `lock_ttl: "30" is not a duration`,
+		`{"migrate": {"lock_ttl": "10ms"}}`:      "lock_ttl must be at least 1s, not 10ms",
+		`{"migrate": {"lock_wait": "-1s"}}`:      "lock_wait must be at least 1s, not -1s",
+		`{"migrate": {"recheck": "1ms"}}`:        "recheck must be at least 100ms, not 1ms",
+		`{"migrate": {"apply_timeout": "0s"}}`:   "apply_timeout must be at least 1s, not 0s",
 		`{"migrate": {"approve": "schema=ab",}}`: "config must be a JSON object",
 	} {
 		_, err := galleon.New(append(base(mod), galleon.ConfigJSON([]byte(cfg)))...)
@@ -344,9 +349,16 @@ func TestBadMigrateConfigFailsBoot(t *testing.T) {
 			t.Errorf("%s: want %q, got %v", cfg, says, err)
 		}
 	}
-	// Without migrators, the section is unused, which is a typo.
-	if _, err := galleon.New(append(base(), galleon.ConfigJSON([]byte(`{"migrate": {}}`)))...); err == nil {
-		t.Error("a migrate section without migrators was accepted")
+	// The section is the kernel's: an app without migrators accepts it,
+	// and still checks it.
+	if _, err := galleon.New(append(base(), galleon.ConfigJSON([]byte(`{"migrate": {"mode": "apply", "lock_wait": "0s"}}`)))...); err != nil {
+		t.Errorf("a migrate section without migrators: %v", err)
+	}
+	if _, err := galleon.New(append(base(), galleon.ConfigJSON([]byte(`{"migrate": {"mode": "often"}}`)))...); err == nil {
+		t.Error("a bad migrate section without migrators was accepted")
+	}
+	if _, err := galleon.New(append(base(mod), galleon.MigrationPolicy(func(p *migrate.Policy) { p.LockTTL = time.Millisecond }))...); err == nil || !strings.Contains(err.Error(), "LockTTL must be 0 (30s) or at least 1s") {
+		t.Errorf("a tiny LockTTL in code: %v", err)
 	}
 }
 
@@ -370,5 +382,31 @@ func TestTheMigrateSeamDoesntDependOnADriver(t *testing.T) {
 	}
 	if strings.Contains(string(out), "pgx") || strings.Contains(string(out), "database/sql") {
 		t.Errorf("package migrate depends on a driver:\n%s", out)
+	}
+}
+
+// risky is a stub that plans a Destructive step.
+type risky struct{ *stub }
+
+func (r risky) Plan(context.Context) (migrate.Plan, error) {
+	return migrate.NewPlan("", []migrate.StepInfo{{ID: "1_drop", Risk: migrate.Destructive}}), nil
+}
+
+func TestMigrationPolicyKeepsTheProfilesDefaultsItDoesntSet(t *testing.T) {
+	var mu sync.Mutex
+	var log []string
+	s := newStub("schema", &log, &mu)
+	mod := migratorModule("m", func(r *galleon.Registry) {
+		galleon.Migrator(r, "schema", func() migrate.Migrator { return risky{s} })
+	})
+	app, err := galleon.New(append(base(mod), galleon.MigrationPolicy(func(p *migrate.Policy) { p.Mode = migrate.ModeApply }))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "1_drop (destructive)") || !strings.Contains(err.Error(), "the maximum risk is caution") {
+		t.Fatalf("Production with mode apply applied a Destructive step: %v", err)
+	}
+	if len(log) != 0 {
+		t.Fatal("the step was applied")
 	}
 }

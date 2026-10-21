@@ -371,15 +371,19 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 		rep.Outcome, rep.Err = Failed, r.lost(actx, fmt.Errorf("migrator %q: applying: %w", name, err))
 		return rep
 	}
-	if err := r.lost(actx, nil); err != nil {
-		rep.Outcome, rep.Err = Failed, err
-		return rep
+	if r.lost(actx, nil) != nil {
+		// Apply returned success, so its changes are committed: the lease
+		// ended after them, and what is applied stays applied.
+		note := "the migration lease was lost after the apply finished; its changes are committed"
+		rep.Notes = append(rep.Notes, note)
+		log.WarnContext(ctx, note, "token", lease.Token())
 	}
 	// Recheck: an apply that returns without error must have left the
-	// database as this build expects.
-	after, err := m.Status(actx)
+	// database as this build expects. ctx, not actx, which a lost lease
+	// has cancelled.
+	after, err := m.Status(ctx)
 	if err != nil {
-		rep.Outcome, rep.Err = Failed, r.lost(actx, fmt.Errorf("migrator %q: reading its status after applying: %w", name, err))
+		rep.Outcome, rep.Err = Failed, fmt.Errorf("migrator %q: reading its status after applying: %w", name, err)
 		return rep
 	}
 	if after.State != UpToDate {
@@ -391,17 +395,22 @@ func (r *Runner) applyOne(ctx context.Context, m Migrator) (rep ApplyReport) {
 }
 
 // hold keeps lease renewed until stop is called, and returns a context
-// that is cancelled, with errLeaseLost as its cause, if the lease is lost.
-// stop releases the lease.
+// that is cancelled, with errLeaseLost as its cause, if the lease is lost:
+// when the backend says so, or when renewing has failed until the lease's
+// deadline has passed. A renewal that fails is retried at every tick until
+// then, so one failed round trip doesn't cancel an apply. stop releases the
+// lease.
 func (r *Runner) hold(ctx context.Context, lease coord.Lease, log *slog.Logger) (context.Context, func()) {
 	actx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
 	exited := make(chan struct{})
-	every := r.policy.lockTTL() / 3
+	ttl := r.policy.lockTTL()
+	every := max(ttl/3, minRenewInterval)
 	go func() {
 		defer close(exited)
 		t := time.NewTicker(every)
 		defer t.Stop()
+		renewed := time.Now()
 		for {
 			select {
 			case <-done:
@@ -411,11 +420,17 @@ func (r *Runner) hold(ctx context.Context, lease coord.Lease, log *slog.Logger) 
 				cancel(errLeaseLost)
 				return
 			case <-t.C:
-				if err := lease.Renew(actx); err != nil {
-					log.ErrorContext(ctx, "renewing the migration lease failed; cancelling the apply", "token", lease.Token(), "error", err)
+				err := lease.Renew(actx)
+				if err == nil {
+					renewed = time.Now()
+					continue
+				}
+				if time.Since(renewed) >= ttl {
+					log.ErrorContext(ctx, "renewing the migration lease failed until its deadline; cancelling the apply", "token", lease.Token(), "error", err)
 					cancel(errLeaseLost)
 					return
 				}
+				log.WarnContext(ctx, "renewing the migration lease failed; retrying until its deadline", "token", lease.Token(), "error", err)
 			}
 		}
 	}()
@@ -430,6 +445,9 @@ func (r *Runner) hold(ctx context.Context, lease coord.Lease, log *slog.Logger) 
 		}
 	}
 }
+
+// minRenewInterval keeps a tiny LockTTL from spinning the renewal loop.
+const minRenewInterval = 10 * time.Millisecond
 
 // lost returns err, or the lease-lost error in its place when the lease was
 // lost, so the report says what really happened.

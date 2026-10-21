@@ -2,7 +2,9 @@ package migrate
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -79,8 +81,8 @@ func (r *Runner) finish(ctx context.Context, span trace.Span, log *slog.Logger, 
 		code := errs.From(rep.Err).Code
 		r.metrics.failures.Add(ctx, 1, metric.WithAttributes(attrMigrator.String(rep.Name), attrOutcome.String(string(rep.Outcome)), attrCode.String(code)))
 		span.SetAttributes(attrCode.String(code))
-		span.SetStatus(codes.Error, rep.Err.Error())
-		log.ErrorContext(ctx, "migration "+string(rep.Outcome), append(attrs, "error", rep.Err)...)
+		span.SetStatus(codes.Error, r.errText(rep.Err))
+		log.ErrorContext(ctx, "migration "+string(rep.Outcome), append(attrs, "error", r.errText(rep.Err))...)
 	} else {
 		log.InfoContext(ctx, "migration "+string(rep.Outcome), attrs...)
 	}
@@ -108,12 +110,37 @@ func (o *observer) Step(ctx context.Context, s StepInfo) (context.Context, func(
 		result := "applied"
 		if err != nil {
 			result = "failed"
-			span.SetStatus(codes.Error, err.Error())
-			o.log.ErrorContext(ctx, "migration step failed", append(logAttrs, "duration", time.Since(start), "error", err)...)
+			span.SetStatus(codes.Error, o.r.errText(err))
+			o.log.ErrorContext(ctx, "migration step failed", append(logAttrs, "duration", time.Since(start), "error", o.r.errText(err))...)
 		} else {
 			o.log.InfoContext(ctx, "migration step applied", append(logAttrs, "duration", time.Since(start))...)
 		}
 		o.r.metrics.steps.Add(ctx, 1, metric.WithAttributes(attrMigrator.String(o.migrator), attrRisk.String(s.Risk.String()), attrResult.String(result)))
 		span.End()
 	}
+}
+
+// errText is what spans and logs say of err. With Policy.Debug, all of it.
+// Without, an error of Galleon's own with no cause, whose message names
+// migrators, steps and policies but never SQL, in full; any other, such as
+// a database error that may quote a statement, only as its kind, code and
+// SQLSTATE. The caller still gets the whole error.
+func (r *Runner) errText(err error) string {
+	if r.policy.Debug {
+		return err.Error()
+	}
+	var sq interface{ SQLState() string }
+	hasState := errors.As(err, &sq)
+	e := errs.From(err)
+	if e.Cause == nil && !hasState && e.Code != "galleon.internal" {
+		return e.Error()
+	}
+	parts := []string{e.Kind.String()}
+	if e.Code != "" {
+		parts = append(parts, e.Code)
+	}
+	if hasState {
+		parts = append(parts, "SQLSTATE "+sq.SQLState())
+	}
+	return strings.Join(parts, " ")
 }

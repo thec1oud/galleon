@@ -93,6 +93,8 @@ type ApplyOptions struct {
 	// MaxRisk is the riskiest step allowed. A migrator that can classify its
 	// steps MUST refuse, before changing anything, a set of changes with a
 	// step above it. Unknown steps are governed by AllowUnknown instead.
+	// The zero value, Unknown, means Safe: options nobody filled in are the
+	// most restrictive, never the most permissive.
 	MaxRisk Risk
 	// AllowUnknown says whether steps of Unknown risk may run.
 	AllowUnknown bool
@@ -118,12 +120,22 @@ func (o ApplyOptions) Step(ctx context.Context, s StepInfo) (context.Context, fu
 func (o ApplyOptions) Allows(r Risk) bool { return Allowed(r, o.MaxRisk, o.AllowUnknown) }
 
 // Allowed reports whether a step of risk r runs under max: Unknown only when
-// allowUnknown is set, any other risk when it isn't above max.
+// allowUnknown is set, any other risk when it isn't above max. A max of
+// Unknown, the zero value, means Safe.
 func Allowed(r, max Risk, allowUnknown bool) bool {
 	if r == Unknown {
 		return allowUnknown
 	}
-	return !r.Above(max)
+	return !r.Above(Ceiling(max))
+}
+
+// Ceiling is the riskiest classified step max allows: max itself, or Safe
+// for the zero value, Unknown.
+func Ceiling(max Risk) Risk {
+	if max == Unknown {
+		return Safe
+	}
+	return max
 }
 
 // Observer receives the steps of an apply. The Runner's maps each step to a

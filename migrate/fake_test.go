@@ -51,6 +51,8 @@ type fake struct {
 	stuck   bool
 	fail    error
 	statErr error
+	// afterApply runs as Apply returns successfully.
+	afterApply func(ctx context.Context)
 }
 
 func (f *fake) Name() string { return f.name }
@@ -99,6 +101,9 @@ func (f *fake) Apply(ctx context.Context, opts migrate.ApplyOptions) (migrate.Re
 		f.db.applied[f.name] = len(f.steps)
 		f.db.mu.Unlock()
 	}
+	if f.afterApply != nil {
+		f.afterApply(ctx)
+	}
 	return res, nil
 }
 
@@ -138,10 +143,12 @@ func (t task) Step(context.Context, []byte) ([]byte, bool, error) {
 // locker wraps a Locker to count waits and hand out controllable leases.
 type locker struct {
 	coord.Locker
-	mu      sync.Mutex
-	waits   int
-	leases  []*lease
-	renewed error // what Renew returns
+	mu       sync.Mutex
+	waits    int
+	leases   []*lease
+	renewed  error // what Renew returns
+	flaky    int   // how many Renews fail before they succeed again
+	renewals int   // Renews called
 }
 
 func (l *locker) TryAcquire(ctx context.Context, key string, ttl time.Duration) (coord.Lease, bool, error) {
@@ -202,6 +209,11 @@ func (l *lease) Lost() <-chan struct{} { return l.lost }
 func (l *lease) Renew(ctx context.Context) error {
 	l.l.mu.Lock()
 	err := l.l.renewed
+	l.l.renewals++
+	if l.l.flaky > 0 {
+		l.l.flaky--
+		err = errors.New("timeout")
+	}
 	l.l.mu.Unlock()
 	if err != nil {
 		return err
@@ -338,3 +350,9 @@ func (m *meter) Float64Histogram(name string, _ ...metric.Float64HistogramOption
 }
 
 var errBoom = errors.New("boom")
+
+// sqlError is a database error that quotes a statement, as a driver's may.
+type sqlError struct{}
+
+func (sqlError) Error() string    { return `syntax error at or near "DROP TABLE payroll"` }
+func (sqlError) SQLState() string { return "42601" }

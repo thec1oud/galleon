@@ -70,7 +70,7 @@ type settings struct {
 	roles           []Role
 	replacements    []replacement
 	env             Env
-	migratePolicy   *migrate.Policy
+	migratePolicy   []func(*migrate.Policy)
 }
 
 // Option configures an App.

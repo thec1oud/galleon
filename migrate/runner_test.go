@@ -3,6 +3,7 @@ package migrate_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -384,7 +385,7 @@ func TestEveryApplyAndStepIsASpanALogAndMetrics(t *testing.T) {
 		p := dev
 		p.Debug = debug
 		r, err := migrate.NewRunner(migrate.Config{Locker: newLocker(), Policy: p, TracerProvider: tp, MeterProvider: meterProvider{m: mt},
-			Migrators: []migrate.Migrator{planner{&fake{db: d, name: "schema", steps: twoSafe}}, &fake{db: d, name: "broken", steps: twoSafe, fail: errBoom}}})
+			Migrators: []migrate.Migrator{planner{&fake{db: d, name: "schema", steps: twoSafe}}, &fake{db: d, name: "broken", steps: twoSafe, fail: fmt.Errorf("applying 2_b: %w", sqlError{})}}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -396,8 +397,10 @@ func TestEveryApplyAndStepIsASpanALogAndMetrics(t *testing.T) {
 		if v, _ := applies[0].attr("galleon.migrate.migrator"); v != "schema" {
 			t.Errorf("the apply span names %q", v)
 		}
-		if v, _ := applies[1].attr("galleon.migrate.outcome"); v != "failed" || !strings.Contains(applies[1].status, "boom") {
-			t.Errorf("the failed apply's span: %q, %q", v, applies[1].status)
+		v, _ := applies[1].attr("galleon.migrate.outcome")
+		quotes := strings.Contains(applies[1].status, "DROP TABLE payroll")
+		if v != "failed" || quotes != debug || (!debug && !strings.Contains(applies[1].status, "SQLSTATE 42601")) {
+			t.Errorf("with debug %v, the failed apply's span: %q, %q", debug, v, applies[1].status)
 		}
 		steps := tp.named("migrate.step")
 		if len(steps) != 2 {
@@ -424,5 +427,73 @@ func TestEveryApplyAndStepIsASpanALogAndMetrics(t *testing.T) {
 				t.Errorf("%s = %v, want %v; have %v", key, got, want, mt.seen)
 			}
 		}
+	}
+}
+
+func TestAZeroMaxRiskMeansSafe(t *testing.T) {
+	if migrate.Allowed(migrate.Caution, migrate.Unknown, true) || !migrate.Allowed(migrate.Safe, migrate.Unknown, false) {
+		t.Fatal("a zero MaxRisk isn't Safe")
+	}
+	d := newDB()
+	drop := []migrate.StepInfo{{ID: "1_drop", Risk: migrate.Destructive}}
+	reps, err := newRunner(t, newLocker(), migrate.Policy{Mode: migrate.ModeApply}, planner{&fake{db: d, name: "schema", steps: drop}}).Apply(context.Background())
+	if reps[0].Outcome != migrate.Refused || !hasCode(err, migrate.CodeRiskRefused) || !strings.Contains(err.Error(), "the maximum risk is safe") {
+		t.Fatalf("%+v, %v", reps[0], err)
+	}
+}
+
+func TestAPinnedMigratorWithNothingPendingHasNoMismatch(t *testing.T) {
+	d := newDB()
+	m := planner{&fake{db: d, name: "schema", steps: twoSafe}}
+	d.applied["schema"] = len(twoSafe)
+	p := dev
+	p.Approved = map[string]string{"schema": "an-old-plan"}
+	plans := newRunner(t, newLocker(), p, m).Plan(context.Background(), false)
+	if plans[0].Err != nil || plans[0].Refused != nil {
+		t.Fatalf("%+v", plans[0])
+	}
+}
+
+func TestOneFailedRenewalIsRetriedUntilTheDeadline(t *testing.T) {
+	d := newDB()
+	l := newLocker()
+	l.flaky = 1
+	m := &fake{db: d, name: "schema", steps: twoSafe, block: make(chan struct{}), started: make(chan struct{})}
+	p := dev
+	p.LockTTL = 60 * time.Millisecond
+	done := make(chan error, 1)
+	go func() {
+		_, err := newRunner(t, l, p, m).Apply(context.Background())
+		done <- err
+	}()
+	<-m.started
+	// Let the failed renewal and a good one happen before finishing.
+	until(t, "the flaky renewal fails and another succeeds", func() bool {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return l.flaky == 0 && l.renewals >= 2
+	})
+	close(m.block)
+	if err := <-done; err != nil {
+		t.Fatalf("one failed renewal cancelled the apply: %v", err)
+	}
+}
+
+func TestLosingTheLeaseAfterApplyCommittedReportsApplied(t *testing.T) {
+	d := newDB()
+	l := newLocker()
+	m := &fake{db: d, name: "schema", steps: twoSafe}
+	// The lease is lost once the changes are in: Apply sees its ctx end
+	// only after it has nothing left to undo.
+	m.afterApply = func(ctx context.Context) {
+		l.last().lose()
+		<-ctx.Done()
+	}
+	reps, err := newRunner(t, l, dev, planner{m}).Apply(context.Background())
+	if err != nil || reps[0].Outcome != migrate.Applied {
+		t.Fatalf("%+v, %v", reps[0], err)
+	}
+	if len(reps[0].Notes) != 1 || !strings.Contains(reps[0].Notes[0], "lost after the apply finished") {
+		t.Errorf("notes %v", reps[0].Notes)
 	}
 }
