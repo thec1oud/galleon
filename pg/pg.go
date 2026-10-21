@@ -533,8 +533,9 @@ func Module(opts ...ModuleOption) galleon.Module {
 		o(&s)
 	}
 	return galleon.ModuleFunc("pg", func(r *galleon.Registry) error {
-		// Models collected by pointer, as *data.ModelInfo, are a collection
-		// nothing takes, which fails boot.
+		// Declares the models collection. Models collected by pointer, as
+		// *data.ModelInfo, are a collection nothing declares or takes, which
+		// fails boot.
 		galleon.Collect[data.ModelInfo](r)
 		galleon.Provide[*data.Models](r, func(models []data.ModelInfo) (*data.Models, error) { return data.NewModels(models...) })
 		if s.use != nil {

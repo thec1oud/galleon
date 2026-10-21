@@ -58,7 +58,7 @@ func (r *Registry) Middleware(mw func(http.Handler) http.Handler)
 func (r *Registry) Needs(caps ...coord.Capability)
 func (r *Registry) Gate(name string, check func(ctx context.Context) error)  // readiness gate
 func (r *Registry) Requires(modules ...string)
-func Collect[T any](r *Registry, values ...T)                        // contributions of several modules, provided as []T; Validate()d if they can; values nothing takes fail boot
+func Collect[T any](r *Registry, values ...T)                        // contributions of several modules, provided as []T; Validate()d if they can; values nothing declares or takes fail boot
 ```
 
 **Rules**

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"slices"
 
 	"github.com/thec1oud/galleon/coord"
 )
@@ -148,17 +149,19 @@ func Supply[T any](r *Registry, value T) {
 // Collect adds values to the app's collection of T, which the kernel
 // provides as []T: the values every module collected, in the order the
 // modules are installed and, within one, of the calls. Any module may add
-// to a collection; a module that consumes one calls Collect with no values,
-// so that []T is provided even when no module adds to it. Nothing else may
+// to a collection; a module that consumes one, whether through a
+// constructor or Resolve, calls Collect with no values, which declares it, so
+// that []T is provided even when no module adds to it. Nothing else may
 // provide []T. Consumers must not modify the slice.
 //
 // A value with a Validate() error method, on T or on *T, is checked as it
 // is collected, and one that fails it fails boot, naming the module and the
-// line, as a config section does. A nil pointer isn't checked.
+// line, as a config section does. A nil pointer or func isn't checked, as
+// its Validate could dereference or call it.
 //
 // Collect belongs in Register: once New has provided the collections, it
 // panics rather than drop the values. A collection with values that no
-// constructor takes fails boot, for the same reason.
+// module declares and no constructor takes fails boot, for the same reason.
 //
 // An ORM adapter module, for one, registers its models with
 // galleon.Collect(r, models...), and the data module builds its model
@@ -173,6 +176,9 @@ func Collect[T any](r *Registry, values ...T) {
 		c = &collection{typ: typ, values: reflect.MakeSlice(typ, 0, len(values)), module: r.module, site: callerSite(2)}
 		r.app.collections[typ] = c
 		r.app.collectionOrder = append(r.app.collectionOrder, c)
+	}
+	if len(values) == 0 {
+		c.declared = true
 	}
 	for _, v := range values {
 		if val := validator(&v); val != nil {
@@ -210,45 +216,81 @@ type collection struct {
 	module, site string // where it was first collected
 	// valueModule and valueSite are where its first value was added.
 	valueModule, valueSite string
+	// declared is whether a module called Collect[T] with no values, as a
+	// consumer does.
+	declared bool
 }
 
 // provideCollections provides each collection, once every module has
 // registered. Each slice is full to its capacity, so a consumer that
 // appends to it gets a copy rather than writing into another's.
 //
-// A collection that has values but that no constructor takes fails boot,
-// naming where its first value was added: its values would go nowhere, as
-// models collected as *data.ModelInfo rather than data.ModelInfo would.
+// A collection with values that no module declares (Collect[T] with no
+// values) and no constructor takes fails boot, naming where its first value
+// was added: its values would go nowhere, as models collected as
+// *data.ModelInfo rather than data.ModelInfo would. A declared collection
+// counts as taken, since it may be read through Resolve rather than a
+// constructor.
 func (a *App) provideCollections() {
 	a.collected = true
-	taken := map[reflect.Type]bool{}
+	wanted := map[reflect.Type]bool{}
 	for _, p := range a.providerOrder {
 		for _, t := range p.params {
-			taken[t] = true
+			wanted[t] = true
 		}
 	}
 	for _, m := range a.migratorRegs {
 		for _, t := range m.params {
-			taken[t] = true
+			wanted[t] = true
 		}
 	}
 	for _, c := range a.collectionOrder {
-		if c.valueSite != "" && !taken[c.typ] {
-			hint := ""
-			if elem := c.typ.Elem(); elem.Kind() == reflect.Pointer && taken[reflect.SliceOf(elem.Elem())] {
-				hint = fmt.Sprintf(" (collect %s values: %s is what is taken)", elem.Elem(), reflect.SliceOf(elem.Elem()))
-			}
-			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): Collect[%s]: nothing takes %s, so its values would go nowhere%s", c.valueModule, c.valueSite, c.typ.Elem(), c.typ, hint))
+		if c.declared {
+			wanted[c.typ] = true
 		}
+	}
+	replaced := map[reflect.Type]bool{}
+	for _, r := range a.settings.replacements {
+		replaced[r.typ] = true
+	}
+	for _, c := range a.collectionOrder {
 		if prev, ok := a.providers[c.typ]; ok {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("%s is provided by %s, but it is a collection (galleon.Collect, first by module %q, %s), which the kernel provides", c.typ, prev.describe(), c.module, c.site))
 			continue
+		}
+		if c.valueSite != "" && !wanted[c.typ] && !replaced[c.typ] {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): Collect[%s]: nothing declares or takes %s, so its values would go nowhere%s", c.valueModule, c.valueSite, c.typ.Elem(), c.typ, collectHint(c.typ.Elem(), wanted)))
 		}
 		n := c.values.Len()
 		p := &provider{typ: c.typ, module: kernelModule, site: c.site, value: c.values.Slice3(0, n, n), built: true}
 		a.providers[c.typ] = p
 		a.providerOrder = append(a.providerOrder, p)
 	}
+}
+
+// collectHint says what a collection of elem nothing takes was likely
+// meant to be: a collection of the pointer or the value of elem, or of an
+// interface elem implements, that something takes; or else that the module
+// that takes it may not be installed.
+func collectHint(elem reflect.Type, wanted map[reflect.Type]bool) string {
+	var hints []string
+	for t := range wanted {
+		if t.Kind() != reflect.Slice {
+			continue
+		}
+		switch e := t.Elem(); {
+		case elem.Kind() == reflect.Pointer && elem.Elem() == e,
+			e.Kind() == reflect.Pointer && e.Elem() == elem:
+			hints = append(hints, fmt.Sprintf(" (collect %s values: %s is what is taken)", e, t))
+		case e.Kind() == reflect.Interface && e != elem && elem.Implements(e):
+			hints = append(hints, fmt.Sprintf(" (%s implements %s: collect it as galleon.Collect[%s], since %s is what is taken)", elem, e, e, t))
+		}
+	}
+	if len(hints) == 0 {
+		return fmt.Sprintf("; is the module that consumes it installed? A consumer declares it with galleon.Collect[%s](r)", elem)
+	}
+	slices.Sort(hints)
+	return hints[0]
 }
 
 var errorType = reflect.TypeFor[error]()

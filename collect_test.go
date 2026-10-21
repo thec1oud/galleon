@@ -73,7 +73,8 @@ func TestACollectionCantAlsoBeProvided(t *testing.T) {
 		return nil
 	})
 	_, err := galleon.New(base(mod)...)
-	if err == nil || !strings.Contains(err.Error(), "[]galleon_test.tag is provided by") || !strings.Contains(err.Error(), `a collection (galleon.Collect, first by module "orders", `) {
+	if err == nil || !strings.Contains(err.Error(), "[]galleon_test.tag is provided by") || !strings.Contains(err.Error(), `a collection (galleon.Collect, first by module "orders", `) ||
+		strings.Contains(err.Error(), "go nowhere") {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -219,7 +220,6 @@ func TestANilCollectedFuncIsntValidated(t *testing.T) {
 
 func TestACollectionNothingTakesFailsBootWhereItsFirstValueWasAdded(t *testing.T) {
 	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
-		galleon.Collect[*tag](r)
 		ptr := tag("a")
 		galleon.Collect(r, &ptr)
 		take[tag](r)
@@ -227,7 +227,7 @@ func TestACollectionNothingTakesFailsBootWhereItsFirstValueWasAdded(t *testing.T
 	})
 	_, err := galleon.New(base(mod)...)
 	if err == nil || !strings.Contains(err.Error(), `module "orders" (`) || !strings.Contains(err.Error(), "collect_test.go:") ||
-		!strings.Contains(err.Error(), "Collect[*galleon_test.tag]: nothing takes []*galleon_test.tag") ||
+		!strings.Contains(err.Error(), "Collect[*galleon_test.tag]: nothing declares or takes []*galleon_test.tag") ||
 		!strings.Contains(err.Error(), "(collect galleon_test.tag values: []galleon_test.tag is what is taken)") {
 		t.Fatalf("got %v", err)
 	}
@@ -246,7 +246,69 @@ func TestACollectionCantBeReplaced(t *testing.T) {
 		return nil
 	})
 	_, err := galleon.New(append(base(mod), galleon.Replace([]tag{"b"}))...)
-	if err == nil || !strings.Contains(err.Error(), "[]galleon_test.tag is a collection") {
+	if err == nil || !strings.Contains(err.Error(), "[]galleon_test.tag is a collection") || strings.Contains(err.Error(), "go nowhere") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestADeclaredCollectionReadOnlyThroughResolveIsTaken(t *testing.T) {
+	decl := galleon.ModuleFunc("decl", func(r *galleon.Registry) error {
+		galleon.Collect[tag](r)
+		return nil
+	})
+	add := galleon.ModuleFunc("add", func(r *galleon.Registry) error {
+		galleon.Collect(r, tag("a"))
+		return nil
+	})
+	app, err := galleon.New(base(decl, add)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := galleon.MustResolve[[]tag](app); !slices.Equal(got, []tag{"a"}) {
+		t.Fatalf("the collection is %v", got)
+	}
+}
+
+func TestACollectionNothingTakesSaysItsConsumerMayNotBeInstalled(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect(r, tag("a"))
+		return nil
+	})
+	_, err := galleon.New(base(mod)...)
+	if err == nil || !strings.Contains(err.Error(), "nothing declares or takes []galleon_test.tag") ||
+		!strings.Contains(err.Error(), "is the module that consumes it installed? A consumer declares it with galleon.Collect[galleon_test.tag](r)") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// labeler is an interface that tag implements.
+type labeler interface{ Label() string }
+
+func (t tag) Label() string { return string(t) }
+
+func TestACollectionOfAConcreteTypeWhereAnInterfaceIsTakenSaysSo(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect(r, tag("a"))
+		take[labeler](r)
+		return nil
+	})
+	_, err := galleon.New(base(mod)...)
+	if err == nil || !strings.Contains(err.Error(), "(galleon_test.tag implements galleon_test.labeler: collect it as galleon.Collect[galleon_test.labeler], since []galleon_test.labeler is what is taken)") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestACollectionOfValuesWhereAPointerIsDeclaredSaysSo(t *testing.T) {
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Collect[*tag](r)
+		galleon.Collect(r, tag("a"))
+		return nil
+	})
+	_, err := galleon.New(base(mod)...)
+	if err == nil || !strings.Contains(err.Error(), "(collect *galleon_test.tag values: []*galleon_test.tag is what is taken)") {
 		t.Fatalf("got %v", err)
 	}
 }
