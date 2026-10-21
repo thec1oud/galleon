@@ -11,7 +11,7 @@ This repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each mod
 | Module | Path | Contents |
 |---|---|---|
 | `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness, node identity, OpenTelemetry and slog), the clock seam, roles and the process supervisor, the error model, coordination interfaces and the in-process `local` backend, the operation model and HTTP/RPC transport, the outbound client, the data plane (`data` interfaces, `pg` on pgx), and the migration seam (`migrate`, with the built-in `pg/sqlmigrate`) |
-| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`, `conformance/migratetest`), a fake migrator (`testkit.MigrationStore`), `testkit.DB`, a Postgres database per package with a transaction per test, `testkit.Replica`, its view on a streaming replica, and `testkit.Proxy` |
+| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`, `conformance/migratetest`, `conformance/ormtest`), a fake migrator (`testkit.MigrationStore`), `testkit.DB`, a Postgres database per package with a transaction per test, `testkit.Replica`, its view on a streaming replica, and `testkit.Proxy` |
 
 Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `coord-pg`, `jobs`, `web`, `realtime`, `http3`, `adapters/*`, `cmd/galleon`.
 
@@ -68,6 +68,32 @@ Tests that need Postgres skip unless `GALLEON_TEST_POSTGRES` holds the DSN of a 
 ## Data plane status
 
 Package `pg` routes reads to streaming replicas by read consistency (`Primary`, `Any`, `BoundedStaleness(d)`, `ReadYourWrites` with wait and fail policies), tracks each replica's lag in the background, and carries read-your-writes across requests and nodes with signed causal tokens in the `Galleon-Consistency` header (see [§7.1, §7.4 and §7.5](docs/design/05-architecture.md#71-sources-and-topology)). Not built yet: `Snapshot` reads, sharing lag readings through coordination, replicas of named sources, the token cookie, and `WAIT FOR LSN` on PostgreSQL 19.
+
+## Using an ORM or query builder
+
+Galleon owns the transaction; your ORM, query builder or repository joins it and never opens a connection or chooses a host of its own. Take the handle you are given, or the one in ctx, and fire side effects after the commit:
+
+```go
+func (r *Orders) Save(ctx context.Context, o Order) error {
+    ctx = data.ForModel(ctx, "order") // spans say galleon.data.model=order, db.collection.name="shop"."orders"
+    q, ok := data.QuerierFrom(ctx)    // only inside a write transaction; never a pool
+    if !ok {
+        return errors.New("orders: Save needs a write transaction")
+    }
+    if _, err := q.Exec(ctx, "INSERT INTO shop.orders (id, total) VALUES ($1, $2)", o.ID, o.Total); err != nil {
+        return err
+    }
+    return data.AfterCommit(ctx, func(ctx context.Context) { r.events.Placed(ctx, o) }) // never on rollback
+}
+```
+
+The adapter's module describes its models, and the data module builds the registry (`*data.Models`), failing boot on an invalid model or a duplicate name or table:
+
+```go
+galleon.Collect(r, data.ModelInfo{Name: "order", Schema: "shop", Table: "orders", Key: []string{"id"}})
+```
+
+`testkit/conformance/ormtest` checks an adapter against the seam's rules, with `ormtest.Reference` as a worked example. See [§7.6](docs/design/05-architecture.md#76-the-orm-seam) and [§6.2](docs/design/06-seam-specifications.md#62-orm-integration). Not built yet: `FilterApplier`, which waits for the security plane, and any named ORM adapter.
 
 ## Migrations status
 
