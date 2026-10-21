@@ -148,7 +148,8 @@ type Locker interface {
 }
 
 type Lease interface {
-    Token() uint64                     // fencing token, strictly increasing per key
+    Token() uint64                     // fencing token, strictly increasing per key within Epoch
+    Epoch() string                     // the token counter's identity: tokens compare only within one
     Renew(ctx context.Context) error
     Release(ctx context.Context) error
     Lost() <-chan struct{}             // closed if the lease is lost (expiry, partition)
@@ -179,7 +180,7 @@ type Counters interface {
 
 **Rules**
 1. **Mutual exclusion:** at most one holder of a key's lease at a time, *as judged by fencing token*. A protected resource that checks tokens MUST reject a lower token than one it has seen.
-2. Fencing tokens MUST strictly increase per key, across restarts of the backend.
+2. Fencing tokens MUST strictly increase per key within an epoch, and a backend MUST keep its epoch across restarts unless its tokens restart too, in which case it MUST report a new one (`local` takes a random epoch per instance). A protected resource compares tokens only within an epoch, and lets a new epoch take over.
 3. `Lost()` MUST close before another node can acquire the same key, or the lease's TTL MUST be shorter than the window in which a holder can still act. The backend documents which guarantee it gives.
 4. PubSub is **at-most-once**, with no ordering guarantee across publishers. Anything that needs at-least-once uses the outbox (§8), not PubSub.
 5. KV `Put` with `IfRevision` MUST be atomic compare-and-swap.
@@ -373,7 +374,7 @@ type Risk uint8    // Unknown (the zero value), Safe, Caution, Destructive, Manu
 
 type ApplyOptions struct {
     Lock         coord.Lease // held; Token() is the fencing token
-    MaxRisk      Risk
+    MaxRisk      Risk        // zero (Unknown) means Safe
     AllowUnknown bool        // whether Unknown steps may run
     Fingerprint  string      // the plan checked or approved; "" for a migrator that can't plan
     Observer     Observer    // may be nil: use opts.Step(ctx, s)
@@ -393,13 +394,13 @@ type Completion interface{ Done(ctx, id string) (bool, error) }
 // migrate.Runner (Status, Plan, Apply, ApplyOne, Done) and migrate.Policy.
 ```
 
-Two changes from part 4's sketch: `ApplyOptions.Lock` is the held lease rather than a `Locker`, since the Runner takes the lock before calling any migrator code, and `AllowUnknown` sits beside `MaxRisk`, because whether Unknown may run is its own policy, not a point on the scale.
+Three changes from part 4's sketch: `ApplyOptions.Lock` is the held lease rather than a `Locker`, since the Runner takes the lock before calling any migrator code; `AllowUnknown` sits beside `MaxRisk`, because whether Unknown may run is its own policy, not a point on the scale; and an unset `MaxRisk` means Safe, so options nobody filled in are the most restrictive. `coord.Lease` gained `Epoch` (§4), so a fence can tell a restarted token counter from a stale holder.
 
 **Rules**
 1. `Apply` MUST NOT run without `opts.Lock`, and MUST stop when ctx ends. The Runner never calls it without a held lease, and cancels ctx if the lease is lost or can't be renewed.
-2. A migrator that classifies risk MUST refuse, before changing anything, changes with a step that `opts` doesn't allow (above `MaxRisk`, or Unknown without `AllowUnknown`). A `Planner` MUST refuse a plan whose fingerprint isn't `opts.Fingerprint`, when that is set.
+2. A migrator that classifies risk MUST refuse, before changing anything, changes with a step that `opts` doesn't allow (above `MaxRisk`, which means Safe when unset, or Unknown without `AllowUnknown`). A `Planner` MUST refuse a plan whose fingerprint isn't `opts.Fingerprint`, when that is set.
 3. `Apply` on an up-to-date database MUST change nothing, and `Status` MUST be `UpToDate` after an `Apply` that returned without error. The Runner reads `Status` under the lock before applying, and again after.
-4. A migrator that claims fencing MUST refuse a lease whose token is below one it has applied under, as recorded with the change itself.
+4. A migrator that claims fencing MUST refuse a lease whose token is below one it has applied under in the same epoch, as recorded with the change itself, and MUST let a lease of another epoch take over: fencing protects within one coordination epoch.
 5. `Status` SHOULD NOT change the database (sqlmigrate's own tests check that it creates nothing).
 6. `Ahead` and `Drifted` MUST NOT be applied over: `Apply` refuses them, as does the Runner.
 7. A `BackgroundTask`'s `Step` MUST be safe to repeat from the same cursor, since a step interrupted before its cursor is saved runs again.
@@ -408,9 +409,9 @@ Two changes from part 4's sketch: `ApplyOptions.Lock` is the held lease rather t
 
 The kernel's behaviour around any migrator (the lock, the readiness gate, boot modes, the per-environment policy, fingerprint pinning, observability and the operator surface) is described in [part 5, §7.7](05-architecture.md#77-migrations-j3-d12).
 
-**Conformance** (`testkit/conformance/migratetest`): an empty database is `Pending`; `Apply` twice changes nothing the second time; four concurrent nodes under one lock run `Apply` exactly once; `Status` is `UpToDate` after `Apply`; a plan above `MaxRisk` is refused by the Runner, and by the migrator itself when it can plan, with nothing applied; `Apply` without a lease is refused; and, where claimed, a stale lease is refused (fencing), `Ahead` and `Drifted` are detected and not applied over, plans are stable across nodes and pinned fingerprints are enforced (`Planner`), offline plans don't depend on the database (`OfflinePlanner`), `Verify` finds the edited change (`Verifier`), and a background task resumes on another node from a saved cursor, repeating a step safely, until `Done` (`Backgrounder`, `Completion`).
+**Conformance** (`testkit/conformance/migratetest`): an empty database is `Pending`; `Apply` twice changes nothing the second time; four concurrent nodes under one lock run `Apply` exactly once; `Status` is `UpToDate` after `Apply`; a plan above `MaxRisk` is refused by the Runner, and by the migrator itself when it can plan, with nothing applied; `Apply` without a lease is refused, as is a Destructive step with `MaxRisk` unset; and, where claimed, a stale lease is refused and a new epoch takes over, through chosen leases and through a restarted in-process backend (fencing), `Ahead` and `Drifted` are detected and not applied over, plans are stable across nodes and pinned fingerprints are enforced (`Planner`), offline plans don't depend on the database (`OfflinePlanner`), `Verify` finds the edited change (`Verifier`), and a background task resumes on another node from a saved cursor, repeating a step safely, until `Done` (`Backgrounder`, `Completion`).
 
-**Ships with:** `pg/sqlmigrate` (numbered SQL files from an `fs.FS`; `Planner` and `Verifier`, fencing, Ahead and Drifted), which passes the suite against real Postgres; `testkit.MigrationStore` and `FakeMigrator` (every capability, shared state across nodes, hooks to block or fail a step), and `testkit.CoreOnly` to hide its capabilities, which pass it too. **Deferred:** running background tasks, which needs the job system (§9); the `migrate` CLI (phase 8), for which the Go API stands in.
+**Ships with:** `pg/sqlmigrate` (numbered SQL files from an `fs.FS`; `Planner`, `OfflinePlanner` and `Verifier`, fencing, Ahead and Drifted, out-of-order files refused unless allowed), which passes the suite against real Postgres; `testkit.MigrationStore` and `FakeMigrator` (every capability, shared state across nodes, hooks to block or fail a step), and `testkit.CoreOnly` to hide its capabilities, which pass it too. **Deferred:** running background tasks, which needs the job system (§9); the `migrate` CLI (phase 8), for which the Go API stands in.
 
 ---
 
