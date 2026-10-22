@@ -1,6 +1,6 @@
 # Architecture decision records
 
-Each file here records one decision about Galleon's architecture: the
+Each record here captures one decision about Galleon's architecture: the
 context, what we decided, the consequences, and the options we rejected.
 Together they answer "why is it like this?". The rest of the documentation
 describes what is true now and links here for the reasoning.
@@ -71,12 +71,13 @@ this with [`.github/scripts/adr-check.sh`](../../.github/scripts/adr-check.sh),
 which also checks every record's name, header and sections, that a
 superseding record exists and is accepted, and that the index has exactly
 one up-to-date row per record. Run it locally from the repository root
-with `.github/scripts/adr-check.sh origin/dev` (it needs bash 4 or later).
+with `.github/scripts/adr-check.sh --decided "$(git merge-base origin/dev HEAD)"`
+(it needs bash 4.4 or later).
 
 | Status | Meaning | Can change to |
 |---|---|---|
 | Proposed | Under discussion; edit freely | Anything |
 | Accepted | In force | Superseded by, Deprecated |
 | Rejected | Considered and declined | Nothing |
-| Superseded by NNNN | Replaced by a later record | Nothing |
+| Superseded by NNNN | Replaced by a later record | Nothing (it keeps pointing at its successor, even once that is superseded in turn) |
 | Deprecated | No longer applies, with no replacement | Nothing |

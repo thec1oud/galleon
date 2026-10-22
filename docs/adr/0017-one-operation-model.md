@@ -20,14 +20,14 @@ validators, its errors, its security requirements, its policies (timeouts,
 limits, idempotency, caching), its streaming mode and its docs metadata.
 
 The descriptor is Galleon's own (ADR 0007). **How it is authored is a seam**:
-Themis generates descriptors, and Go code builds them with generics. Galleon
-publishes a small, versioned target package that generators implement, and
-Galleon never depends on Themis.
+Go code builds descriptors with generics today, and Themis will generate
+them. Galleon is to publish a small, versioned target package that
+generators implement, and Galleon never depends on Themis.
 
 ## Consequences
 
-- One source of truth drives routing, OpenAPI/proto/AsyncAPI export, docs,
-  authorization and clients.
+- One source of truth drives routing and authorization now, and is to drive
+  OpenAPI, proto and AsyncAPI export, docs and clients.
 - People can leave Themis without rewriting handlers.
 - A Themis-generated operation and the same operation written by hand must
   pass the same conformance suite.

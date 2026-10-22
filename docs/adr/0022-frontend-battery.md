@@ -11,23 +11,24 @@ component model and no type safety.
 
 ## Decision
 
-The frontend is an optional **battery** (`web`) with a seam. Its defaults:
+The frontend will be an optional **battery** (`web`) with a seam. None of it
+is built yet. Its defaults are to be:
 
 - **templ** for type-safe, compiled HTML components.
 - **Fragment responses**, htmx and Hotwire style: partial rendering,
   out-of-band updates, and fragment-request headers, without shipping a JS
   framework.
-- **Vite as the asset seam**, not an owned toolchain: Galleon reads Vite's
-  manifest for fingerprinted URLs, proxies its dev server, and embeds the
+- **Vite as the asset seam**, not an owned toolchain: Galleon will read
+  Vite's manifest for fingerprinted URLs, proxy its dev server, and embed the
   built output in the binary.
 
-SPAs and meta-frameworks use the same Vite seam. `html/template` stays
-supported as an alternative. A server-driven, LiveView-style UI can come
+SPAs and meta-frameworks will use the same Vite seam, and `html/template`
+will stay supported as an alternative. A server-driven, LiveView-style UI can come
 later as its own battery, after the realtime work.
 
 ## Consequences
 
-- Full-stack apps get type-checked templates and interactivity without an
+- Full-stack apps will get type-checked templates and interactivity without an
   SPA by default.
 - Galleon never owns the JS build, so it can't break when that ecosystem
   moves.

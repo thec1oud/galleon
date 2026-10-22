@@ -12,9 +12,11 @@ Galleon still needs dependency injection that is pleasant to use.
 
 ## Decision
 
-- **No global state and no init-time registration.** Everything is
+- **No global registries and no init-time registration.** Components are
   constructed and passed in, and every piece of wiring can be found with
-  "go to definition".
+  "go to definition". The one exception is the process's own identity under
+  a supervisor, which package `process` reads from its environment once at
+  startup.
 - **Dependency injection uses reflection at boot by default.** Code
   generation is to be an option for teams that want it.
 - **Reflection is allowed at boot, never per request** (ADR 0002's budget).

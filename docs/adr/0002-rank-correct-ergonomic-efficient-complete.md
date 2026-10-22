@@ -30,8 +30,8 @@ Completeness is delivered through batteries and seams, not a bigger core.
 - "Efficient" becomes reviewable: a change either adds hot-path cost or it
   doesn't.
 - Most of the conflict between ergonomics and efficiency is resolved at boot
-  or by generated code (precompiled routes, the DI graph, generated decoders),
-  not per request.
+  (the DI graph, validation plans), or is to be resolved by generated code
+  (generated decoders), not per request.
 - The core stays small; a feature that isn't needed for correctness goes in a
   battery.
 

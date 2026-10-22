@@ -9,7 +9,8 @@
 # 1, a valid "Status:" line on line 3, a "Date:" line on line 4, and the
 # sections Context, Decision, Consequences, Alternatives considered and
 # Sources, in that order. Numbers must be unique. A record superseded by
-# another must name a different, accepted record. The index table in
+# another must name a different record which is accepted or deprecated, or
+# superseded in turn by such a record, with no cycle. The index table in
 # docs/adr/README.md must have exactly one row per record, with its number,
 # title, file and status, and no other rows.
 #
@@ -21,8 +22,8 @@
 # deleted since: only its Status: line may change, and only forwards
 # (Accepted to Superseded or Deprecated).
 #
-# Run from the repository root, with bash 4 or later (macOS's /bin/bash is
-# 3.2). Exits non-zero, listing every problem, if any check fails.
+# Run from the repository root, with bash 4.4 or later (macOS's /bin/bash is
+# 3.2). Exits 1, listing every problem, if any check fails, and 2 on misuse.
 set -euo pipefail
 
 DIR=docs/adr
@@ -35,12 +36,22 @@ fail() {
   problems=$((problems + 1))
 }
 
+usage() {
+  echo "usage: adr-check.sh [--decided] [BASE]" >&2
+  exit 2
+}
 decided=false
-if [[ ${1:-} == --decided ]]; then
-  decided=true
-  shift
-fi
-base=${1:-}
+base=""
+for arg in "$@"; do
+  case $arg in
+    --decided) decided=true ;;
+    -*) usage ;;
+    *)
+      [[ -z $base ]] || usage
+      base=$arg
+      ;;
+  esac
+done
 if [[ -n $base ]] && ! git rev-parse --verify -q "$base^{commit}" >/dev/null; then
   echo "adr-check: $base is not a commit" >&2
   exit 2
@@ -60,15 +71,26 @@ status_kind() {
   esac
 }
 
-# status_of prints the value of the Status: line (line 3) of the file named.
+# status_of prints the value of the Status: line (line 3) of the text on
+# stdin.
 status_of() {
-  sed -n '3s/^Status: //p' "$1"
+  sed -n '3s/^Status: //p'
+}
+
+# headings prints the level-2 headings of the file named, outside code fences.
+headings() {
+  awk '/^(```|~~~)/ { fenced = !fenced; next } !fenced && /^## /' "$1"
 }
 
 # The records, and every file that should be one.
 records=()
 while IFS= read -r f; do
+  [[ -e $f || -L $f ]] || continue # tracked, but deleted in the work tree
   name=${f#"$DIR"/}
+  if [[ -L $f ]]; then
+    fail "$f: is a symbolic link; records must be regular files"
+    continue
+  fi
   case $name in
     README.md | template.md) continue ;;
   esac
@@ -77,7 +99,7 @@ while IFS= read -r f; do
     continue
   fi
   records+=("$f")
-done < <(find "$DIR" -type f | sort)
+done < <(git ls-files -co --exclude-standard -- "$DIR" | sort)
 
 declare -A seen=() title_of=() kind_of=() full_status_of=()
 for f in "${records[@]}"; do
@@ -85,8 +107,9 @@ for f in "${records[@]}"; do
   num=${name:0:4}
   if [[ -n ${seen[$num]:-} ]]; then
     fail "$f: number $num is also used by ${seen[$num]}"
+  else
+    seen[$num]=$f
   fi
-  seen[$num]=$f
   if grep -q $'\r' "$f"; then
     fail "$f: has Windows (CRLF) line endings; use Unix (LF)"
     continue
@@ -98,7 +121,7 @@ for f in "${records[@]}"; do
   else
     fail "$f: line 1 must be \"# $num. Title\", not \"$title\""
   fi
-  status=$(status_of "$f")
+  status=$(status_of <"$f")
   kind=$(status_kind "$status")
   kind_of[$name]=$kind
   full_status_of[$name]=$status
@@ -107,29 +130,43 @@ for f in "${records[@]}"; do
   elif [[ $kind == Proposed ]] && $decided; then
     fail "$f: still Proposed; accept or reject it before it merges"
   fi
-  if ! sed -n '4p' "$f" | grep -Eq '^Date: [0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
-    fail "$f: line 4 must be \"Date: YYYY-MM-DD\""
+  date=$(sed -n '4s/^Date: //p' "$f")
+  if [[ ! $date =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || [[ $(date -u -d "$date" +%F 2>/dev/null) != "$date" ]]; then
+    fail "$f: line 4 must be \"Date: YYYY-MM-DD\", with a real date"
   fi
-  headings=$(grep -E '^## ' "$f" || true)
   want=$(printf '%s\n' "${SECTIONS[@]}")
-  if [[ $headings != "$want" ]]; then
+  if [[ $(headings "$f") != "$want" ]]; then
     fail "$f: its sections must be exactly: $(printf '"%s" ' "${SECTIONS[@]}")in that order"
   fi
 done
 
-# A superseded record names a different record, which is in force.
+# A superseded record names a different record, which is in force, or was
+# superseded in turn: following the chain must end at an accepted or
+# deprecated record, without a cycle.
 for f in "${records[@]}"; do
   name=${f##*/}
   [[ ${kind_of[$name]:-} == Superseded ]] || continue
-  target=${full_status_of[$name]#*](}
-  target=${target%)}
-  if [[ $target == "$name" ]]; then
-    fail "$f: can't be superseded by itself"
-  elif [[ ! -f $DIR/$target ]]; then
-    fail "$f: superseded by $target, which doesn't exist"
-  elif [[ ${kind_of[$target]:-} != Accepted ]]; then
-    fail "$f: superseded by $target, which isn't Accepted"
-  fi
+  declare -A visited=([$name]=1)
+  at=$name
+  while [[ ${kind_of[$at]:-} == Superseded ]]; do
+    next=${full_status_of[$at]#*](}
+    next=${next%)}
+    if [[ -n ${visited[$next]:-} ]]; then
+      fail "$f: its chain of superseding records loops back to $next"
+      break
+    fi
+    visited[$next]=1
+    if [[ ! -f $DIR/$next ]]; then
+      fail "$f: superseded by $next, which doesn't exist"
+      break
+    fi
+    at=$next
+  done
+  case ${kind_of[$at]:-} in
+    Accepted | Deprecated | Superseded) ;;
+    *) fail "$f: superseded by a chain ending at $at, which is ${kind_of[$at]:-invalid}, not Accepted or Deprecated" ;;
+  esac
+  unset visited
 done
 
 # The index has one row per record, and only those.
@@ -170,7 +207,8 @@ if [[ -n $base ]]; then
     [[ -n $f ]] || continue
     name=${f##*/}
     [[ $f == "$DIR/$name" && $name =~ ^[0-9]{4}-.*\.md$ ]] || continue
-    old_status=$(git show "$base:$f" | sed -n '3s/^Status: //p')
+    old=$(git show "$base:$f")
+    old_status=$(status_of <<<"$old")
     old_kind=$(status_kind "$old_status")
     if [[ -z $old_kind ]]; then
       echo "adr-check: warning: $f has no valid status at $base, so it isn't checked for edits" >&2
@@ -181,10 +219,10 @@ if [[ -n $base ]]; then
       fail "$f: was $old_kind at $base and has been deleted or renamed; records are append-only"
       continue
     fi
-    if ! cmp -s <(git show "$base:$f" | sed 3d) <(sed 3d "$f"); then
+    if ! cmp -s <(git show "$base:$f" | sed 3d) <(sed 3d "$f"); then # bytes, not $old: $() drops trailing newlines
       fail "$f: was $old_kind at $base and has been edited; only its Status: line may change. Supersede it with a new record instead"
     fi
-    new_status=$(status_of "$f")
+    new_status=$(status_of <"$f")
     if [[ $new_status != "$old_status" ]]; then
       case $old_kind:$(status_kind "$new_status") in
         Accepted:Superseded | Accepted:Deprecated) ;;

@@ -151,12 +151,12 @@ expect fail "badly named file" "name it NNNN-slug.md"
 setup
 record 0001 first "Superseded by [0001](0001-first.md)"
 index
-expect fail "supersede a record with itself" "by itself"
+expect fail "supersede a record with itself" "loops back"
 
 setup
 record 0001 first "Superseded by [0002](0002-second.md)"
 index
-expect fail "supersede with a proposed record" "isn't Accepted"
+expect fail "supersede with a proposed record" "not Accepted or Deprecated"
 
 setup
 record 0001 first Deprecated
@@ -204,6 +204,65 @@ expect pass "no proposed records with --decided"
 setup
 ARGS=(deadbeef)
 expect fail "a base that isn't a commit" "is not a commit"
+
+setup
+record 0003 third Accepted
+record 0004 fourth Accepted
+index
+git add -A && git commit -qm "accept 0003 and 0004"
+record 0001 first "Superseded by [0003](0003-third.md)"
+index
+git add -A && git commit -qm "supersede 0001"
+record 0003 third "Superseded by [0004](0004-fourth.md)"
+index
+expect pass "supersede a record that superseded another"
+
+setup
+record 0003 third Accepted
+index
+git add -A && git commit -qm "accept 0003"
+record 0001 first "Superseded by [0003](0003-third.md)"
+index
+git add -A && git commit -qm "supersede 0001"
+record 0003 third Deprecated
+index
+expect pass "deprecate a record that superseded another"
+
+setup
+record 0003 third "Superseded by [0001](0001-first.md)"
+record 0001 first "Superseded by [0003](0003-third.md)"
+index
+expect fail "a cycle of superseding records" "loops back"
+
+setup
+ARGS=("$(git rev-list --max-parents=0 HEAD)" --decided)
+expect fail "--decided after the base" "still Proposed"
+
+setup
+ARGS=(a b)
+expect fail "two bases" "usage"
+
+setup
+ARGS=(--nope)
+expect fail "an unknown flag" "usage"
+
+setup
+ln -s 0001-first.md docs/adr/0009-link.md
+expect fail "a symlinked record" "symbolic link"
+
+setup
+sed -i 's/^Date: .*/Date: 2026-13-45/' docs/adr/0002-second.md
+expect fail "an impossible date" "a real date"
+
+setup
+printf '\n```md\n## Usage\n```\n' >>docs/adr/0002-second.md
+sed -i 's/^## Sources$/## Sources\n\nSee:/' docs/adr/0002-second.md
+expect pass "a heading inside a code fence"
+
+setup
+record 0002 other Accepted
+index
+expect fail "reuse a number, both indexed" "is also used by"
 
 if ((failures > 0)); then
   echo "$failures case(s) failed" >&2
