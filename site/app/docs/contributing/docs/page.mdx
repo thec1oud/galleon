@@ -79,3 +79,23 @@ bun run typecheck
 bun run build                    # fails on a stale sample, a missing region, or a broken page
 test -z "$(gofmt -l examples)" && go vet ./... && go test -race ./...   # the samples
 ```
+
+## Deploys
+
+The site is hosted on [Vercel](https://vercel.com/), from `site/vercel.json`:
+
+| Branch | Deploys to |
+|---|---|
+| `master` | the docs' own domain, the stable docs |
+| `dev` | the dev domain, with a banner saying it may describe work that hasn't reached `master` |
+| any other | a preview link on its pull request, with a banner naming the branch |
+
+Only the stable docs are indexed by search engines. The banner and the indexing come from the branch and environment Vercel sets at build time, so local and CI builds look like the stable docs. Vercel installs Bun 1.4.2, the version CI uses, and the site runs on Node 22.
+
+The Vercel project needs these settings:
+
+- **Root Directory:** `site`, with source files outside it included in the build, which is the default. The build reads `docs/adr` and the README.
+- **Production Branch:** `master`. Vercel's default is the repository's default branch, which is `dev`.
+- **Domains:** the docs' domain on production, and a second domain assigned to the `dev` branch.
+
+The README's samples are synced like a page's, with `bun run samples`. It is read as plain Markdown, as GitHub reads it.

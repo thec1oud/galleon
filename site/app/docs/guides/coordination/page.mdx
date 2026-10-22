@@ -12,9 +12,25 @@ Locks, leader election and rate limits need a coordination backend, and Galleon 
 
 Today there is one backend, [`coord/local`](https://pkg.go.dev/github.com/thec1oud/galleon/coord/local). It is exact, but only inside one process. Use it when the app runs as a single process, and say so:
 
-```go
-galleon.Coordination(local.New()),
-galleon.Deploy(galleon.SingleNode),
+```go file=examples/firstapp/main.go#app title="main.go"
+func options() []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("hello"),
+		galleon.Coordination(local.New()), // required: there is no default backend
+		galleon.Deploy(galleon.SingleNode),
+		galleon.Modules(Greetings{}),
+	}
+}
+
+func main() {
+	app, err := galleon.New(options()...)
+	if err != nil {
+		log.Fatal(err) // every wiring, config and coordination problem, listed together
+	}
+	if err := app.Run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
 ```
 
 Without `galleon.Deploy`, an app whose modules need coordination boots and logs a line asking you to declare it.

@@ -81,6 +81,13 @@ describe("syncSamples", () => {
     expect(() => syncSamples("```go file=missing.go\n```\n", read)).toThrow("can't read");
     expect(() => syncSamples("```go file=main.go#nope\n```\n", read)).toThrow("no region");
   });
+  test("reads plain Markdown, as GitHub does a README, with format md", () => {
+    const page = "<!-- a note -->\n\n<details>\n\n```go file=main.go#inner\n```\n\n</details>\n";
+    expect(() => syncSamples(page, read)).toThrow();
+    expect(syncSamples(page, read, "README.md", "md")).toBe(
+      "<!-- a note -->\n\n<details>\n\n```go file=main.go#inner\nif x > 0 {\n\tprintln(x)\n}\n```\n\n</details>\n",
+    );
+  });
   test("handles a CRLF page", () => {
     expect(syncSamples("```go file=main.go#inner\r\nstale\r\n```\r\n", read)).toBe(
       "```go file=main.go#inner\nif x > 0 {\n\tprintln(x)\n}\n```\n",
