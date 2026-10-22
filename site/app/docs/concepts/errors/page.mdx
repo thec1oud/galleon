@@ -55,4 +55,4 @@ Over HTTP, an error is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `ap
 
 `instance` is usually the trace ID. An `Internal` error always shows the title `internal error` and the code `galleon.internal`, never its message or cause. Over RPC, the error carries the gRPC code of its kind.
 
-An operation lists the codes it can return with `Errors(...)` in its declaration.
+An operation lists the codes it can return with `Errors(...)` in its declaration. The [error reference](/docs/reference/errors) lists every kind, and every code Galleon's core module returns.

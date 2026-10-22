@@ -106,16 +106,23 @@ func (r Retrier) Do(ctx context.Context, fn func(ctx context.Context) error) err
 // Error codes of the data plane. The kinds they come with are part of the
 // contract: callers and clients branch on them.
 const (
-	// Conflict, retryable: rerunning the whole transaction can succeed.
+	// Conflict, retryable: the transaction conflicted with a concurrent
+	// one under serializable isolation; rerunning it can succeed.
 	CodeSerializationFailure = "data.serialization_failure" // SQLSTATE 40001
-	CodeDeadlock             = "data.deadlock"              // SQLSTATE 40P01
-	// Conflict: the data already exists.
-	CodeUniqueViolation    = "data.unique_violation"    // 23505
+	// Conflict, retryable: the transaction deadlocked with another, and the
+	// database aborted it; rerunning it can succeed.
+	CodeDeadlock = "data.deadlock" // SQLSTATE 40P01
+	// Conflict: the data already exists, by a unique constraint.
+	CodeUniqueViolation = "data.unique_violation" // 23505
+	// Conflict: the data overlaps data an exclusion constraint keeps apart.
 	CodeExclusionViolation = "data.exclusion_violation" // 23P01
-	// FailedPrecondition: the change breaks a constraint.
-	CodeCheckViolation      = "data.check_violation"       // 23514
+	// FailedPrecondition: the change breaks a check constraint.
+	CodeCheckViolation = "data.check_violation" // 23514
+	// FailedPrecondition: the change refers to a row that doesn't exist,
+	// or removes one still referred to.
 	CodeForeignKeyViolation = "data.foreign_key_violation" // 23503
-	CodeNotNullViolation    = "data.not_null_violation"    // 23502
+	// FailedPrecondition: the change leaves a required column empty.
+	CodeNotNullViolation = "data.not_null_violation" // 23502
 	// Conflict: a lock wasn't granted within lock_timeout, or NOWAIT.
 	CodeLockNotAvailable = "data.lock_not_available" // 55P03
 	// DeadlineExceeded: statement_timeout canceled the statement.
@@ -125,17 +132,27 @@ const (
 	// Unavailable, retryable: a ReadYourWrites read with OrFail found no
 	// replica caught up with its causal floor within its wait.
 	CodeConsistencyTimeout = "data.consistency_timeout"
-	// Internal: the handle was used wrongly.
-	CodeTxEnded       = "data.tx_ended"      // used after Commit or Rollback
-	CodePropagation   = "data.propagation"   // Mandatory, Never, a read joined by a write, …
-	CodeCrossSource   = "data.cross_source"  // joining a transaction of another source
-	CodeRollbackOnly  = "data.rollback_only" // a joined handle rolled back; the commit didn't happen
-	CodeTxOpen        = "data.tx_open"       // a nested transaction was still open at commit
-	CodeTxLeaked      = "data.tx_leaked"     // still open when its operation ended
+	// Internal: a transaction handle was used after Commit or Rollback.
+	CodeTxEnded = "data.tx_ended"
+	// Internal: a transaction's propagation or isolation can't be honored,
+	// such as Mandatory without a transaction, Never within one, or a
+	// write joining a read.
+	CodePropagation = "data.propagation"
+	// Internal: a transaction tried to join one on another source, which
+	// would need two-phase commit.
+	CodeCrossSource = "data.cross_source"
+	// Internal: a transaction that joined this one rolled back, so the
+	// commit rolled back instead.
+	CodeRollbackOnly = "data.rollback_only"
+	// Internal: a nested transaction was still open at commit.
+	CodeTxOpen = "data.tx_open"
+	// Internal: a transaction was still open when its operation ended.
+	CodeTxLeaked = "data.tx_leaked"
+	// Internal: no data source has the name asked for.
 	CodeUnknownSource = "data.unknown_source"
-	// CodeInvalidConsistency is a read's level that fails Level.Validate,
-	// from its options or its ctx: an Internal error, since the level is
-	// the server's.
+	// Internal: a read asked for a consistency level that fails
+	// Level.Validate, in its options or its ctx. The level is the
+	// server's choice, not the client's, so it is a bug.
 	CodeInvalidConsistency = "data.invalid_consistency"
 )
 

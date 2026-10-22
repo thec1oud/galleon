@@ -277,12 +277,25 @@ func MaxRisk(steps []StepInfo) Risk {
 
 // Error codes of the errors the Runner returns.
 const (
-	CodeRiskRefused         = "migrate.risk_refused"
+	// CodeRiskRefused: the plan has a step riskier than the policy's
+	// MaxRisk, or of unknown risk without AllowUnknown, so nothing was
+	// applied.
+	CodeRiskRefused = "migrate.risk_refused"
+	// CodeFingerprintMismatch: the plan isn't the one approved for the
+	// deploy, so nothing was applied.
 	CodeFingerprintMismatch = "migrate.fingerprint_mismatch"
-	CodeLeaseLost           = "migrate.lease_lost"
-	CodeNotSupported        = "migrate.not_supported"
-	CodeNotReady            = "migrate.not_ready"
-	CodeUnknownMigrator     = "migrate.unknown_migrator"
+	// CodeLeaseLost: the node lost the migration lease, so its apply
+	// stopped.
+	CodeLeaseLost = "migrate.lease_lost"
+	// CodeNotSupported: the migrator can't do what was asked of it, such as
+	// planning.
+	CodeNotSupported = "migrate.not_supported"
+	// CodeNotReady: a migrator's database isn't in a state this build may
+	// take traffic in: changes are pending, it is ahead or has drifted, or
+	// its status couldn't be read.
+	CodeNotReady = "migrate.not_ready"
+	// CodeUnknownMigrator: no migrator has the name asked for.
+	CodeUnknownMigrator = "migrate.unknown_migrator"
 )
 
 // ValidName reports whether name can name a migrator.

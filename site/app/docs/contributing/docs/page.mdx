@@ -29,7 +29,7 @@ Each PR carries its own docs. What goes where depends on what changed:
 
 - **A decision** becomes a record in [`docs/adr`](https://github.com/thec1oud/galleon/tree/dev/docs/adr), which appears here under Decisions. If it reverses an earlier decision, it supersedes that record rather than editing it.
 - **A lesson** from a bug, a review or an incident becomes a callout in the guide where readers would hit it. It can also be a "why" paragraph in the concept page. If it changes a decision, it also gets a superseding record.
-- **A code change** updates its guide, concept and reference pages.
+- **A code change** updates its guide and concept pages by hand. The error and config reference pages are generated: run `go generate ./...` in `site/`, and a test fails if they are stale.
 
 Concept pages say what is true now and link the decision records for why, so they never replay a debate.
 

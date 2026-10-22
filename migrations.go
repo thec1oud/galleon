@@ -142,9 +142,13 @@ type migrateSection struct {
 	// Mode is off, verify or apply.
 	Mode string `json:"mode"`
 	// MaxRisk is safe, caution, destructive or manual.
-	MaxRisk       string `json:"max_risk"`
-	AllowUnknown  bool   `json:"allow_unknown"`
-	TolerateAhead bool   `json:"tolerate_ahead"`
+	MaxRisk string `json:"max_risk"`
+	// AllowUnknown lets steps of unknown risk run, and migrators that can't
+	// plan apply at all.
+	AllowUnknown bool `json:"allow_unknown"`
+	// TolerateAhead counts a database newer than this build as ready, for
+	// the old nodes of a rolling deploy.
+	TolerateAhead bool `json:"tolerate_ahead"`
 	// Approve pins approved plan fingerprints, as name=fingerprint pairs
 	// separated by commas: each the online plan's, of the changes pending
 	// on the database (see migrate.Policy.Approved).
@@ -206,6 +210,12 @@ func (s *migrateSection) Validate() error {
 	}
 	return errors.Join(errs...)
 }
+
+// The defaults of the migrate section's recheck and apply_timeout.
+const (
+	defaultRecheck      = 5 * time.Second
+	defaultApplyTimeout = 10 * time.Minute
+)
 
 // durationText is a duration in config: a string with a unit, such as
 // "30s". A bare JSON number is kept as its text, so Validate can say which
@@ -313,7 +323,7 @@ func (a *App) configureMigrations() {
 	if policy.LockTTL != 0 && policy.LockTTL < time.Second || policy.LockWait < 0 {
 		a.bootErrs = append(a.bootErrs, fmt.Errorf("migrate: the policy's LockTTL must be 0 (%s) or at least 1s, and its LockWait not negative; it has %s and %s", migrate.DefaultLockTTL, policy.LockTTL, policy.LockWait))
 	}
-	mg := &migrations{policy: policy, recheck: cfg.Recheck.get(5 * time.Second), applyTimeout: cfg.ApplyTimeout.get(10 * time.Minute), gates: map[string]*migrationGate{}, handle: a.migrationsHandle}
+	mg := &migrations{policy: policy, recheck: cfg.Recheck.get(defaultRecheck), applyTimeout: cfg.ApplyTimeout.get(defaultApplyTimeout), gates: map[string]*migrationGate{}, handle: a.migrationsHandle}
 	for name := range policy.Approved {
 		if !slices.ContainsFunc(a.migratorRegs, func(m *migratorReg) bool { return m.name == name }) {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("migrate: a fingerprint is approved for migrator %q, which isn't registered (typo?)", name))
