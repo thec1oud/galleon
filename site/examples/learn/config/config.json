@@ -1,0 +1,4 @@
+{
+  "http": {"addr": ":8080"},
+  "limits": {"max_bookmarks": 500}
+}
