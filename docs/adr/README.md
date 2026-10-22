@@ -69,7 +69,8 @@ simply no longer applies, set it to `Status: Deprecated` instead.
 Nothing else in an accepted record changes, not even a typo. CI enforces
 this with [`.github/scripts/adr-check.sh`](../../.github/scripts/adr-check.sh),
 which also checks every record's name, header and sections, that a
-superseding record exists and is accepted, and that the index has exactly
+superseding record exists and that its chain of successors ends at an
+accepted or deprecated record, and that the index has exactly
 one up-to-date row per record. Run it locally from the repository root
 with `.github/scripts/adr-check.sh --decided "$(git merge-base origin/dev HEAD)"`
 (it needs bash 4.4 or later).

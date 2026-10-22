@@ -77,9 +77,27 @@ status_of() {
   sed -n '3s/^Status: //p'
 }
 
+# valid_date reports whether its argument is a real YYYY-MM-DD date, in pure
+# bash, since date -d is GNU-only.
+valid_date() {
+  [[ $1 =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] || return 1
+  local y=$((10#${BASH_REMATCH[1]})) m=$((10#${BASH_REMATCH[2]})) d=$((10#${BASH_REMATCH[3]})) days
+  ((m >= 1 && m <= 12 && d >= 1)) || return 1
+  case $m in
+    4 | 6 | 9 | 11) days=30 ;;
+    2) if ((y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))); then days=29; else days=28; fi ;;
+    *) days=31 ;;
+  esac
+  ((d <= days))
+}
+
 # headings prints the level-2 headings of the file named, outside code fences.
 headings() {
-  awk '/^(```|~~~)/ { fenced = !fenced; next } !fenced && /^## /' "$1"
+  awk '
+    !fence && match($0, /^(```+|~~~+)/) { fence = substr($0, 1, RLENGTH); next }
+    fence && index($0, fence) == 1 && $0 ~ /^(`+|~+)[ \t]*$/ { fence = ""; next }
+    !fence && /^## /
+  ' "$1"
 }
 
 # The records, and every file that should be one.
@@ -99,9 +117,15 @@ while IFS= read -r f; do
     continue
   fi
   records+=("$f")
-done < <(git ls-files -co --exclude-standard -- "$DIR" | sort)
+done < <({
+  git ls-files -c -- "$DIR"
+  # Untracked files count only if they could be records, so editor backups
+  # and swap files don't fail a local run.
+  git ls-files -o --exclude-standard -- "$DIR" | grep -E '\.md$' || true
+} | sort -u)
 
 declare -A seen=() title_of=() kind_of=() full_status_of=()
+want=$(printf '%s\n' "${SECTIONS[@]}")
 for f in "${records[@]}"; do
   name=${f##*/}
   num=${name:0:4}
@@ -110,31 +134,36 @@ for f in "${records[@]}"; do
   else
     seen[$num]=$f
   fi
+  crlf=false
   if grep -q $'\r' "$f"; then
     fail "$f: has Windows (CRLF) line endings; use Unix (LF)"
-    continue
+    crlf=true
   fi
 
-  title=$(sed -n '1p' "$f")
+  title=$(sed -n '1p' "$f" | tr -d '\r')
   if [[ $title =~ ^"# $num. "(.+)$ ]]; then
     title_of[$name]=${BASH_REMATCH[1]}
   else
     fail "$f: line 1 must be \"# $num. Title\", not \"$title\""
   fi
-  status=$(status_of <"$f")
+  status=$(status_of <"$f" | tr -d '\r')
   kind=$(status_kind "$status")
   kind_of[$name]=$kind
   full_status_of[$name]=$status
+  # A CRLF record is reported once, above, not again for each line.
+  $crlf && continue
+  if [[ $(sed -n '2p' "$f") != "" ]]; then
+    fail "$f: line 2 must be blank"
+  fi
   if [[ -z $kind ]]; then
     fail "$f: line 3 must be \"Status: \" followed by Proposed, Accepted, Rejected, Deprecated or \"Superseded by [NNNN](NNNN-slug.md)\""
   elif [[ $kind == Proposed ]] && $decided; then
     fail "$f: still Proposed; accept or reject it before it merges"
   fi
   date=$(sed -n '4s/^Date: //p' "$f")
-  if [[ ! $date =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || [[ $(date -u -d "$date" +%F 2>/dev/null) != "$date" ]]; then
+  if ! valid_date "$date"; then
     fail "$f: line 4 must be \"Date: YYYY-MM-DD\", with a real date"
   fi
-  want=$(printf '%s\n' "${SECTIONS[@]}")
   if [[ $(headings "$f") != "$want" ]]; then
     fail "$f: its sections must be exactly: $(printf '"%s" ' "${SECTIONS[@]}")in that order"
   fi
@@ -182,7 +211,7 @@ while IFS= read -r row; do
     continue
   fi
   listed[$file]=1
-  if [[ ! -f $DIR/$file || -z ${seen[$num]:-} || ${seen[$num]} != "$DIR/$file" ]]; then
+  if [[ ${file:0:4} != "$num" || ! " ${records[*]} " =~ " $DIR/$file " ]]; then
     fail "$INDEX: row $num points at $file, which isn't record $num"
     continue
   fi

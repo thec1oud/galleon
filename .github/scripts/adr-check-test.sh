@@ -215,6 +215,7 @@ index
 git add -A && git commit -qm "supersede 0001"
 record 0003 third "Superseded by [0004](0004-fourth.md)"
 index
+ARGS=("$(git rev-parse HEAD)")
 expect pass "supersede a record that superseded another"
 
 setup
@@ -226,6 +227,7 @@ index
 git add -A && git commit -qm "supersede 0001"
 record 0003 third Deprecated
 index
+ARGS=("$(git rev-parse HEAD)")
 expect pass "deprecate a record that superseded another"
 
 setup
@@ -262,7 +264,31 @@ expect pass "a heading inside a code fence"
 setup
 record 0002 other Accepted
 index
-expect fail "reuse a number, both indexed" "is also used by"
+expect fail "reuse a number, both indexed" "1 problem(s)"
+
+setup
+touch docs/adr/0001-first.md~ docs/adr/.0001-first.md.swp
+expect pass "editor backups and swap files"
+
+setup
+sed -i '2s/^$/x/' docs/adr/0002-second.md
+expect fail "line 2 not blank" "line 2 must be blank"
+
+setup
+sed -i 's/^Date: .*/Date: 2027-02-29/' docs/adr/0002-second.md
+expect fail "29 February outside a leap year" "a real date"
+
+setup
+sed -i 's/^Date: .*/Date: 2028-02-29/' docs/adr/0002-second.md
+expect pass "29 February in a leap year"
+
+setup
+printf '\n````md\n```\n## Usage\n```\n````\n' >>docs/adr/0002-second.md
+expect pass "a three-backtick line inside a four-backtick fence"
+
+setup
+sed -i 's/$/\r/' docs/adr/0002-second.md
+expect fail "CRLF is reported once" "1 problem(s)"
 
 if ((failures > 0)); then
   echo "$failures case(s) failed" >&2

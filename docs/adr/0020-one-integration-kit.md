@@ -22,8 +22,8 @@ through the outbox and inbox.
 
 ## Consequences
 
-- Integrating an external service is one uniform, first-class thing.
-- Outbox writes commit atomically with business data through the
+- Integrating an external service will be one uniform, first-class thing.
+- Outbox writes will commit atomically with business data through the
   transaction seam.
 - The kit is a large piece of core work that several features wait on.
 

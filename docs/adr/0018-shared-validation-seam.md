@@ -25,7 +25,7 @@ consistently to responses.
 
 - Every layer reports validation failures the same way, and clients see one
   error format.
-- Themis can generate matching client-side validators.
+- Themis will be able to generate matching client-side validators.
 
 ## Alternatives considered
 

@@ -21,7 +21,7 @@ isn't allowed to call the operation at all.
   the handler, producing a typed operating context. Operations declare the
   contexts they accept, so the gate is a cheap comparison.
 - **Decisions are made locally**: an IAM like vantage is the source of truth,
-  and an embedded engine evaluates decisions against a synced copy of its
+  and an embedded engine will evaluate decisions against a synced copy of its
   policies. Galleon will supply **context providers** that assemble the
   request context a decision needs; billing entitlements can be one of them.
 - **Authorization is split in two**: the action check runs before decode, and
