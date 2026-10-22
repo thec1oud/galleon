@@ -1,0 +1,84 @@
+---
+title: "Modules and wiring"
+description: "How an app is assembled from modules: registration, dependency injection, configuration and the lifecycle."
+order: 2
+---
+
+# Modules and wiring
+
+An app is a list of modules. A module is a value with a `Name` and a `Register` method, and everything it contributes goes through the `*galleon.Registry` that `Register` receives. Nothing registers itself globally ([0009](/docs/decisions/0009-explicit-wiring-reflection-at-boot)).
+
+```go file=examples/firstapp/greetings.go#module title="greetings.go"
+// Greetings is a module: it registers everything it contributes in one place.
+type Greetings struct{}
+
+func (Greetings) Name() string { return "greetings" }
+
+func (Greetings) Register(r *galleon.Registry) error {
+	galleon.Config[GreeterConfig](r, "greeter") // typed config, also injectable as *GreeterConfig
+	galleon.Provide[*Greeter](r, NewGreeter)    // built at boot from its parameters
+	return nil
+}
+
+// GreeterConfig is the "greeter" section of the config.
+type GreeterConfig struct {
+	Greeting string `json:"greeting"`
+}
+
+// Default fills in what the config file leaves out.
+func (c *GreeterConfig) Default() { c.Greeting = "Hello" }
+
+// Greeter is a service other modules can depend on.
+type Greeter struct{ greeting string }
+
+func NewGreeter(cfg *GreeterConfig) *Greeter { return &Greeter{greeting: cfg.Greeting} }
+
+func (g *Greeter) Greet(name string) string { return fmt.Sprintf("%s, %s!", g.greeting, name) }
+```
+
+`Register` only records what the module contributes. It does no I/O and starts no goroutines. Most registrations remember their module and source line, so a boot error names the module and usually the exact call.
+
+## Dependency injection
+
+`galleon.Provide[T]` registers a constructor for `T`. Its parameters are other provided types, and it returns `T` or `(T, error)`. `galleon.Supply[T]` registers a value that is already built.
+
+Each provided type is a singleton per process. The kernel builds them at `Start`, in dependency order. It checks the whole graph in `galleon.New`: a missing type, a cycle or two providers of one type fails boot. Reflection is used only at boot. No request path uses it.
+
+A value built by a `Provide` constructor that implements `Start(ctx) error` or `Stop(ctx) error` is started after its dependencies and stopped before them. Supplied values are used as they are.
+
+`galleon.Collect[T]` adds values to a collection that the kernel provides as `[]T`. Any module may add to it; a module that consumes it declares it with an empty `Collect` call. The data plane builds its model registry this way.
+
+## Configuration
+
+`galleon.Config[T](r, "section")` loads one section of the config into a `*T`, and provides `*T` to other constructors. Values come from three places, each overriding the last:
+
+1. the struct's `Default()` method, if it has one;
+2. the JSON config file (`galleon.ConfigFile`) or bytes (`galleon.ConfigJSON`), keyed by section;
+3. environment variables named `<APP>_<SECTION>_<FIELD>`, for top-level scalar fields.
+
+A section whose struct has a `Validate() error` method is checked after loading. A field tagged `secret:"true"` is redacted in `App.ConfigReport()`.
+
+## The lifecycle
+
+`app.Run` starts the app, waits for a signal or a fatal error, and shuts down. In order:
+
+| Phase | What happens |
+|---|---|
+| `galleon.New` | Every module registers. The kernel checks wiring, config, coordination needs and operations, and reports every problem together. A config file it can't read or parse stops boot at once. |
+| Start | Providers start in dependency order. Migrators run. `OnStart` hooks run in registration order. |
+| Ready | `OnReady` hooks run once, the first time every readiness gate passes. Listeners start accepting here. |
+| Drain | Readiness turns off. After the drain grace, `OnDrain` hooks run in reverse order, and listeners stop. |
+| Stop | `OnStop` hooks run in reverse order, then providers stop in reverse dependency order. |
+
+A readiness gate is a check registered with `r.Gate`. `App.HealthHandler` serves `/livez` and `/readyz`, and `/readyz` passes only while the app is started, not draining, and every gate passes.
+
+## Roles and environments
+
+A role is a part of the app a process runs, such as `web` or `rpc`. Every process runs the same modules; a module asks `r.Active(roles...)` whether to start its plane. The default role, `all`, runs everything. `galleon.Roles` sets the roles, and a configured role that no module asks about fails boot as a typo.
+
+An environment profile changes defaults, never behaviour. `Production` is the default; `Development` and `Test` apply migrations at boot instead of only verifying them. For now it is set in code only, with `galleon.Environment`.
+
+## Why it is built this way
+
+- Wiring is explicit, so "go to definition" finds every piece of it ([0009](/docs/decisions/0009-explicit-wiring-reflection-at-boot)).
+- Everything that can be checked before traffic is checked at boot ([0010](/docs/decisions/0010-fail-at-boot)).

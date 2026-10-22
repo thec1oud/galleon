@@ -1,0 +1,22 @@
+---
+title: "Concepts"
+description: "How Galleon's parts work and fit together, and why."
+order: 3
+---
+
+# Concepts
+
+Concepts explain how Galleon works and link the [decisions](/docs/decisions) behind it. They describe what is true now. They don't give step-by-step instructions; the [Guides](/docs/guides) do.
+
+The design discussion that came before the decision records is at [commit 0897d74](https://github.com/thec1oud/galleon/tree/0897d74/docs/design). It is history, not a description of Galleon now.
+
+| Page | Covers |
+|---|---|
+| [Architecture](/docs/concepts/architecture) | The kernel, the planes built on it, and what exists today |
+| [Modules and wiring](/docs/concepts/modules) | Modules, dependency injection, configuration and the lifecycle |
+| [Coordination](/docs/concepts/coordination) | Cluster-wide guarantees, and why the backend is your choice |
+| [Operations](/docs/concepts/operations) | One description per operation, and the pipeline every call runs |
+| [Errors](/docs/concepts/errors) | Kinds, stable codes, and problem+json |
+| [Data](/docs/concepts/data) | Transactions, propagation, replicas and read-your-writes |
+| [Migrations](/docs/concepts/migrations) | One apply across the cluster, with any tool, under a deploy policy |
+| [Seams](/docs/concepts/seams) | Where Galleon meets the tools it doesn't own |

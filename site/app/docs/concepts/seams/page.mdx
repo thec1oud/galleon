@@ -1,0 +1,33 @@
+---
+title: "Seams"
+description: "Where Galleon meets a tool it doesn't own, and what it promises on each side."
+order: 8
+---
+
+# Seams
+
+A seam is the interface between Galleon and a tool it doesn't own. Galleon defines it, owns the behaviour around it, and tests implementations against it. A tool plugs in by implementing it.
+
+## The rules
+
+- **A seam sits where the tool touches the app.** It describes the one exchange that matters, not the tool's whole API ([0004](/docs/decisions/0004-seams-sit-at-the-touchpoint)).
+- **A seam ships complete.** It is meant to arrive with a built-in implementation, a conformance suite and a test double ([0005](/docs/decisions/0005-a-seam-ships-complete)). The table below shows which parts each seam has so far.
+- **A standard is the seam when one exists.** `net/http` handlers, `*http.Client`, OpenTelemetry and `slog` are used as they are ([0006](/docs/decisions/0006-standards-are-the-seams)).
+- **Optional abilities are discovered, not faked.** A seam has a small required core, and optional interfaces a tool implements only if it can.
+
+## The seams today
+
+| Seam | Package | Built-in implementation | Conformance suite |
+|---|---|---|---|
+| Coordination | `coord` | `coord/local` | `testkit/conformance/coordtest` |
+| Data | `data` | `pg` | `testkit/conformance/datatest` |
+| ORM | `data` (`QuerierFrom`, `AfterCommit`, `ModelInfo`) | `ormtest.Reference`, an example | `testkit/conformance/ormtest` |
+| Migrations | `migrate` | `pg/sqlmigrate` | `testkit/conformance/migratetest` |
+| Payload formats | `codec` | JSON | |
+| Time | `clock` | `clock.System`, and `clock.Fake` for tests | |
+
+Validation has one result shape, `*op.ValidationError`, shared by tag validation and hand-written validators. Generated validators, when a generator exists, will return it too ([0018](/docs/decisions/0018-shared-validation-seam)).
+
+## Testing an implementation
+
+Each conformance suite is a function you call from your own test with a constructor for your implementation. A backend, adapter or migrator that passes it keeps the promises Galleon's behaviour depends on. See [Testing](/docs/contributing/testing).

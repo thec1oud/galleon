@@ -17,7 +17,15 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/thec1oud/galleon/clock"
 	"github.com/thec1oud/galleon/coord"
+	"github.com/thec1oud/galleon/migrate"
+	"github.com/thec1oud/galleon/op"
+	"github.com/thec1oud/galleon/process"
 )
 
 // Deployment declares how many instances of the app will run. It lets boot
@@ -54,6 +62,15 @@ type settings struct {
 	stopTimeout     time.Duration
 	drainGrace      time.Duration
 	gateTimeout     time.Duration
+	clock           clock.Clock
+	tracerProvider  trace.TracerProvider
+	meterProvider   metric.MeterProvider
+	ownTracer       bool
+	ownMeter        bool
+	roles           []Role
+	replacements    []replacement
+	env             Env
+	migratePolicy   []func(*migrate.Policy)
 }
 
 // Option configures an App.
@@ -67,7 +84,12 @@ func Coordination(b coord.Backend) Option { return func(s *settings) { s.backend
 
 func Modules(m ...Module) Option { return func(s *settings) { s.modules = append(s.modules, m...) } }
 
+// Logger sets the logger. The kernel wraps its handler with ContextHandler and
+// adds the app name and node to every record.
 func Logger(l *slog.Logger) Option { return func(s *settings) { s.logger = l } }
+
+// Clock sets the clock the app provides to modules. The default is clock.System().
+func Clock(c clock.Clock) Option { return func(s *settings) { s.clock = c } }
 
 func Deploy(d Deployment) Option { return func(s *settings) { s.deployment = d } }
 
@@ -121,6 +143,8 @@ const (
 type App struct {
 	name     string
 	log      *slog.Logger
+	level    *slog.LevelVar
+	node     Node
 	backend  coord.Backend
 	settings settings
 
@@ -128,16 +152,32 @@ type App struct {
 	providerOrder []*provider
 	buildOrder    []*provider
 
+	collections     map[reflectType]*collection
+	collectionOrder []*collection
+	collected       bool // the collections are provided; Collect is closed
+
 	configRaw    map[string]json.RawMessage
 	configOwners map[string]string
 	configReport []ConfigValue
 
+	knownRoles map[Role]bool
 	needs      []need
 	requires   []require
 	gates      []gate
 	startHooks []hook
+	readyHooks []hook
 	stopHooks  []hook
 	drainHooks []hook
+
+	ops          []registeredOp
+	interceptors []op.Placed
+	stageImpls   map[op.Stage]stageImpl
+	operations   *Operations
+	middleware   *HTTPMiddleware
+
+	migratorRegs     []*migratorReg
+	migrations       *migrations // nil without migrators
+	migrationsHandle *Migrations
 
 	bootErrs []error
 
@@ -145,6 +185,11 @@ type App struct {
 	state        state
 	started      []*provider // providers whose Start succeeded, in order
 	fullyStarted bool        // every provider and start hook succeeded
+	sealed       bool        // New has returned; registrations are closed
+	readyCancel  context.CancelFunc
+	readyDone    chan struct{}
+	fatal        chan struct{} // closed by die
+	fatalErr     error
 }
 
 // New configures, registers and validates the whole app. Every wiring, config
@@ -162,25 +207,60 @@ func New(opts ...Option) (*App, error) {
 	if s.name == "" {
 		s.name = "app"
 	}
-	if s.logger == nil {
-		s.logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if len(s.roles) == 0 {
+		s.roles = []Role{RoleAll}
 	}
+	if s.clock == nil {
+		s.clock = clock.System()
+	}
+	if s.tracerProvider == nil {
+		s.tracerProvider = otel.GetTracerProvider()
+	}
+	if s.meterProvider == nil {
+		s.meterProvider = otel.GetMeterProvider()
+	}
+	var level *slog.LevelVar
+	if s.logger == nil {
+		level = new(slog.LevelVar)
+		s.logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	}
+	node, nodeErr := currentNode()
 	a := &App{
 		name:         s.name,
-		log:          s.logger.With("app", s.name),
+		log:          slog.New(ContextHandler(s.logger.Handler())).With("app", s.name, "node", node.String()),
+		level:        level,
+		node:         node,
 		backend:      s.backend,
 		settings:     s,
 		providers:    map[reflectType]*provider{},
+		collections:  map[reflectType]*collection{},
 		configRaw:    map[string]json.RawMessage{},
 		configOwners: map[string]string{},
+		knownRoles:   map[Role]bool{},
+		stageImpls:   map[op.Stage]stageImpl{},
+		operations:   &Operations{byID: map[string]*Operation{}},
+		middleware:   &HTTPMiddleware{},
+		fatal:        make(chan struct{}),
+
+		migrationsHandle: &Migrations{},
 	}
 
+	if nodeErr != nil {
+		a.bootErrs = append(a.bootErrs, nodeErr)
+	}
 	if err := a.loadConfig(); err != nil {
-		return nil, err
+		return nil, a.failBoot(&BootError{Errs: append(a.bootErrs, err)})
 	}
 
-	kernel := &Registry{app: a, module: "galleon"}
+	kernel := &Registry{app: a, module: kernelModule}
 	Supply[*slog.Logger](kernel, a.log)
+	Supply[clock.Clock](kernel, s.clock)
+	Supply[Node](kernel, node)
+	Supply[trace.TracerProvider](kernel, s.tracerProvider)
+	Supply[metric.MeterProvider](kernel, s.meterProvider)
+	Supply[*Operations](kernel, a.operations)
+	Supply[*HTTPMiddleware](kernel, a.middleware)
+	Supply[*Migrations](kernel, a.migrationsHandle)
 	if a.backend != nil {
 		Supply[coord.Backend](kernel, a.backend)
 	}
@@ -203,23 +283,42 @@ func New(opts ...Option) (*App, error) {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q requires module %q, which is not installed (%s)", rq.module, rq.needs, rq.site))
 		}
 	}
+	a.provideCollections()
+	a.configureMigrations()
 	for section := range a.configRaw {
 		if _, ok := a.configOwners[section]; !ok {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("config section %q is not used by any module (typo?)", section))
 		}
 	}
+	a.applyReplacements()
 	a.checkCoordination()
+	a.checkRoles()
+	a.compileOperations()
 
+	a.checkMigratorDeps()
 	if order, err := a.resolveGraph(); err != nil {
 		a.bootErrs = append(a.bootErrs, err)
 	} else {
 		a.buildOrder = order
 	}
 	if len(a.bootErrs) > 0 {
-		return nil, &BootError{Errs: a.bootErrs}
+		return nil, a.failBoot(&BootError{Errs: a.bootErrs})
 	}
+	a.sealed = true
 	return a, nil
 }
+
+// failBoot releases the telemetry providers the app was handed, since no App
+// is returned to shut them down later.
+func (a *App) failBoot(err error) error {
+	if terr := shutdownTelemetry(context.Background(), &a.settings); terr != nil {
+		return errors.Join(err, terr)
+	}
+	return err
+}
+
+// kernelModule is the module name the kernel's own values are registered under.
+const kernelModule = "galleon"
 
 // BootError collects every problem found while building the app.
 type BootError struct{ Errs []error }
@@ -272,10 +371,16 @@ func (a *App) checkCoordination() {
 	if caps.Scope == coord.ScopeCluster || len(a.needs) == 0 {
 		return
 	}
-	switch a.settings.deployment {
+	deployment := a.settings.deployment
+	if process.Supervised() {
+		// Workers of one supervisor are separate processes: a process-scoped
+		// backend gives each its own locks and leaders.
+		deployment = MultiNode
+	}
+	switch deployment {
 	case MultiNode:
 		if !a.settings.allowPerProcess {
-			a.bootErrs = append(a.bootErrs, fmt.Errorf("deployment is multi-node but coordination backend %q only guarantees within one process; "+
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("the app runs as several processes (multi-node, or under a supervisor) but coordination backend %q only guarantees within one process; "+
 				"use a cluster backend, or set galleon.AllowPerProcessGuarantees() to accept per-process guarantees", caps.Name))
 			return
 		}
@@ -292,7 +397,11 @@ func (a *App) checkCoordination() {
 func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	if a.state != stateBuilt {
+		st := a.state
 		a.mu.Unlock()
+		if st == stateStopped {
+			return errors.New("galleon: Start called after Shutdown; an app runs once")
+		}
 		return errors.New("galleon: Start called twice")
 	}
 	a.state = stateStarting
@@ -303,6 +412,9 @@ func (a *App) Start(ctx context.Context) error {
 		defer cancel()
 		if serr := a.stopAll(stopCtx); serr != nil {
 			err = errors.Join(err, serr)
+		}
+		if terr := shutdownTelemetry(stopCtx, &a.settings); terr != nil {
+			err = errors.Join(err, terr)
 		}
 		a.mu.Lock()
 		a.state = stateStopped
@@ -324,6 +436,9 @@ func (a *App) Start(ctx context.Context) error {
 		}
 		a.started = append(a.started, p)
 	}
+	if err := a.startMigrations(ctx); err != nil {
+		return fail(err)
+	}
 	for _, h := range a.startHooks {
 		hctx, cancel := context.WithTimeout(ctx, a.settings.startTimeout)
 		err := h.fn(hctx)
@@ -336,8 +451,13 @@ func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	a.state = stateStarted
 	a.fullyStarted = true
+	// Set up under the same lock as stateStarted, so a concurrent Shutdown
+	// always finds the watcher to cancel.
+	readyCtx, readyCancel := context.WithCancel(context.Background())
+	a.readyCancel, a.readyDone = readyCancel, make(chan struct{})
 	a.mu.Unlock()
-	a.log.Info("started", "providers", len(a.started), "deployment", a.settings.deployment.String(), "coordination", a.backend.Capabilities().Name)
+	a.watchReadiness(readyCtx)
+	a.log.Info("started", "roles", a.settings.roles, "providers", len(a.started), "deployment", a.settings.deployment.String(), "coordination", a.backend.Capabilities().Name)
 	return nil
 }
 
@@ -349,6 +469,12 @@ func (a *App) Ready(ctx context.Context) error {
 	a.mu.Unlock()
 	switch st {
 	case stateStarted:
+		a.mu.Lock()
+		fatal := a.fatalErr
+		a.mu.Unlock()
+		if fatal != nil {
+			return fatal
+		}
 	case stateDraining:
 		return errors.New("draining")
 	default:
@@ -370,12 +496,24 @@ func (a *App) Ready(ctx context.Context) error {
 // stop hooks, then providers in reverse dependency order.
 func (a *App) Shutdown(ctx context.Context) error {
 	a.mu.Lock()
-	if a.state != stateStarted {
+	switch a.state {
+	case stateStarted:
+	case stateBuilt:
+		// Never started: nothing to drain or stop, but the telemetry
+		// providers the app was handed still need flushing. Shutdown is
+		// final, so the app can't be started afterwards.
+		a.state = stateStopped
+		a.mu.Unlock()
+		return shutdownTelemetry(ctx, &a.settings)
+	default:
 		a.mu.Unlock()
 		return nil
 	}
 	a.state = stateDraining
 	a.mu.Unlock()
+	if err := a.stopWatchingReadiness(ctx); err != nil {
+		a.log.Warn("ready hook still running at shutdown; draining anyway", "error", err)
+	}
 	a.log.Info("draining", "grace", a.settings.drainGrace)
 
 	if a.settings.drainGrace > 0 {
@@ -399,6 +537,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.state = stateStopped
 	a.mu.Unlock()
 	a.log.Info("stopped")
+	if err := shutdownTelemetry(ctx, &a.settings); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
@@ -439,21 +580,33 @@ func (a *App) runHook(ctx context.Context, h hook, kind string) error {
 	return nil
 }
 
-// Run starts the app, waits for ctx to end or for SIGINT/SIGTERM, then shuts down.
+// Run starts the app, waits for ctx to end, for SIGINT/SIGTERM, or for a fatal
+// error such as a failed OnReady hook, then shuts down. It returns the fatal
+// error, if any, so the process can exit non-zero.
 func (a *App) Run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := a.Start(ctx); err != nil {
 		return err
 	}
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-a.fatal:
+	}
 	sctx, cancel := context.WithTimeout(context.Background(), a.settings.drainGrace+a.settings.stopTimeout)
 	defer cancel()
-	return a.Shutdown(sctx)
+	err := a.Shutdown(sctx)
+	a.mu.Lock()
+	fatal := a.fatalErr
+	a.mu.Unlock()
+	return errors.Join(fatal, err)
 }
 
 // Name returns the app's name.
 func (a *App) Name() string { return a.name }
+
+// Node returns this process's identity.
+func (a *App) Node() Node { return a.node }
 
 // Coordination returns the configured backend.
 func (a *App) Coordination() coord.Backend { return a.backend }

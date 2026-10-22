@@ -1,0 +1,268 @@
+---
+title: "1. Your first service"
+description: "Build a bookmarks service with two operations over HTTP, and test it."
+order: 1
+---
+
+# Your first service
+
+In this chapter you build a small bookmarks service. It saves a bookmark and returns it by ID, over HTTP. By the end you can run it, call it with `curl`, and test it.
+
+You need Go 1.26 or later. The rest of Learn builds on this service, one chapter at a time.
+
+## Create the project
+
+Galleon isn't published as a release yet, so you build against a clone of it, in a [Go workspace](https://go.dev/ref/mod#workspaces). Clone it next to a new module for the service, and join them in a workspace:
+
+```sh
+git clone https://github.com/thec1oud/galleon
+mkdir bookmarks
+(cd bookmarks && go mod init example.com/bookmarks)
+go work init ./bookmarks ./galleon ./galleon/testkit
+cd bookmarks
+```
+
+Run every command from here on in the `bookmarks` folder. The workspace supplies Galleon and its test kit, so don't run `go mod tidy`, which would try to download them.
+
+<Callout type="warn">
+Galleon's APIs will change before its first release.
+</Callout>
+
+Start each Go file with `package main`. The samples on these pages leave that line out, and the `import` blocks too. Your editor adds the imports if it runs `goimports`, as the Go extensions for most editors do.
+
+## Describe the data
+
+A bookmark has an ID, a URL and a title. Each operation takes an input struct and returns an output struct. Struct tags say where each field comes from and what it must hold.
+
+```go file=examples/learn/service/bookmarks.go#types title="bookmarks.go"
+// Bookmark is what the service stores and returns.
+type Bookmark struct {
+	ID    string `json:"id"`
+	URL   string `json:"url"`
+	Title string `json:"title"`
+}
+
+// CreateIn is the body of a request to save a bookmark.
+type CreateIn struct {
+	URL   string `json:"url" validate:"required,url"`
+	Title string `json:"title" validate:"required,max=200"`
+}
+
+// GetIn names the bookmark to return, from the request's path.
+type GetIn struct {
+	ID string `path:"id" json:"-"`
+}
+```
+
+`validate:"required,url"` makes Galleon refuse a request without a valid URL before your code runs. `path:"id"` fills `ID` from the request's path.
+
+## Declare the operations
+
+An operation is declared once, as a value. It has an ID, an HTTP route, and a security choice. `Public()` lets anyone call it; every operation must say who may call it.
+
+```go file=examples/learn/service/bookmarks.go#operations title="bookmarks.go"
+// CodeNotFound is the error code of a bookmark that doesn't exist.
+const CodeNotFound = "bookmarks.not_found"
+
+var (
+	Create = op.Unary[CreateIn, Bookmark]("bookmarks.create").
+		HTTP("POST", "/bookmarks").
+		Public()
+
+	Get = op.Unary[GetIn, Bookmark]("bookmarks.get").
+		HTTP("GET", "/bookmarks/{id}").
+		Public().
+		Errors(CodeNotFound)
+)
+```
+
+`Errors(CodeNotFound)` lists the error codes an operation can return, so clients can rely on them.
+
+## Write the handlers
+
+A handler is a plain function from an input to an output. It never sees the HTTP request. For now, the bookmarks live in a map:
+
+```go file=examples/learn/service/bookmarks.go#store title="bookmarks.go"
+// store keeps bookmarks in memory, so they last until the process exits.
+type store struct {
+	mu   sync.Mutex
+	last int
+	byID map[string]Bookmark
+}
+
+func (s *store) create(ctx context.Context, in *CreateIn) (*Bookmark, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.last++
+	b := Bookmark{ID: fmt.Sprint(s.last), URL: in.URL, Title: in.Title}
+	s.byID[b.ID] = b
+	return &b, nil
+}
+
+func (s *store) get(ctx context.Context, in *GetIn) (*Bookmark, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.byID[in.ID]
+	if !ok {
+		return nil, errs.New(errs.NotFound, CodeNotFound, "no such bookmark")
+	}
+	return &b, nil
+}
+```
+
+A missing bookmark is an error with a kind and a code. The kind, `NotFound`, becomes the HTTP status 404. The code, `bookmarks.not_found`, is what clients switch on.
+
+## Register them in a module
+
+A module is where a part of the app registers what it contributes. This one registers the two operations with their handlers:
+
+```go file=examples/learn/service/bookmarks.go#module title="bookmarks.go"
+// Bookmarks is the module that serves bookmarks.
+type Bookmarks struct{}
+
+func (Bookmarks) Name() string { return "bookmarks" }
+
+func (Bookmarks) Register(r *galleon.Registry) error {
+	s := &store{byID: map[string]Bookmark{}}
+	r.Operation(Create, s.create)
+	r.Operation(Get, s.get)
+	return nil
+}
+```
+
+## Write main
+
+The app is a list of modules plus the choices Galleon won't make for you. `server.Module()` serves the operations over HTTP. The in-process coordination backend, `local`, runs a single node.
+
+```go file=examples/learn/service/main.go#main title="main.go"
+func options() []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("bookmarks"),
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode),
+		galleon.Modules(server.Module(), Bookmarks{}),
+	}
+}
+
+func main() {
+	app, err := galleon.New(options()...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := app.Run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`galleon.New` checks everything at boot: every module, operation and handler. If anything is wrong, it lists every problem at once, before the app takes traffic.
+
+## Run it
+
+```sh
+go run .
+```
+
+The server listens on port 8080. In another terminal, save a bookmark:
+
+```sh
+curl -X POST localhost:8080/bookmarks \
+  -H 'Content-Type: application/json' \
+  -d '{"url": "https://go.dev", "title": "The Go language"}'
+```
+
+```json
+{"id":"1","url":"https://go.dev","title":"The Go language"}
+```
+
+Read it back, then ask for one that doesn't exist:
+
+```sh
+curl localhost:8080/bookmarks/1
+curl localhost:8080/bookmarks/2
+```
+
+```json
+{"id":"1","url":"https://go.dev","title":"The Go language"}
+{"type":"urn:galleon:problem:not_found","title":"no such bookmark","status":404,"code":"bookmarks.not_found"}
+```
+
+Errors are [problem details](https://www.rfc-editor.org/rfc/rfc9457) JSON, with the code you chose. Press Ctrl+C to stop the server; it finishes the requests in flight first.
+
+## Test it
+
+`testkit.New` boots the real app inside a test. Here the environment moves the server to a free port, and the test calls its handler directly:
+
+```go file=examples/learn/service/bookmarks_test.go title="bookmarks_test.go"
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/thec1oud/galleon/server"
+	"github.com/thec1oud/galleon/testkit"
+)
+
+// api boots the app and returns its HTTP handler.
+func api(t *testing.T) http.Handler {
+	t.Setenv("BOOKMARKS_HTTP_ADDR", "127.0.0.1:0") // a free port, not :8080
+	h := testkit.New(t, options()...)
+	return testkit.Get[*server.Server](h).Handler()
+}
+
+func TestABookmarkCanBeSavedAndRead(t *testing.T) {
+	api := api(t)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/bookmarks", strings.NewReader(`{"url": "https://go.dev", "title": "Go"}`))
+	req.Header.Set("Content-Type", "application/json")
+	api.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	var saved Bookmark
+	if err := json.Unmarshal(w.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+
+	w = httptest.NewRecorder()
+	api.ServeHTTP(w, httptest.NewRequest("GET", "/bookmarks/"+saved.ID, nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"title":"Go"`) {
+		t.Fatalf("get: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestAMissingBookmarkIsNotFound(t *testing.T) {
+	w := httptest.NewRecorder()
+	api(t).ServeHTTP(w, httptest.NewRequest("GET", "/bookmarks/9", nil))
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), `"code":"bookmarks.not_found"`) {
+		t.Fatalf("get: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestAnInvalidBookmarkIsRefused(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/bookmarks", strings.NewReader(`{"url": "not a url", "title": ""}`))
+	req.Header.Set("Content-Type", "application/json")
+	api(t).ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"code":"galleon.invalid_input"`) {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+}
+```
+
+The last two tests check a missing bookmark and invalid input. Run them all:
+
+```sh
+go test ./...
+```
+
+## Checkpoint
+
+You have a service with two operations, validated input, and errors clients can rely on. Its bookmarks are lost when it stops.
+
+Next, in [Configuration and modules](/docs/learn/configuration), you give the service a setting and let Galleon build the store for you. For how operations work underneath, see [Operations](/docs/concepts/operations).

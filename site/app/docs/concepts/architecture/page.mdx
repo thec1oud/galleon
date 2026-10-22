@@ -1,0 +1,49 @@
+---
+title: "Architecture"
+description: "The kernel, the planes built on it, and the seams between Galleon and the tools it works with."
+order: 1
+---
+
+# Architecture
+
+Galleon is a kernel with planes built on top of it. The kernel runs modules. It doesn't serve HTTP, open databases or know about identity. Each plane, such as the operation plane or the data plane, is a set of modules that use the kernel's public API.
+
+## The kernel
+
+Package [`galleon`](https://pkg.go.dev/github.com/thec1oud/galleon) is the kernel. It does six things:
+
+- runs the modules an app is built from, and nothing else ([Modules and wiring](/docs/concepts/modules));
+- wires their dependencies, by constructor parameters;
+- loads typed configuration;
+- owns the lifecycle: start, readiness, drain and stop;
+- checks what each module needs from coordination against the backend the app chose ([Coordination](/docs/concepts/coordination));
+- compiles every operation's pipeline at boot ([Operations](/docs/concepts/operations)).
+
+Everything it can check, it checks in `galleon.New`, before the app takes traffic. A wiring mistake, a bad config value or a missing capability fails boot, naming the module that caused it.
+
+## The planes
+
+These planes exist today:
+
+| Plane | Packages | What it does |
+|---|---|---|
+| Operations | `op`, `bind`, `validate`, `codec` | Describes every API operation once, and runs each call through one fixed pipeline |
+| Transport | `server`, `client` | Serves operations over HTTP and RPC on one `net/http` server, and makes outbound HTTP calls |
+| Errors | `errs` | One error type with a kind and a stable code, rendered as problem+json or a gRPC status |
+| Data | `data`, `pg` | Transactions on PostgreSQL through pgx, with replica routing and read-your-writes |
+| Migrations | `migrate`, `pg/sqlmigrate` | Applies schema changes once across the cluster, under a deploy policy |
+| Coordination | `coord`, `coord/local` | Locks, leader election, pub/sub, KV, counters and membership |
+| Processes | `process` | Runs several copies of the app on one host, sharing ports |
+
+The security, async, realtime and web planes are designed but not built. Their decisions are recorded, for example [0021](/docs/decisions/0021-generic-authorization-seams) for authorization.
+
+## Seams
+
+Where Galleon touches a tool it doesn't own, such as an ORM, it defines a seam. A seam is a small Go interface that any tool can implement. Galleon owns the behaviour around the seam, and the tool plugs in. See [Seams](/docs/concepts/seams).
+
+## Why it is built this way
+
+- Correctness comes before ergonomics, efficiency and completeness, in that order ([0002](/docs/decisions/0002-rank-correct-ergonomic-efficient-complete)).
+- It builds on `net/http`, so any standard handler or middleware works ([0003](/docs/decisions/0003-build-on-net-http)).
+- Galleon owns what must never fork between apps, and leaves the rest to tools ([0007](/docs/decisions/0007-galleon-owns-what-must-never-fork)).
+- Dependencies point one way: the core never imports a battery or an adapter ([0008](/docs/decisions/0008-dependency-direction)).

@@ -1,0 +1,81 @@
+---
+title: "Introduction"
+description: "Galleon is a complete, efficient web framework for Go, for internal services and large full-stack applications."
+order: 0
+---
+
+# Galleon
+
+Galleon is a web framework for Go that covers the whole application. It gives you modules, dependency injection and configuration, typed operations over HTTP and RPC, and a PostgreSQL data plane with replicas, read-your-writes and migrations.
+
+<Callout type="warn">
+Galleon is early, and its APIs will change. The kernel is still in progress. The operation model, the PostgreSQL data plane and the migration seam work, with gaps the [Concepts](/docs/concepts) pages name. Coordination has only the in-process `local` backend, for a single node.
+</Callout>
+
+## A first app
+
+An app is a set of modules plus the choices Galleon refuses to make for you, such as which coordination backend to use:
+
+```go file=examples/firstapp/main.go#app title="main.go"
+func options() []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("hello"),
+		galleon.Coordination(local.New()), // required: there is no default backend
+		galleon.Deploy(galleon.SingleNode),
+		galleon.Modules(Greetings{}),
+	}
+}
+
+func main() {
+	app, err := galleon.New(options()...)
+	if err != nil {
+		log.Fatal(err) // every wiring, config and coordination problem, listed together
+	}
+	if err := app.Run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+A module registers everything it contributes in one place, and Galleon checks all of it at boot, before the app takes traffic:
+
+```go file=examples/firstapp/greetings.go#module title="greetings.go"
+// Greetings is a module: it registers everything it contributes in one place.
+type Greetings struct{}
+
+func (Greetings) Name() string { return "greetings" }
+
+func (Greetings) Register(r *galleon.Registry) error {
+	galleon.Config[GreeterConfig](r, "greeter") // typed config, also injectable as *GreeterConfig
+	galleon.Provide[*Greeter](r, NewGreeter)    // built at boot from its parameters
+	return nil
+}
+
+// GreeterConfig is the "greeter" section of the config.
+type GreeterConfig struct {
+	Greeting string `json:"greeting"`
+}
+
+// Default fills in what the config file leaves out.
+func (c *GreeterConfig) Default() { c.Greeting = "Hello" }
+
+// Greeter is a service other modules can depend on.
+type Greeter struct{ greeting string }
+
+func NewGreeter(cfg *GreeterConfig) *Greeter { return &Greeter{greeting: cfg.Greeting} }
+
+func (g *Greeter) Greet(name string) string { return fmt.Sprintf("%s, %s!", g.greeting, name) }
+```
+
+Every Go sample in these docs is copied from code that CI compiles and tests.
+
+## Where to go next
+
+| If you want to… | Read |
+|---|---|
+| Learn Galleon from zero, by building a service | [Learn](/docs/learn) |
+| Get a specific job done | [Guides](/docs/guides) |
+| Understand how a part works, and why | [Concepts](/docs/concepts) |
+| Look up an exact option, error or API | [Reference](/docs/reference) |
+| Know why Galleon is built the way it is | [Decisions](/docs/decisions) |
+| Change Galleon itself | [Contributing](/docs/contributing) |

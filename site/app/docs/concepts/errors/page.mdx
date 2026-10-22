@@ -1,0 +1,58 @@
+---
+title: "Errors"
+description: "One error type with a kind and a stable code, rendered the same way on every transport."
+order: 5
+---
+
+# Errors
+
+Every error that reaches a transport edge becomes an [`*errs.Error`](https://pkg.go.dev/github.com/thec1oud/galleon/errs#Error). It has:
+
+- a **kind**, which fixes its HTTP status and gRPC code;
+- a stable **code**, `<module>.<name>`, that clients can switch on, such as `data.unique_violation`;
+- a **message** that is safe to show clients;
+- optional structured **details**, such as field violations;
+- a **cause**, kept for logs and never sent.
+
+```go file=examples/concepts/orders.go#error
+return errs.New(errs.NotFound, "orders.not_found", "no such order")
+```
+
+`errs.Wrap` keeps an underlying error as the cause. An error that isn't an `*errs.Error` becomes `Internal`, and a context error becomes `Canceled` or `DeadlineExceeded`.
+
+## Kinds
+
+| Kind | HTTP | gRPC code |
+|---|---|---|
+| `Internal` | 500 | 13 |
+| `InvalidArgument` | 400 | 3 |
+| `Unauthenticated` | 401 | 16 |
+| `PermissionDenied` | 403 | 7 |
+| `NotFound` | 404 | 5 |
+| `Conflict` | 409 | 6 |
+| `FailedPrecondition` | 422 | 9 |
+| `TooManyRequests` | 429 | 8 |
+| `Canceled` | 499 | 1 |
+| `DeadlineExceeded` | 504 | 4 |
+| `Unavailable` | 503 | 14 |
+| `Unimplemented` | 501 | 12 |
+
+The zero kind is `Internal`, so an error nobody classified never looks like a success or a client mistake.
+
+## On the wire
+
+Over HTTP, an error is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json` body:
+
+```json
+{
+  "type": "urn:galleon:problem:not_found",
+  "title": "no such order",
+  "status": 404,
+  "instance": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "code": "orders.not_found"
+}
+```
+
+`instance` is usually the trace ID. An `Internal` error always shows the title `internal error` and the code `galleon.internal`, never its message or cause. Over RPC, the error carries the gRPC code of its kind.
+
+An operation lists the codes it can return with `Errors(...)` in its declaration. The [error reference](/docs/reference/errors) lists every kind, and every code Galleon's core module returns.

@@ -5,6 +5,8 @@ package local
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -14,14 +16,18 @@ import (
 	"github.com/thec1oud/galleon/coord"
 )
 
-// Backend implements coord.Backend in memory.
+// Backend implements coord.Backend in memory. Its fencing tokens start
+// again at 1 in every Backend, so each has an epoch of its own, random, that
+// its leases report: a resource that recorded a token from an earlier
+// process tells the two counters apart.
 type Backend struct {
-	node coord.NodeID
+	node  coord.NodeID
+	epoch string
 
 	mu      sync.Mutex
 	locks   map[string]*lease
 	tokens  map[string]uint64
-	changed chan struct{} // closed and replaced whenever a lock is freed
+	changed chan struct{} // closed and replaced whenever a lock is taken or freed
 
 	subs map[string]map[*subscription]struct{}
 
@@ -41,8 +47,11 @@ func WithNodeID(id coord.NodeID) Option { return func(b *Backend) { b.node = id 
 // New returns an empty in-process backend.
 func New(opts ...Option) *Backend {
 	host, _ := os.Hostname()
+	var e [8]byte
+	_, _ = rand.Read(e[:])
 	b := &Backend{
 		node:     coord.NodeID(fmt.Sprintf("%s-%d", host, os.Getpid())),
+		epoch:    "local-" + hex.EncodeToString(e[:]),
 		locks:    map[string]*lease{},
 		tokens:   map[string]uint64{},
 		changed:  make(chan struct{}),
@@ -103,6 +112,7 @@ type lease struct {
 
 func (l *lease) Key() string           { return l.key }
 func (l *lease) Token() uint64         { return l.token }
+func (l *lease) Epoch() string         { return l.b.epoch }
 func (l *lease) Lost() <-chan struct{} { return l.lost }
 
 func (l *lease) Renew(context.Context) error {
@@ -148,6 +158,10 @@ func (b *Backend) endLocked(l *lease) {
 	if b.locks[l.key] == l {
 		delete(b.locks, l.key)
 	}
+	b.locksChangedLocked()
+}
+
+func (b *Backend) locksChangedLocked() {
 	close(b.changed)
 	b.changed = make(chan struct{})
 }
@@ -160,6 +174,7 @@ func (b *Backend) tryAcquireLocked(key string, ttl time.Duration) (*lease, chan 
 	l := &lease{b: b, key: key, token: b.tokens[key], ttl: ttl, expires: time.Now().Add(ttl), lost: make(chan struct{})}
 	l.timer = time.AfterFunc(ttl, l.expire)
 	b.locks[key] = l
+	b.locksChangedLocked()
 	return l, nil
 }
 
@@ -237,10 +252,45 @@ func (e election) Campaign(ctx context.Context) (coord.Lease, error) {
 func (e election) Leader(context.Context) (coord.NodeID, bool, error) {
 	e.b.mu.Lock()
 	defer e.b.mu.Unlock()
+	id, ok := e.leaderLocked()
+	return id, ok, nil
+}
+
+func (e election) leaderLocked() (coord.NodeID, bool) {
 	if l := e.b.locks[e.key()]; l != nil && !l.ended {
-		return e.b.node, true, nil
+		return e.b.node, true
 	}
-	return "", false, nil
+	return "", false
+}
+
+func (e election) Observe(ctx context.Context) <-chan coord.NodeID {
+	out := make(chan coord.NodeID)
+	go func() {
+		defer close(out)
+		first := true
+		var last coord.NodeID
+		for {
+			e.b.mu.Lock()
+			id, _ := e.leaderLocked()
+			wait := e.b.changed
+			e.b.mu.Unlock()
+			if first || id != last {
+				select {
+				case out <- id:
+				case <-ctx.Done():
+					return
+				}
+				first, last = false, id
+				continue // re-read: the leader may have changed while we were sending
+			}
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
 }
 
 // ---- pub/sub ----

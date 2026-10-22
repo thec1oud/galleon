@@ -1,0 +1,9 @@
+node_modules/
+/firstapp
+.next/
+next-env.d.ts
+*.tsbuildinfo
+# Generated from docs/adr by scripts/sync-adrs.ts.
+app/docs/decisions/
+# Written by withDocs at build time.
+.docs/

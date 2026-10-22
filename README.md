@@ -2,62 +2,81 @@
 
 A complete, efficient web framework for Go, for internal services and large full-stack applications.
 
-> Status: early. Phase 1 (the kernel) is in progress. APIs will change.
+Galleon gives you modules, dependency injection and configuration, typed operations over HTTP and RPC, and a PostgreSQL data plane with replicas, read-your-writes and migrations. Every app's wiring, config and coordination are checked at boot, before it takes traffic.
 
-## Repository layout
-
-This repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each module has its own `go.mod`, and `go.work` at the root lists them all.
-
-| Module | Path | Contents |
-|---|---|---|
-| `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness), the error model, coordination interfaces and the in-process `local` backend |
-
-Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `testkit`, `pg`, `coord-pg`, `jobs`, `web`, `realtime`, `http3`, `adapters/*`, `cmd/galleon`.
-
-Dependency rules: the core imports no battery and no adapter; a battery imports only the core's public API; an adapter imports the core plus its one tool.
+> **Status: early.** APIs will change and there is no release yet. Coordination has only the in-process backend, for a single node. The [Concepts](site/app/docs/concepts/page.mdx) pages say what isn't built yet.
 
 ## A first app
 
-```go
-app, err := galleon.New(
-    galleon.Name("orders"),
-    galleon.Coordination(local.New()), // required: there is no default backend
-    galleon.Deploy(galleon.SingleNode),
-    galleon.ConfigFile("config.json"),
-    galleon.Modules(orders.Module()),
-)
-if err != nil {
-    log.Fatal(err) // every wiring, config and coordination problem, listed together
+```go file=examples/firstapp/main.go#app
+func options() []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("hello"),
+		galleon.Coordination(local.New()), // required: there is no default backend
+		galleon.Deploy(galleon.SingleNode),
+		galleon.Modules(Greetings{}),
+	}
 }
-log.Fatal(app.Run(context.Background()))
+
+func main() {
+	app, err := galleon.New(options()...)
+	if err != nil {
+		log.Fatal(err) // every wiring, config and coordination problem, listed together
+	}
+	if err := app.Run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
 ```
 
 A module registers everything it contributes in one place:
 
-```go
-func (Module) Register(r *galleon.Registry) error {
-    galleon.Config[DBConfig](r, "db")                 // typed config, also injectable as *DBConfig
-    galleon.Provide[*Repo](r, NewRepo)                // func(*DBConfig) (*Repo, error)
-    galleon.Provide[*Service](r, NewService)          // func(*Repo, *slog.Logger) *Service
-    r.Needs(coord.LeaderElection)                     // checked against the backend at boot
-    r.Gate("schema", checkSchema)                     // readiness gate
-    return nil
+```go file=examples/firstapp/greetings.go#module
+// Greetings is a module: it registers everything it contributes in one place.
+type Greetings struct{}
+
+func (Greetings) Name() string { return "greetings" }
+
+func (Greetings) Register(r *galleon.Registry) error {
+	galleon.Config[GreeterConfig](r, "greeter") // typed config, also injectable as *GreeterConfig
+	galleon.Provide[*Greeter](r, NewGreeter)    // built at boot from its parameters
+	return nil
 }
+
+// GreeterConfig is the "greeter" section of the config.
+type GreeterConfig struct {
+	Greeting string `json:"greeting"`
+}
+
+// Default fills in what the config file leaves out.
+func (c *GreeterConfig) Default() { c.Greeting = "Hello" }
+
+// Greeter is a service other modules can depend on.
+type Greeter struct{ greeting string }
+
+func NewGreeter(cfg *GreeterConfig) *Greeter { return &Greeter{greeting: cfg.Greeting} }
+
+func (g *Greeter) Greet(name string) string { return fmt.Sprintf("%s, %s!", g.greeting, name) }
 ```
 
-## Design documents
+## Documentation
 
-The design was worked out in [docs/design](docs/design):
+The docs are in [`site`](site), and every Go sample in them is tested in CI.
 
-1. [Crash course](docs/design/01-crash-course.md)
-2. [Strengths and shortcomings](docs/design/02-strengths-and-shortcomings.md)
-3. [Complete component list](docs/design/03-complete-component-list.md)
-4. [Desires and decisions](docs/design/04-desires-debate.md)
-5. [Architecture](docs/design/05-architecture.md)
-6. [Seam specifications](docs/design/06-seam-specifications.md)
+- [Learn](site/app/docs/learn/page.mdx): build a service from zero, one chapter at a time.
+- [Guides](site/app/docs/guides/page.mdx): get a specific job done.
+- [Concepts](site/app/docs/concepts/page.mdx): how each part works, and why.
+- [Reference](site/app/docs/reference/page.mdx): every config key and error code, generated from the source.
+- [Decisions](docs/adr/README.md): the architecture decision records, append-only.
 
-## Development
+To read them locally, with [Bun](https://bun.sh/) installed: `cd site && bun install && bun run dev`, then open http://localhost:3000/docs.
+
+## Contributing
+
+The repository is a Go workspace of several modules. Run every module's checks with:
 
 ```sh
-for dir in $(go list -m -f '{{.Dir}}'); do (cd "$dir" && go vet ./... && go test -race ./...); done
+bash -ec 'for dir in $(go list -m -f "{{.Dir}}"); do (cd "$dir" && go vet ./... && go test -race ./...); done'
 ```
+
+Tests that need PostgreSQL, or a streaming replica, skip unless `GALLEON_TEST_POSTGRES` and `GALLEON_TEST_POSTGRES_REPLICA` are set; [.github/scripts/postgres-replica.sh](.github/scripts/postgres-replica.sh) starts both in Docker. [Contributing](site/app/docs/contributing/page.mdx) covers the repository layout, testing and writing the docs.

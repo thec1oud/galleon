@@ -236,3 +236,12 @@ func TestCapabilitiesAreHonest(t *testing.T) {
 		t.Fatalf("local backend must report process scope, got %v", caps.Scope)
 	}
 }
+
+func TestEveryBackendHasAnEpochOfItsOwn(t *testing.T) {
+	ctx := context.Background()
+	a, _ := New().Locks().Acquire(ctx, "k", time.Second)
+	b, _ := New().Locks().Acquire(ctx, "k", time.Second)
+	if a.Token() != b.Token() || a.Epoch() == "" || a.Epoch() == b.Epoch() {
+		t.Fatalf("tokens %d and %d, epochs %q and %q: restarted counters must have new epochs", a.Token(), b.Token(), a.Epoch(), b.Epoch())
+	}
+}

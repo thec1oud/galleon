@@ -1,0 +1,51 @@
+{
+  "name": "galleon-docs",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync": "bun scripts/sync-adrs.ts",
+    "samples": "bun scripts/sync-samples.ts",
+    "predev": "bun run sync && bun run samples",
+    "dev": "next dev --turbopack",
+    "prebuild": "bun run sync && bun scripts/sync-samples.ts --check",
+    "build": "next build --turbopack",
+    "start": "next start",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@farming-labs/docs": "0.2.125",
+    "@farming-labs/next": "0.2.125",
+    "@farming-labs/theme": "0.2.125",
+    "next": "16.3.8",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/bun": "1.4.2",
+    "@types/mdast": "4.0.4",
+    "@types/mdx": "2.0.14",
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "mdast-util-from-markdown": "2.1.0",
+    "mdast-util-frontmatter": "2.0.1",
+    "mdast-util-gfm": "3.1.0",
+    "mdast-util-mdx": "3.0.0",
+    "mdast-util-to-markdown": "2.2.0",
+    "mdast-util-to-string": "4.0.0",
+    "micromark-extension-frontmatter": "2.0.0",
+    "micromark-extension-gfm": "3.0.0",
+    "micromark-extension-mdxjs": "3.0.0",
+    "postcss": "8.5.31",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "unist-util-visit": "5.1.0"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "packageManager": "bun@1.4.2"
+}

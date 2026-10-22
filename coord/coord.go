@@ -96,12 +96,24 @@ type Locker interface {
 	TryAcquire(ctx context.Context, key string, ttl time.Duration) (lease Lease, ok bool, err error)
 }
 
-// Lease is a held lock.
+// Lease is a held lock. Its TTL never starts before the call that grants
+// or renews it begins: TryAcquire's and Renew's start during the call, and
+// Acquire's no earlier than the moment the lease is granted, however long
+// it waited, so Acquire never returns a lease that has already expired. A
+// holder measures its deadline from before the call that last granted or
+// renewed the lease.
 type Lease interface {
 	Key() string
-	// Token is a fencing token, strictly increasing per key. Anything a lease
-	// protects should reject tokens lower than one it has already seen.
+	// Token is a fencing token, strictly increasing per key within its
+	// Epoch. Anything a lease protects should reject tokens lower than one
+	// it has already seen from the same epoch.
 	Token() uint64
+	// Epoch identifies the counter Token comes from. Tokens compare only
+	// within one epoch: a backend whose counter can restart, such as the
+	// in-process one, gets a new epoch each time, and a protected resource
+	// that sees a new epoch lets it take over. A cluster backend keeps its
+	// counter, and so its epoch, durably, so its epoch never changes.
+	Epoch() string
 	Renew(ctx context.Context) error
 	Release(ctx context.Context) error
 	// Lost is closed when the lease ends for any reason (release, expiry, partition).
@@ -113,6 +125,10 @@ type Election interface {
 	Campaign(ctx context.Context) (Lease, error)
 	// Leader reports the current leader, if any.
 	Leader(ctx context.Context) (NodeID, bool, error)
+	// Observe sends the current leader, then every change of leader; "" means
+	// there is none. The channel closes when ctx ends. Intermediate changes may
+	// be skipped by a slow reader, but the latest leader is always delivered.
+	Observe(ctx context.Context) <-chan NodeID
 }
 
 type Message struct {

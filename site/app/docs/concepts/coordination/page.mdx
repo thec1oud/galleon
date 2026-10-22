@@ -1,0 +1,47 @@
+---
+title: "Coordination"
+description: "The one place Galleon gets cluster-wide guarantees, and why an app must choose its backend."
+order: 3
+---
+
+# Coordination
+
+Coordination is the one place every part of Galleon gets guarantees that span processes. It provides locks, leader election, pub/sub, a shared key-value store, windowed counters and membership. Package [`coord`](https://pkg.go.dev/github.com/thec1oud/galleon/coord) defines the interface, and a backend implements it.
+
+There is no default backend. An app passes one to `galleon.Coordination`, or boot fails ([0011](/docs/decisions/0011-no-default-coordination-backend)).
+
+## What a backend promises
+
+A backend describes itself honestly with `Capabilities()`:
+
+- **Scope.** `ScopeProcess` guarantees hold inside one OS process. `ScopeCluster` guarantees hold across every process and node using the backend.
+- **Provides.** The capabilities it implements: `locks`, `leader_election`, `pubsub`, `kv`, `counters` and `membership`.
+
+A module declares what it relies on with `r.Needs(...)`. Boot fails if the backend lacks a capability. It also fails if the backend is process-scoped while the app runs as several processes, unless the app accepts that with `galleon.AllowPerProcessGuarantees()`.
+
+| `galleon.Deploy` | Process-scoped backend, with needs |
+|---|---|
+| `SingleNode` | Allowed |
+| `MultiNode`, or running under the [process supervisor](https://pkg.go.dev/github.com/thec1oud/galleon/process) | Boot fails, unless per-process guarantees are allowed, in which case each one is logged |
+| Not set | Allowed, with a log line asking you to declare `SingleNode` |
+
+## Backends
+
+Only one backend exists today: [`coord/local`](https://pkg.go.dev/github.com/thec1oud/galleon/coord/local), which is in-process. Its guarantees are exact, but hold inside one process only. Use it for a single node, development and tests. Cluster backends, on PostgreSQL first, are not built yet.
+
+Every backend must pass the conformance suite in `testkit/conformance/coordtest`.
+
+## Leases and fencing
+
+A lock is a lease with a time to live. Each lease carries a fencing token that only increases for its key, within an epoch. Anything a lease protects should reject a token lower than one it has already seen from the same epoch. That way, a holder that paused past its lease can't overwrite the work of the next holder.
+
+The migration runner uses this: it applies under a coordination lock. `pg/sqlmigrate` refuses a lower token of the same epoch, and any lease of a superseded epoch.
+
+## What uses it today
+
+- **Rate limits.** An operation's `RateLimit` counts calls with the backend's counters.
+- **Migrations.** Each migrator applies under a lock, once across the cluster.
+
+## Why it is built this way
+
+Every component is designed for more than one node from the start ([0012](/docs/decisions/0012-every-component-is-replication-aware)). Making the backend an explicit choice means a single-node backend can't reach a multi-node deploy by accident.

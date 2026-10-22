@@ -1,0 +1,101 @@
+---
+title: "Writing the docs"
+description: "Where a page goes, how decisions and lessons reach the docs, and how samples stay correct."
+order: 3
+---
+
+# Writing the docs
+
+Galleon's docs hold what is settled and true now. Discussion happens elsewhere; a decision reaches the docs when it's made, in the same PR as the code it affects.
+
+## Where a page goes
+
+Every page belongs to exactly one section, chosen by the question its reader is asking:
+
+| Section | The reader asks | A page… |
+|---|---|---|
+| [Learn](/docs/learn) | "Teach me from zero." | is a chapter of one project built in order, ending at a working checkpoint |
+| [Guides](/docs/guides) | "How do I do X?" | starts from a goal, assumes Learn, and ends with working code |
+| [Concepts](/docs/concepts) | "How does this work, and why?" | explains, links the decisions behind it, and has no step-by-step instructions |
+| [Reference](/docs/reference) | "What exactly does this accept and return?" | is exact and complete, with no narrative, and generated from the code where possible |
+| [Decisions](/docs/decisions) | "Why was this chosen?" | is an append-only architecture decision record |
+| [Contributing](/docs/contributing) | "How do I change Galleon?" | is for maintainers, and may describe internals |
+
+If a page answers two of these questions, split it. A guide that stops to explain a concept links to the concept page instead.
+
+## How a change reaches the docs
+
+Each PR carries its own docs. What goes where depends on what changed:
+
+- **A decision** becomes a record in [`docs/adr`](https://github.com/thec1oud/galleon/tree/dev/docs/adr), which appears here under Decisions. If it reverses an earlier decision, it supersedes that record rather than editing it.
+- **A lesson** from a bug, a review or an incident becomes a callout in the guide where readers would hit it. It can also be a "why" paragraph in the concept page. If it changes a decision, it also gets a superseding record.
+- **A code change** updates its guide and concept pages by hand. The error and config reference pages are generated: run `go generate ./...` in `site/`, and a test fails if they are stale.
+
+Concept pages say what is true now and link the decision records for why, so they never replay a debate.
+
+## Code samples
+
+A code sample of Galleon code is never written by hand. It lives in a Go file under `site/examples`, which CI compiles and tests. The page names the file and a region of it in the code fence:
+
+````md
+```go file=examples/firstapp/greetings.go#module title="greetings.go"
+```
+````
+
+Mark the region in the Go file with comments, which are left out of the sample:
+
+```txt
+// docs:start module
+type Greetings struct{}
+// docs:end module
+```
+
+Then run `bun run samples` in `site/` to copy every sample into its page. The page keeps the code in its own source, so the Markdown version served to agents shows it too. The build fails if any sample is out of date, or names a file or region that doesn't exist.
+
+## Style
+
+- Write for one reader doing one job. Lead with what they need, in the first sentence.
+- Use plain words, the second person and the present tense: "Galleon checks the config at boot", not "the configuration will be validated".
+- Keep sentences under 25 words and paragraphs to three sentences.
+- Say what isn't built yet, plainly, rather than describing plans as features.
+- Use a callout for a trap readers will fall into (`type="warn"`) or for optional depth, not for emphasis.
+
+## Running the site
+
+The site is built with [Farming Labs docs](https://docs.farming-labs.dev/) on Next.js, using [Bun](https://bun.sh/). Go-only changes don't need it. To preview the docs:
+
+```sh
+cd site
+bun install
+bun dev
+```
+
+Then open [localhost:3000/docs](http://localhost:3000/docs). Before pushing, run what CI runs:
+
+```sh
+bun install --frozen-lockfile
+bun test                         # the site's own scripts
+bun run typecheck
+bun run build                    # fails on a stale sample, a missing region, or a broken page
+test -z "$(gofmt -l examples)" && go vet ./... && go test -race ./...   # the samples
+```
+
+## Deploys
+
+The site is hosted on [Vercel](https://vercel.com/), from `site/vercel.json`:
+
+| Branch | Deploys to |
+|---|---|
+| `master` | the docs' own domain, the stable docs |
+| `dev` | the dev domain, with a banner saying it may describe work that hasn't reached `master` |
+| any other | a preview link on its pull request, with a banner naming the branch |
+
+Only the stable docs are indexed by search engines. The banner and the indexing come from the branch and environment Vercel sets at build time, so local and CI builds look like the stable docs. Vercel installs and builds with the Bun its build image ships, and prints its version at the start of the install step. The frozen lockfile keeps the dependencies the same as CI's, and the site runs on Node 22, as in CI.
+
+The Vercel project needs these settings:
+
+- **Root Directory:** `site`, with source files outside it included in the build, which is the default. The build reads `docs/adr` and the README.
+- **Production Branch:** `master`. Vercel's default is the repository's default branch, which is `dev`.
+- **Domains:** the docs' domain on production, and a second domain assigned to the `dev` branch.
+
+The README's samples are synced like a page's, with `bun run samples`. It is read as plain Markdown, as GitHub reads it.

@@ -1,5 +1,11 @@
-go 1.24
+go 1.26.0
 
-// Every module in this repository is listed here. Add new modules
-// (pg, jobs, web, adapters/...) with `go work use ./<dir>`.
-use .
+use (
+	// Every module in this repository is listed here, except adapters/dpg,
+	// which builds only against a local dpg checkout until dpg publishes
+	// its library engine (see adapters/dpg/README.md). Add new modules
+	// (pg, jobs, web, adapters/...) with `go work use ./<dir>`.
+	.
+	./site
+	./testkit
+)
