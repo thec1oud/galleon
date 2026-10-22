@@ -36,15 +36,15 @@ Building an index on a large table blocks writes unless it is built concurrently
 CREATE INDEX CONCURRENTLY IF NOT EXISTS notes_title ON notes (title);
 ```
 
-If the statement fails part way, or runs past `apply_timeout` (ten minutes by default) and is cancelled, the file is pending again. A concurrent build that fails leaves an invalid index behind, and on the next attempt `IF NOT EXISTS` skips it: the file is recorded as applied, and nothing was built. A restarted node can make that attempt on its own, since the pending plan, and so its fingerprint, hasn't changed.
+If the statement fails part way, or runs past `apply_timeout` (ten minutes by default) and is cancelled, the file is pending again. A concurrent build that fails leaves an invalid index behind, and on the next attempt `IF NOT EXISTS` skips it: the file is recorded as applied, and nothing was built. A restarted node can make that attempt on its own when the failed file was the first step of the approved plan, since the pending plan, and so its fingerprint, still matches. Without a pinned fingerprint, any restart in apply mode retries it.
 
-So after a failed apply, withdraw the approval or stop restarts, and check the index:
+So after a failed apply, switch the deploy back to verify mode (unset `NOTES_MIGRATE_MODE`) or stop restarts, and check the index:
 
 ```sql
 SELECT indisvalid FROM pg_index WHERE indexrelid = 'notes_title'::regclass;
 ```
 
-If it is invalid, drop it with `DROP INDEX CONCURRENTLY IF EXISTS notes_title` before the next attempt. If an attempt has already recorded the file, ship two new `no-transaction` files: one that drops the index, and one that builds it again. For a large table, raise `apply_timeout` for the deploy.
+If it is invalid, drop it with `DROP INDEX CONCURRENTLY IF EXISTS notes_title`, then deploy again, approving the new plan if its fingerprint changed. If an attempt has already recorded the file, ship two new `no-transaction` files: one that drops the index, and one that builds it again. For a large table, raise `apply_timeout` for the deploy.
 
 The migrator is registered as in Learn:
 
