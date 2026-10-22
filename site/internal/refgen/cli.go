@@ -2,10 +2,15 @@ package refgen
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/thec1oud/galleon/cli"
 )
+
+// commandName is what a command's name may be: it is written unescaped,
+// in a heading and a shell block.
+var commandName = regexp.MustCompile(`^[a-z][a-z-]*( [a-z][a-z-]*)*$`)
 
 // renderCLI renders the command line's reference from the commands'
 // definitions, which also run them and print their help.
@@ -29,8 +34,8 @@ order: 3
 	}
 	b.WriteString("\nEach command's section says what `0` and `1` mean for it.\n")
 	for _, c := range commands {
-		if c.Name == "" || c.Summary == "" || len(c.Exits) == 0 {
-			return "", fmt.Errorf("refgen: command %q has no name, summary or exit codes", c.Name)
+		if !commandName.MatchString(c.Name) || c.Summary == "" || len(c.Exits) == 0 {
+			return "", fmt.Errorf("refgen: command %q needs a name of lowercase words, a summary and exit codes", c.Name)
 		}
 		fmt.Fprintf(&b, "\n## %s\n\n```sh\n<app> %s", c.Name, c.Name)
 		if c.Args != "" {

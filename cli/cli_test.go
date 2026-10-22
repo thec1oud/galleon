@@ -108,16 +108,16 @@ func TestThePolicyStillRefuses(t *testing.T) {
 	s := &schema{risk: migrate.Destructive}
 	opts, _ := app(s, `{}`) // Production: up to caution
 
-	code, out, _ := runCLI(t, opts, "migrate", "plan")
-	if code != cli.ExitFailed || !strings.Contains(out, "refused: migrate.risk_refused") {
-		t.Fatalf("plan: %d\n%s", code, out)
+	code, out, errs := runCLI(t, opts, "migrate", "plan")
+	if code != cli.ExitFailed || !strings.Contains(out, "refused: migrate.risk_refused") || !strings.Contains(errs, "migrate plan: schema can't be applied as planned") {
+		t.Fatalf("plan: %d\n%s\n%s", code, out, errs)
 	}
-	code, out, errs := runCLI(t, opts, "migrate", "apply")
+	code, out, errs = runCLI(t, opts, "migrate", "apply")
 	if code != cli.ExitFailed || !strings.Contains(out, "error: migrate.risk_refused") || s.up {
 		t.Fatalf("apply: %d, applied %v\n%s", code, s.up, out)
 	}
-	if errs != "" {
-		t.Errorf("the report already says why; stderr repeats it:\n%s", errs)
+	if errs != "migrate apply: migrator \"schema\": refused; the report above says why\n" {
+		t.Errorf("stderr should name the migrator once, not repeat the report:\n%s", errs)
 	}
 }
 
@@ -164,6 +164,9 @@ func TestUsage(t *testing.T) {
 		{[]string{"nope"}, cli.ExitUsage, "", `unknown command "nope"`},
 		{[]string{"migrate"}, cli.ExitUsage, "", "migrate needs a subcommand"},
 		{[]string{"migrate", "drop"}, cli.ExitUsage, "", "migrate needs a subcommand"},
+		{[]string{"help", "migrate"}, cli.ExitOK, "migrate apply", ""},
+		{[]string{"migrate", "-h"}, cli.ExitOK, "migrate status", ""},
+		{[]string{"help", "migrate", "plan", "extra"}, cli.ExitUsage, "", `unknown command "migrate plan extra"`},
 		{[]string{"migrate", "plan", "-online"}, cli.ExitUsage, "", "flag provided but not defined: -online"},
 		{[]string{"migrate", "status", "extra"}, cli.ExitUsage, "", `unexpected argument "extra"`},
 	} {
@@ -197,6 +200,9 @@ func TestCommandsDescribeEveryCommand(t *testing.T) {
 		names = append(names, c.Name)
 		if c.Summary == "" || len(c.Exits) == 0 {
 			t.Errorf("%q has no summary or exit codes", c.Name)
+		}
+		if c.Name == "migrate plan" && (len(c.Flags) != 1 || c.Flags[0] != cli.Flag{Name: "offline", Default: "false", Usage: "plan without reading the database's state"}) {
+			t.Errorf("migrate plan's flags, as it parses them: %+v", c.Flags)
 		}
 	}
 	if got := strings.Join(names, ","); got != "serve,migrate status,migrate plan,migrate apply" {

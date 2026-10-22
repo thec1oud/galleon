@@ -43,8 +43,8 @@ const (
 // it. Commands returns them; the definitions run them, so the two can't
 // differ.
 type Command struct {
-	// Name is the command as typed, such as "migrate plan"; "" is the
-	// default command, which runs when no command is given.
+	// Name is the command as typed, such as "migrate plan". Without a
+	// command, the binary runs "serve".
 	Name string
 	// Args is the synopsis after the name, such as "[-offline]".
 	Args string
@@ -59,7 +59,7 @@ type Command struct {
 	Exits []Exit
 }
 
-// Flag is a command's flag.
+// Flag is a command's flag, as the flag package parses it.
 type Flag struct {
 	Name, Default, Usage string
 }
@@ -71,17 +71,43 @@ type Exit struct {
 }
 
 type command struct {
-	Command
-	// define declares the command's flags on fs; it may be nil.
-	define func(fs *flag.FlagSet)
-	run    func(ctx context.Context, e *env) int
+	Command // its Flags are left empty: flags declares them
+	// flags declares the command's flags on fs, into v; it may be nil.
+	flags func(fs *flag.FlagSet, v *values)
+	run   func(ctx context.Context, e *env) int
+}
+
+// values are the parsed flags of every command.
+type values struct {
+	offline bool
 }
 
 // env is what a command runs with.
 type env struct {
 	stdout, stderr io.Writer
 	opts           []galleon.Option
-	flags          *flag.FlagSet
+	values
+}
+
+// flagSet returns c's flags, parsing into v.
+func (c *command) flagSet(v *values) *flag.FlagSet {
+	fs := flag.NewFlagSet(c.Name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if c.flags != nil {
+		c.flags(fs, v)
+	}
+	return fs
+}
+
+// describe returns c's description, with its flags as it declares them.
+func (c *command) describe() Command {
+	d := c.Command
+	d.Exits = slices.Clone(c.Exits)
+	d.Flags = nil
+	c.flagSet(new(values)).VisitAll(func(f *flag.Flag) {
+		d.Flags = append(d.Flags, Flag{Name: f.Name, Default: f.DefValue, Usage: f.Usage})
+	})
+	return d
 }
 
 var commands = []*command{
@@ -116,14 +142,15 @@ var commands = []*command{
 			Summary: "Print what migrate apply would do: each migrator's pending steps, their risks, the plan's fingerprint, and whether the policy would refuse it.",
 			Doc: "It changes nothing. Approve a plan by pinning its fingerprint in the `migrate` section's `approve` key, or `<APP>_MIGRATE_APPROVE`, as `name=fingerprint` pairs.\n\n" +
 				"With `-offline`, a migrator that can plan without a database plans every change as if the database were empty, and one that can't says so. The providers the migrators need still start, so the database must be reachable even then.",
-			Flags: []Flag{{Name: "offline", Default: "false", Usage: "plan without reading the database's state"}},
 			Exits: []Exit{
 				{ExitOK, "every migrator planned, and the policy allows every plan"},
 				{ExitFailed, "the app didn't boot, a plan couldn't be made, a status couldn't be read, or the policy would refuse a plan"},
 			},
 		},
-		define: func(fs *flag.FlagSet) { fs.Bool("offline", false, "") },
-		run:    migratePlan,
+		flags: func(fs *flag.FlagSet, v *values) {
+			fs.BoolVar(&v.offline, "offline", false, "plan without reading the database's state")
+		},
+		run: migratePlan,
 	},
 	{
 		Command: Command{
@@ -155,9 +182,7 @@ func ExitCodes() []Exit {
 func Commands() []Command {
 	out := make([]Command, len(commands))
 	for i, c := range commands {
-		out[i] = c.Command
-		out[i].Flags = slices.Clone(c.Flags)
-		out[i].Exits = slices.Clone(c.Exits)
+		out[i] = c.describe()
 	}
 	return out
 }
@@ -177,35 +202,39 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, opts ...g
 	}
 	switch args[0] {
 	case "help", "-h", "-help", "--help":
-		if len(args) > 1 {
-			c, _ := find(args[1:])
-			if c == nil {
-				fmt.Fprintf(stderr, "unknown command %q\n\n", strings.Join(args[1:], " "))
-				usage(stderr)
-				return ExitUsage
-			}
+		if len(args) == 1 {
+			usage(stdout, "")
+			return ExitOK
+		}
+		if c, rest := find(args[1:]); c != nil && len(rest) == 0 {
 			commandUsage(stdout, c)
 			return ExitOK
 		}
-		usage(stdout)
-		return ExitOK
+		if len(args) == 2 && group(args[1]) {
+			usage(stdout, args[1])
+			return ExitOK
+		}
+		fmt.Fprintf(stderr, "unknown command %q\n\n", strings.Join(args[1:], " "))
+		usage(stderr, "")
+		return ExitUsage
 	}
 	c, rest := find(args)
 	if c == nil {
-		if args[0] == "migrate" {
-			fmt.Fprintln(stderr, "migrate needs a subcommand: status, plan or apply")
-		} else {
-			fmt.Fprintf(stderr, "unknown command %q\n", args[0])
+		if group(args[0]) {
+			if len(args) > 1 && isHelp(args[1]) {
+				usage(stdout, args[0])
+				return ExitOK
+			}
+			fmt.Fprintf(stderr, "%s needs a subcommand\n\n", args[0])
+			usage(stderr, args[0])
+			return ExitUsage
 		}
-		fmt.Fprintln(stderr)
-		usage(stderr)
+		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
+		usage(stderr, "")
 		return ExitUsage
 	}
-	fs := flag.NewFlagSet(c.Name, flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	if c.define != nil {
-		c.define(fs)
-	}
+	var v values
+	fs := c.flagSet(&v)
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			commandUsage(stdout, c)
@@ -220,7 +249,15 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, opts ...g
 		commandUsage(stderr, c)
 		return ExitUsage
 	}
-	return c.run(ctx, &env{stdout: stdout, stderr: stderr, opts: opts, flags: fs})
+	return c.run(ctx, &env{stdout: stdout, stderr: stderr, opts: opts, values: v})
+}
+
+func isHelp(arg string) bool { return arg == "-h" || arg == "-help" || arg == "--help" }
+
+// group reports whether word starts the names of several commands, as
+// "migrate" does.
+func group(word string) bool {
+	return slices.ContainsFunc(commands, func(c *command) bool { return strings.HasPrefix(c.Name, word+" ") })
 }
 
 // find returns the command args start with, and the arguments after its
@@ -243,11 +280,18 @@ func program() string {
 	return filepath.Base(os.Args[0])
 }
 
-func usage(w io.Writer) {
+// usage lists the commands, or only those of group when it isn't "".
+func usage(w io.Writer, group string) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Usage: %s [command] [flags]\n\nCommands:\n", program())
+	if group == "" {
+		fmt.Fprintf(&b, "Usage: %s [command] [flags]\n\nCommands:\n", program())
+	} else {
+		fmt.Fprintf(&b, "Usage: %s %s <command> [flags]\n\nCommands:\n", program(), group)
+	}
 	for _, c := range commands {
-		fmt.Fprintf(&b, "  %-15s %s\n", c.Name, c.Summary)
+		if group == "" || strings.HasPrefix(c.Name, group+" ") {
+			fmt.Fprintf(&b, "  %-15s %s\n", c.Name, c.Summary)
+		}
 	}
 	fmt.Fprintf(&b, "\nWithout a command, the app serves. Run `%s help <command>` for a command's flags and exit codes.\n", program())
 	io.WriteString(w, b.String())
@@ -263,9 +307,9 @@ func commandUsage(w io.Writer, c *command) {
 	if c.Doc != "" {
 		fmt.Fprintf(&b, "\n%s\n", c.Doc)
 	}
-	if len(c.Flags) > 0 {
+	if d := c.describe(); len(d.Flags) > 0 {
 		b.WriteString("\nFlags:\n")
-		for _, f := range c.Flags {
+		for _, f := range d.Flags {
 			fmt.Fprintf(&b, "  -%s\t%s (default %s)\n", f.Name, f.Usage, f.Default)
 		}
 	}
@@ -295,6 +339,9 @@ func serve(ctx context.Context, e *env) int {
 func withMigrations(ctx context.Context, e *env, fn func(ctx context.Context, m *galleon.Migrations) (int, error)) int {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The first signal cancels the command; a second, while it stops what
+	// it started, kills the process as signals do by default.
+	go func() { <-ctx.Done(); stop() }()
 	app, err := galleon.New(e.opts...)
 	if err != nil {
 		fmt.Fprintln(e.stderr, err)
@@ -332,19 +379,23 @@ func migrateStatus(ctx context.Context, e *env) int {
 }
 
 func migratePlan(ctx context.Context, e *env) int {
-	offline := e.flags.Lookup("offline").Value.(flag.Getter).Get().(bool)
 	return withMigrations(ctx, e, func(ctx context.Context, m *galleon.Migrations) (int, error) {
-		plans, err := m.Plan(ctx, offline)
+		plans, err := m.Plan(ctx, e.offline)
 		if err != nil {
 			return ExitFailed, err
 		}
 		if err := migrate.WritePlans(e.stdout, plans); err != nil {
 			return ExitFailed, err
 		}
+		var failed []string
 		for _, p := range plans {
 			if p.Err != nil || p.StatusErr != nil || p.Refused != nil {
-				return ExitFailed, nil
+				failed = append(failed, p.Name)
 			}
+		}
+		if len(failed) > 0 {
+			fmt.Fprintf(e.stderr, "migrate plan: %s can't be applied as planned; the plan above says why\n", strings.Join(failed, ", "))
+			return ExitFailed, nil
 		}
 		return ExitOK, nil
 	})
@@ -359,8 +410,11 @@ func migrateApply(ctx context.Context, e *env) int {
 		if err != nil {
 			// The report already says why the migrator that stopped the
 			// apply failed; an error none of them carries is said here.
-			if slices.ContainsFunc(reports, func(r migrate.ApplyReport) bool { return r.Err != nil }) {
-				return ExitFailed, nil
+			for _, r := range reports {
+				if r.Err != nil {
+					fmt.Fprintf(e.stderr, "migrate apply: migrator %q: %s; the report above says why\n", r.Name, r.Outcome)
+					return ExitFailed, nil
+				}
 			}
 			return ExitFailed, err
 		}

@@ -84,9 +84,11 @@ type migratorReg struct {
 
 // Migrator registers migrator name, built at Start by ctor, a function
 // whose parameters are provided types and which returns a migrate.Migrator,
-// or (migrate.Migrator, error). It is built once every provider has
-// started, so it can take a started data plane, such as *pg.Manager for
-// its pool, and its Name must be name.
+// or (migrate.Migrator, error). It is built once its parameters, and what
+// they depend on, have started, so it can take a started data plane, such
+// as *pg.Manager for its pool, and its Name must be name. It must take
+// everything it needs as parameters: the migrate commands
+// (App.WithMigrations) start nothing else.
 //
 // At boot, after the providers start and before OnStart hooks run, the
 // kernel acts on every migrator, in order, as the policy's mode says (see
@@ -500,7 +502,12 @@ func (a *App) buildMigrators() (*migrate.Runner, []migrate.Migrator, error) {
 // coordination lock and the config are the ones boot would use.
 //
 // Like Start, it runs once: the app can't be started afterwards. It fails
-// without calling fn when the app has no migrators.
+// without calling fn when the app has no migrators. While fn runs, Resolve
+// returns only what it started, Ready fails and Shutdown is refused.
+//
+// Only providers the migrators' constructors reach through parameters
+// start. One that matters for its side effect alone, such as pg's
+// telemetry for a Manager supplied with pg.Use, doesn't.
 func (a *App) WithMigrations(ctx context.Context, fn func(ctx context.Context, m *Migrations) error) error {
 	a.mu.Lock()
 	if a.state != stateBuilt {
@@ -509,12 +516,17 @@ func (a *App) WithMigrations(ctx context.Context, fn func(ctx context.Context, m
 		if st == stateStopped {
 			return errors.New("galleon: WithMigrations called after the app ran; an app runs once")
 		}
+		if st == stateMigrating {
+			return errors.New("galleon: WithMigrations called twice")
+		}
 		return errors.New("galleon: WithMigrations called on an app that is running")
 	}
-	a.state = stateStarting
+	a.state = stateMigrating
 	a.mu.Unlock()
 
 	err := a.withMigrations(ctx, fn)
+	// What it started is about to stop: the handle refuses from now on.
+	a.migrationsHandle.set(nil, nil)
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.settings.stopTimeout)
 	defer cancel()
 	if serr := a.stopAll(stopCtx); serr != nil {
@@ -647,9 +659,10 @@ func (g *migrationGate) refreshLocked(ctx context.Context) {
 }
 
 // Migrations is the app's operator surface for its migrators: status, plan
-// and apply, as `migrate status|plan|apply` will run them, and Done for app
+// and apply, as `migrate status|plan|apply` run them, and Done for app
 // code waiting on a background task. The kernel provides it, so a
-// constructor can take it; it works once the app has started.
+// constructor can take it; it works once the app has started, or inside
+// WithMigrations.
 type Migrations struct {
 	mu      sync.Mutex
 	runner  *migrate.Runner
@@ -705,7 +718,9 @@ func (m *Migrations) Apply(ctx context.Context) ([]migrate.ApplyReport, error) {
 	m.mu.Unlock()
 	// The gates show what the apply did even when the caller's ctx ended
 	// with it; each read is bounded by the gate timeout.
-	refresh(context.WithoutCancel(ctx))
+	if refresh != nil {
+		refresh(context.WithoutCancel(ctx))
+	}
 	return reps, err
 }
 

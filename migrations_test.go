@@ -523,11 +523,26 @@ func TestWithMigrationsStartsOnlyWhatTheMigratorsNeed(t *testing.T) {
 		if len(applied) != 0 || len(reps) != 1 || reps[0].Status.State != migrate.Pending {
 			t.Errorf("before apply: applied %v, status %+v", applied, reps)
 		}
+		if _, err := galleon.Resolve[*dbHandle](app); err != nil {
+			t.Errorf("resolving a started provider: %v", err)
+		}
+		if _, err := galleon.Resolve[*webServer](app); err == nil || !strings.Contains(err.Error(), "wasn't built") {
+			t.Errorf("resolving a provider WithMigrations didn't start: %v", err)
+		}
+		if app.Ready(ctx) == nil {
+			t.Error("ready while running migrate commands")
+		}
+		if err := app.Shutdown(ctx); err == nil {
+			t.Error("Shutdown while WithMigrations runs")
+		}
 		_, err = m.Apply(ctx)
 		return err
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := app.Migrations().Status(context.Background()); err == nil {
+		t.Error("the Migrations handle works after WithMigrations stopped its providers")
 	}
 	if got := strings.Join(applied, ","); got != "schema" {
 		t.Errorf("applied %q", got)

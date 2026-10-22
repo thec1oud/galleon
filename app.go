@@ -137,6 +137,9 @@ const (
 	stateStarted
 	stateDraining
 	stateStopped
+	// stateMigrating: WithMigrations is running; only the migrators'
+	// providers are started.
+	stateMigrating
 )
 
 // App is a built, validated application. Create it with New.
@@ -399,8 +402,11 @@ func (a *App) Start(ctx context.Context) error {
 	if a.state != stateBuilt {
 		st := a.state
 		a.mu.Unlock()
-		if st == stateStopped {
-			return errors.New("galleon: Start called after Shutdown; an app runs once")
+		switch st {
+		case stateStopped:
+			return errors.New("galleon: Start called after Shutdown or WithMigrations; an app runs once")
+		case stateMigrating:
+			return errors.New("galleon: Start called while WithMigrations runs; an app runs once")
 		}
 		return errors.New("galleon: Start called twice")
 	}
@@ -477,6 +483,8 @@ func (a *App) Ready(ctx context.Context) error {
 		}
 	case stateDraining:
 		return errors.New("draining")
+	case stateMigrating:
+		return errors.New("running migrate commands, not serving")
 	default:
 		return errors.New("not started")
 	}
@@ -505,6 +513,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 		a.state = stateStopped
 		a.mu.Unlock()
 		return shutdownTelemetry(ctx, &a.settings)
+	case stateMigrating:
+		a.mu.Unlock()
+		return errors.New("galleon: Shutdown called while WithMigrations runs; it stops what it started when its function returns")
 	default:
 		a.mu.Unlock()
 		return nil

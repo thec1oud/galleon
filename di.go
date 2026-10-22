@@ -136,7 +136,8 @@ func (a *App) build(p *provider) error {
 	return nil
 }
 
-// Resolve returns the instance of T. It only works after Start.
+// Resolve returns the instance of T. It only works after Start, or inside
+// WithMigrations for what the migrators need, which is all it starts.
 func Resolve[T any](a *App) (T, error) {
 	var zero T
 	a.mu.Lock()
@@ -148,6 +149,9 @@ func Resolve[T any](a *App) (T, error) {
 	p, ok := a.providers[reflect.TypeFor[T]()]
 	if !ok {
 		return zero, fmt.Errorf("galleon: nothing provides %s", reflect.TypeFor[T]())
+	}
+	if !p.value.IsValid() {
+		return zero, fmt.Errorf("galleon: %s wasn't built: WithMigrations builds only what the migrators need", reflect.TypeFor[T]())
 	}
 	return p.value.Interface().(T), nil
 }

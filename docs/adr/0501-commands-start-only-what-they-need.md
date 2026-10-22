@@ -36,7 +36,12 @@ Like `Start`, it runs once: the app can't start afterwards.
   would be refused, and waits for the same lock.
 - A migrator's constructor must take what it needs as parameters, which
   the seam already required; one that reached for a provider some other
-  way would find it unstarted.
+  way would find it unstarted. A provider that matters only for its side
+  effect doesn't start either: with a Manager supplied by `pg.Use`, the
+  app's telemetry isn't attached to it during a command.
+- While a command runs, `Resolve` returns only what it started, `Ready`
+  fails and `Shutdown` is refused; when it returns, `App.Migrations()`
+  refuses too.
 - Planning offline still starts the migrators' providers, so the database
   must be reachable. A migrator that can plan offline but whose
   constructor needs a pool can't plan in CI without a database; that would
