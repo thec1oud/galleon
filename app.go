@@ -80,6 +80,11 @@ func Name(name string) Option { return func(s *settings) { s.name = name } }
 
 // Coordination sets the coordination backend. It is required: there is no default.
 // Use coord/local's New() for a single-node deployment.
+//
+// A backend that holds resources owns its lifecycle through the app: if it
+// is a Module, it is installed first, before the modules given to Modules,
+// so it can read its own config section; if it is a Starter, it starts
+// before every provider, and if it is a Stopper, it stops after them all.
 func Coordination(b coord.Backend) Option { return func(s *settings) { s.backend = b } }
 
 func Modules(m ...Module) Option { return func(s *settings) { s.modules = append(s.modules, m...) } }
@@ -147,6 +152,9 @@ type App struct {
 	node     Node
 	backend  coord.Backend
 	settings settings
+	// backendStarted is set once a backend that is a Starter has started,
+	// so it is stopped exactly once.
+	backendStarted bool
 
 	providers     map[reflectType]*provider
 	providerOrder []*provider
@@ -265,10 +273,19 @@ func New(opts ...Option) (*App, error) {
 		Supply[coord.Backend](kernel, a.backend)
 	}
 
+	modules := s.modules
+	backendModule, _ := s.backend.(Module)
+	if backendModule != nil {
+		modules = append([]Module{backendModule}, modules...)
+	}
 	seen := map[string]bool{}
-	for _, m := range s.modules {
+	for i, m := range modules {
 		name := m.Name()
 		if seen[name] {
+			if backendModule != nil && i > 0 && name == backendModule.Name() {
+				a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q is installed twice: galleon.Coordination installs a backend that is a module, so leave it out of galleon.Modules", name))
+				continue
+			}
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q is installed twice", name))
 			continue
 		}
@@ -422,6 +439,15 @@ func (a *App) Start(ctx context.Context) error {
 		return err
 	}
 
+	if s, ok := a.backend.(Starter); ok {
+		sctx, cancel := context.WithTimeout(ctx, a.settings.startTimeout)
+		err := s.Start(sctx)
+		cancel()
+		if err != nil {
+			return fail(fmt.Errorf("starting coordination backend %q: %w", a.backend.Capabilities().Name, err))
+		}
+		a.backendStarted = true
+	}
 	for _, p := range a.buildOrder {
 		if err := a.build(p); err != nil {
 			return fail(err)
@@ -568,6 +594,17 @@ func (a *App) stopAll(ctx context.Context) error {
 		}
 	}
 	a.started = nil
+	// The backend stops last: providers and hooks may release leases or
+	// leave membership through it as they stop.
+	if s, ok := a.backend.(Stopper); ok && a.backendStarted {
+		sctx, cancel := context.WithTimeout(ctx, a.settings.stopTimeout)
+		err := s.Stop(sctx)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("stopping coordination backend %q: %w", a.backend.Capabilities().Name, err))
+		}
+	}
+	a.backendStarted = false
 	return errors.Join(errs...)
 }
 

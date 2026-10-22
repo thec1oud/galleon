@@ -384,3 +384,74 @@ func TestRegistryFatalStopsTheApp(t *testing.T) {
 		t.Fatalf("Run must return the fatal error, got %v", err)
 	}
 }
+
+// managedBackend is a coordination backend that owns resources: a module
+// with its own config section, started and stopped by the app.
+type managedBackend struct {
+	*local.Backend
+	log     *[]string
+	setting *struct{ Value string }
+}
+
+func (b *managedBackend) Name() string { return "managed_coord" }
+func (b *managedBackend) Register(r *galleon.Registry) error {
+	b.setting = galleon.Config[struct{ Value string }](r, "managed_coord")
+	return nil
+}
+func (b *managedBackend) Start(context.Context) error {
+	*b.log = append(*b.log, "start backend "+b.setting.Value)
+	return nil
+}
+func (b *managedBackend) Stop(context.Context) error {
+	*b.log = append(*b.log, "stop backend")
+	return nil
+}
+
+func TestABackendOwnsItsLifecycleThroughTheApp(t *testing.T) {
+	var log []string
+	b := &managedBackend{Backend: local.New(), log: &log}
+	mod := galleon.ModuleFunc("orders", func(r *galleon.Registry) error {
+		galleon.Provide[*Repo](r, func() *Repo { return &Repo{log: &log} })
+		return nil
+	})
+	app, err := galleon.New(quiet(), galleon.Coordination(b), galleon.Deploy(galleon.SingleNode), galleon.DrainGrace(0),
+		galleon.ConfigJSON([]byte(`{"managed_coord": {"Value": "configured"}}`)), galleon.Modules(mod))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"start backend configured", "start repo", "stop repo", "stop backend"}
+	if strings.Join(log, ",") != strings.Join(want, ",") {
+		t.Fatalf("lifecycle = %v, want %v", log, want)
+	}
+
+	_, err = galleon.New(quiet(), galleon.Coordination(b), galleon.Modules(b))
+	if err == nil || !strings.Contains(err.Error(), "leave it out of galleon.Modules") {
+		t.Fatalf("installing the backend as a module too = %v", err)
+	}
+}
+
+func TestABackendThatFailsToStartFailsStart(t *testing.T) {
+	var log []string
+	b := &failingBackend{managedBackend{Backend: local.New(), log: &log}}
+	app, err := galleon.New(quiet(), galleon.Coordination(b), galleon.Deploy(galleon.SingleNode))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = app.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), `starting coordination backend "local": unreachable`) {
+		t.Fatalf("Start = %v", err)
+	}
+	if len(log) != 0 {
+		t.Fatalf("a backend that didn't start was stopped: %v", log)
+	}
+}
+
+type failingBackend struct{ managedBackend }
+
+func (b *failingBackend) Start(context.Context) error { return errors.New("unreachable") }
