@@ -116,6 +116,7 @@ galleon.Provide(r, NewOrderRepo, galleon.Scope(galleon.Singleton))
 ```
 
 - Constructors are plain Go functions. Galleon uses reflection **once at boot** to read their parameter types and build the graph. It is never used per request.
+- One constructor provides each type. Values several modules contribute go into a collection instead: `galleon.Collect(r, values...)` adds to the app's collection of `T`, which the kernel provides as `[]T`, in module installation order and then call order, once every module has registered. A consumer, whether it takes `[]T` in a constructor or reads it with `Resolve`, calls `Collect` with no values, which declares the collection, so that `[]T` is provided even when nothing is added; providing or replacing `[]T` fails boot, and `Collect` after `New` has provided the collections panics rather than drop its values. Each consumer gets the slice full to its capacity, so an append copies. A value with a `Validate() error` method, on `T` or `*T`, is checked as it is collected (a nil pointer or func isn't), and fails boot naming the module and line, as a config section does. Values collected with nothing declaring or taking their collection fail boot too, naming where the first was added, since they would go nowhere; this is usually a consumer's module that isn't installed, or a mismatched type: models collected by pointer (`*data.ModelInfo`) are refused this way, and the error suggests the type that is declared or taken, the value for a pointer or the pointer for a value, or an interface the type implements. A collection that is also provided or replaced reports only that conflict. Models (§7.6) are the first collection.
 - The whole graph is validated before anything starts: missing providers, cycles, scope violations, unused providers (a warning). Errors name the module and constructor, and say how to fix them (U7).
 - Scopes: `Singleton` (per process), `PerOperation` and `PerJob`. **Cluster-wide singletons are not a DI scope.** They come from coordination (`coord.Leader`), so they can never be confused with per-process singletons (O6).
 - An optional codegen mode (`galleon generate wire`) can emit the same graph as plain Go for anyone who wants zero reflection even at boot. Both modes go through the same validation.
@@ -456,10 +457,35 @@ Spans of reads on the primary source carry `galleon.data.consistency` (the level
 
 ### 7.6 The ORM seam
 
-Your ORM (and sqlc, bun, ent, GORM) gets its `Querier` from context, or explicitly from the handle passed in. It **never chooses a host**: Galleon does. The ORM adapter's only jobs are:
+Your ORM (and sqlc, bun, ent, GORM, or a hand-written repository) gets its `Querier` from context, or explicitly from the handle passed in. It **never chooses a host**: Galleon does. The ORM adapter's only jobs are:
 1. accept a Galleon `Querier` or transaction,
 2. register its model metadata for tracing (and later the admin battery),
 3. add ORM-level hooks to `AfterCommit` where it needs them.
+
+What Galleon gives it, all in package `data`, which links pgx's types and the error model and nothing else (no kernel, no `pg`, no pool; a test checks):
+
+```go
+q, ok := data.QuerierFrom(ctx) // the transaction in ctx, only when it writes
+r, ok := data.ReaderFrom(ctx)  // the transaction in ctx, read or write
+err := data.AfterCommit(ctx, func(ctx context.Context) { … }) // on the write transaction in ctx
+ctx = data.ForModel(ctx, "order")                             // the model these statements serve
+
+galleon.Collect(r, data.ModelInfo{
+    Name: "order", Schema: "shop", Table: "orders",
+    Key:     []string{"id"},
+    Columns: []string{"id", "customer_id", "total"},            // optional
+    Relations: []data.Relation{{Name: "customer", Model: "customer",
+        Columns: []string{"customer_id"}, References: []string{"id"}}}, // optional
+})
+```
+
+- **Handles from context.** `QuerierFrom` yields a handle only when the enclosing transaction writes: a read transaction, or a read view of a write one, is never a `Querier`, so code holding a read handle can't call `Exec` or `CopyFrom` without a type assertion that fails. That is a guard on the API, not on SQL: a read view joined to a write transaction shares that transaction, so a write sent through its `Query` (`INSERT … RETURNING`) isn't refused by the database, as it is in a read transaction of its own, which runs `READ ONLY`. Neither helper begins a transaction or chooses a source: with nothing in ctx they report absence, and there is no pool to fall back to.
+- **Hooks.** `data.AfterCommit` registers with the write transaction in ctx (`WriteTx.AfterCommit`), so a side effect never fires for a change that rolls back, and fires once for a retried closure. With no write transaction in ctx it refuses (`Internal`, `data.propagation`) and never runs the callback: running it at once would fire the side effect as if a commit had happened. A handle that has already committed or rolled back is refused too (`data.tx_ended`), when it can tell (`data.Ender`, which `pg`'s handles are, and which a wrapper of a handle should forward, as the suite's recording handle does). Nothing new runs inline.
+- **Model metadata.** `data.ModelInfo` is a driver-free description: a name unique in the app, a schema-qualified table, the primary key's columns, and optionally the columns the model maps and its foreign-key relations to other models. An adapter module registers its models with `galleon.Collect` (§3.2), which checks each with `ModelInfo.Validate` as it is collected, so an invalid one fails `galleon.New` naming the module and line. The data module (`pg.Module`) builds the registry, `*data.Models`, from every module's, failing `Start` when two share a name or a table, or a relation names a model that isn't registered. The registry never changes after boot and hands out copies, so it is safe for concurrent reads; DI provides it to anything that needs it, such as the admin battery later.
+- **Spans.** Statement, batch and copy spans whose ctx names a model carry `galleon.data.model`, and, when the model is registered, its table as `db.collection.name` (semantic conventions); a copy keeps its own table, and statements that control the transaction (`BEGIN`, `SAVEPOINT`, `COMMIT`, …) name no model. The tables are formatted once, when the registry reaches the Manager. Nothing changes for statements whose ctx names none, and no SQL text or argument is recorded anywhere new.
+- **Conformance** (`testkit/conformance/ormtest`): an adapter runs the suite as a repository of the suite's `Widget`, and is given a ctx carrying the transaction and the same transaction explicitly. The suite records every statement through the handles it gives, and checks that each call ran through one of them, that reads see the transaction's own uncommitted writes, that nothing of a rolled-back transaction persisted, and that nothing connected with the DSN the adapter was configured with (it points at a `testkit.Proxy`, which counts every connection, even one closed again); that side effects run only after the commit, once per save, never on rollback or for a save through a savepoint that rolled back, and once under a retried closure; and that the models the adapter registers are valid, cover the table it writes, match the catalog's primary key and columns, and include every model its statements are marked for. `ormtest.Reference`, a hand-written repository over `data.Querier`, passes it (taking its handle explicitly or from ctx), and the suite's own tests show that adapters with a pool of their own, a connection per call, reads elsewhere, inline side effects, side effects on rollback or mismatched models fail it.
+
+**As built, and deferred:** `FilterApplier`, which turns an authorization `Filter` into a `WHERE` clause, waits for the security plane's `Filterer` and `Filter` (§8.3), which don't exist yet; there is no placeholder for it. No named ORM adapter ships yet: dpg's (`adapters/dpg`) is its own piece of work.
 
 ### 7.7 Migrations (J3, D12)
 

@@ -152,6 +152,10 @@ type App struct {
 	providerOrder []*provider
 	buildOrder    []*provider
 
+	collections     map[reflectType]*collection
+	collectionOrder []*collection
+	collected       bool // the collections are provided; Collect is closed
+
 	configRaw    map[string]json.RawMessage
 	configOwners map[string]string
 	configReport []ConfigValue
@@ -229,6 +233,7 @@ func New(opts ...Option) (*App, error) {
 		backend:      s.backend,
 		settings:     s,
 		providers:    map[reflectType]*provider{},
+		collections:  map[reflectType]*collection{},
 		configRaw:    map[string]json.RawMessage{},
 		configOwners: map[string]string{},
 		knownRoles:   map[Role]bool{},
@@ -278,6 +283,7 @@ func New(opts ...Option) (*App, error) {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q requires module %q, which is not installed (%s)", rq.module, rq.needs, rq.site))
 		}
 	}
+	a.provideCollections()
 	a.configureMigrations()
 	for section := range a.configRaw {
 		if _, ok := a.configOwners[section]; !ok {

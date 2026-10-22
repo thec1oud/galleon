@@ -73,6 +73,11 @@ func TestProxyForwardsRecordsAndCuts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(ctx)
+	// pgx may try more than once, as it does when TLS is preferred.
+	if n := p.Opened(); n < 1 {
+		t.Fatalf("the proxy counts %d connections opened", n)
+	}
+	opened := p.Opened()
 	p.Reset()
 	if _, err := conn.Exec(ctx, "SELECT 1"); err != nil {
 		t.Fatal(err)
@@ -87,12 +92,20 @@ func TestProxyForwardsRecordsAndCuts(t *testing.T) {
 	if _, err := pgx.Connect(ctx, p.DSN(db.DSN())); err == nil {
 		t.Fatal("a cut proxy let a connection through")
 	}
+	// pgx tries again on its own, so a refused connect may count more than once.
+	refused := p.Opened()
+	if refused <= opened {
+		t.Fatalf("the proxy counts %d connections opened, %d before the refused one", refused, opened)
+	}
 	p.Restore()
 	again, err := pgx.Connect(ctx, p.DSN(db.DSN()))
 	if err != nil {
 		t.Fatalf("after Restore: %v", err)
 	}
 	again.Close(ctx)
+	if n := p.Opened(); n <= refused {
+		t.Fatalf("the proxy counts %d connections opened, %d before the last", n, refused)
+	}
 }
 
 func TestProxyDSNsPointAtTheProxyInEitherForm(t *testing.T) {
