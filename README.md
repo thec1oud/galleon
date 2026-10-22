@@ -61,7 +61,7 @@ func (g *Greeter) Greet(name string) string { return fmt.Sprintf("%s, %s!", g.gr
 
 ## Documentation
 
-The docs are in [`site`](site), and every code sample in them is tested in CI.
+The docs are in [`site`](site), and every Go sample in them is tested in CI.
 
 - [Learn](site/app/docs/learn/page.mdx): build a service from zero, one chapter at a time.
 - [Guides](site/app/docs/guides/page.mdx): get a specific job done.

@@ -43,7 +43,7 @@ const stale: string[] = [];
 for (const page of [...pages(PAGES), README]) {
   const rel = path.relative(SITE, page);
   const before = readFileSync(page, "utf8");
-  const after = syncSamples(before, read, rel);
+  const after = syncSamples(before, read, rel, page === README ? "md" : "mdx");
   // A CRLF checkout (Git's core.autocrlf on Windows) isn't out of date.
   if (after === before.replace(/\r\n/g, "\n")) continue;
   stale.push(rel);

@@ -92,9 +92,11 @@ Within a request, read-your-writes tracks the WAL position of each write the req
 
 Galleon owns the transaction; an ORM, query builder or repository joins it. It takes the handle it is given, or the one in `ctx` with `data.QuerierFrom` or `data.ReaderFrom`. It never opens a connection or picks a host of its own. It fires side effects with `data.AfterCommit`, so they never run for a change that rolls back. `testkit/conformance/ormtest` checks an adapter against these rules.
 
+An adapter's module describes the models it stores, with `galleon.Collect(r, data.ModelInfo{...})`, and the data module builds the registry, `*data.Models`, from them. An invalid model fails `galleon.New`, and two models with the same name or table fail `Start`. A statement run with a ctx from `data.ForModel(ctx, name)` gets a span naming the model, and its table when the model is registered.
+
 ## Not built yet
 
-`Snapshot` reads, sharing lag readings through coordination, replicas of named sources, a cookie for the causal token, and `WAIT FOR LSN` on PostgreSQL 19.
+`Snapshot` reads, sharing lag readings through coordination, replicas of named sources, a cookie for the causal token, and `WAIT FOR LSN` on PostgreSQL 19. For ORMs, `FilterApplier`, which waits for the security plane, and any adapter for a named ORM.
 
 ## Why it is built this way
 

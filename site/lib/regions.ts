@@ -75,17 +75,19 @@ function dedent(lines: string[]): string[] {
 /**
  * Rewrites the body of every fenced code block in `page` (MDX) whose info
  * string names a `file=PATH[#REGION]`, using `read(PATH)` for the file's
- * contents. The page is parsed as MDX, so only real code blocks count: an
- * example of the syntax inside a longer fence is left alone. Line endings
- * become LF.
+ * contents. The page is parsed as MDX, or as plain Markdown with format
+ * "md" (as GitHub reads a README, with HTML comments and tags), so only real
+ * code blocks count: an example of the syntax inside a longer fence is left
+ * alone. Line endings become LF.
  */
-export function syncSamples(page: string, read: (path: string) => string, label = "page"): string {
+export function syncSamples(page: string, read: (path: string) => string, label = "page", format: "mdx" | "md" = "mdx"): string {
   const source = page.replace(/\r\n/g, "\n");
+  const mdx = format === "mdx";
   let tree: Root;
   try {
     tree = fromMarkdown(source, {
-      extensions: [mdxjs(), gfm(), frontmatter(["yaml"])],
-      mdastExtensions: [mdxFromMarkdown(), gfmFromMarkdown(), frontmatterFromMarkdown(["yaml"])],
+      extensions: [...(mdx ? [mdxjs()] : []), gfm(), frontmatter(["yaml"])],
+      mdastExtensions: [...(mdx ? [mdxFromMarkdown()] : []), gfmFromMarkdown(), frontmatterFromMarkdown(["yaml"])],
     });
   } catch (e) {
     throw new Error(`${label}: ${(e as Error).message}`);
