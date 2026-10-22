@@ -29,7 +29,7 @@ func config(primary, replica string) []byte {
 
 In production, `token_key` comes from a secret store, through the environment variable `<APP>_PG_TOKEN_KEY`. Every node sharing the database must share it.
 
-`max_lag` takes a replica out of rotation while it is that far behind; the default is two seconds. Durations in this section are numbers of nanoseconds in the file, so `60000000000` is one minute, and strings with a unit, such as `1m`, in the environment.
+`max_lag` takes a replica out of rotation while it is that far behind; the default is two seconds. The test raises it to a minute so that its paused replica stays in rotation. In production, keep the default or set a bound your reads can live with. Durations in this section are numbers of nanoseconds in the file, so `60000000000` is one minute, and strings with a unit, such as `1m`, in the environment.
 
 Each replica is polled in the background. One that can't be reached leaves rotation, and the app stays ready.
 
@@ -40,8 +40,8 @@ A read that begins a transaction can run on a replica, as its consistency allows
 | Level | Reads |
 |---|---|
 | `data.ReadYourWrites` (the default) | a replica that has every write this call, or the call whose token it brought, committed; else the primary |
-| `data.Any` | any replica in rotation |
-| `data.BoundedStaleness(d)` | a replica at most `d` behind |
+| `data.Any` | any replica in rotation; else the primary |
+| `data.BoundedStaleness(d)` | a replica at most `d` behind; else the primary |
 | `data.Primary` | always the primary |
 
 An operation declares the default for its reads with `Consistency`. Here `Get` keeps read-your-writes, and `Count` accepts a count a little behind:

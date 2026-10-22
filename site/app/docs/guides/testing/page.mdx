@@ -187,7 +187,7 @@ Without it, tests that need PostgreSQL skip. With `CI` set they fail instead, so
 
 To use the database from your app, pass `db.Module()` in place of `pg.Module()`. [A database](/docs/learn/database#test-against-a-real-database) in Learn does that.
 
-Because everything runs in one transaction, `testkit.DB` can't show what another connection sees. A test of migrations, or of replicas, needs committed data: use `testkit.PackageDSN` and clean up after the test, as [Deploy migrations safely](/docs/guides/migrations) does.
+Because everything runs in one transaction, `testkit.DB` can't show what another connection sees. A test of migrations, or of replicas, needs committed data: use `testkit.PackageDSN` (for replicas, `db.DSN()` and `db.Replica(t)`) and clean up after the test, as [Deploy migrations safely](/docs/guides/migrations) does.
 
 ## Test over HTTP
 
