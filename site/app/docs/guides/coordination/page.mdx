@@ -23,11 +23,12 @@ For an app that runs as several processes, there is no backend yet. Cluster back
 
 ## Declare what each module needs
 
-A module that relies on a capability declares it with `r.Needs`. This one sends a daily digest, and uses a lock so that only one node sends it at a time:
+A module that relies on a capability declares it with `r.Needs`. This one sends a daily digest, and uses a lock so that no two nodes send it at the same time:
 
 ```go file=examples/guides/coordination/digest.go#module title="digest.go"
 // Digest sends the daily digest. However many nodes run it, the lock lets
-// only one send at a time.
+// only one send at a time. It doesn't remember that the digest went out:
+// a node that calls Send after the lock is released sends it again.
 type Digest struct {
 	locks coord.Locker
 	log   *slog.Logger
@@ -58,6 +59,8 @@ func (d *Digest) Send(ctx context.Context) (bool, error) {
 	return true, nil
 }
 ```
+
+A lock only stops sends that overlap. To send the digest once a day, also record durably that today's went out, and check the record while holding the lock.
 
 On a single node, the lock works as it would across a cluster:
 
@@ -109,4 +112,4 @@ galleon: 1 boot problem(s):
   - the app runs as several processes (multi-node, or under a supervisor) but coordination backend "local" only guarantees within one process; use a cluster backend, or set galleon.AllowPerProcessGuarantees() to accept per-process guarantees
 ```
 
-`galleon.AllowPerProcessGuarantees()` boots anyway, and logs a warning for each guarantee that now holds per process only. With it, two nodes could each send the digest. Use it only where that is acceptable.
+`galleon.AllowPerProcessGuarantees()` boots anyway, and logs a warning for each guarantee that now holds per process only. With it, two nodes could send the digest at the same time. Use it only where that is acceptable.

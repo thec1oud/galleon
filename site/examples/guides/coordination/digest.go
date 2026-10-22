@@ -13,7 +13,8 @@ import (
 
 // docs:start module
 // Digest sends the daily digest. However many nodes run it, the lock lets
-// only one send at a time.
+// only one send at a time. It doesn't remember that the digest went out:
+// a node that calls Send after the lock is released sends it again.
 type Digest struct {
 	locks coord.Locker
 	log   *slog.Logger

@@ -192,6 +192,6 @@ export GALLEON_TEST_POSTGRES='postgres://postgres@localhost:5432/postgres?sslmod
 export GALLEON_TEST_POSTGRES_REPLICA='postgres://postgres@localhost:5433/postgres?sslmode=disable'
 ```
 
-`db.Replica(t)` returns the test's database on the replica, once replay has caught up. Tests that use it take turns, since pausing replay pauses it for everyone. Without the variable they skip, and with `CI` set they fail.
+`db.Replica(t)` returns the package's database on the replica, once replay has caught up. The test's own transaction, from `db.Manager()`, is rolled back and never reaches the replica: write through a connection to `db.DSN()`, as the sample's app does. Tests that use it take turns, since pausing replay pauses it for everyone. Without the variable they skip, and with `CI` set they fail.
 
 A replica only has committed data, so these tests commit, and clean up after themselves.

@@ -28,12 +28,18 @@ CREATE TABLE notes (
 );
 ```
 
-Building an index on a large table blocks writes unless it is built concurrently, which can't run in a transaction. Mark such a file `no-transaction`, keep it to one statement, and make it safe to repeat. If it fails half way, it is pending again:
+Building an index on a large table blocks writes unless it is built concurrently, which can't run in a transaction. Mark such a file `no-transaction`, and keep it to one statement:
 
 ```sql file=examples/guides/migrations/migrations/0002_index_notes_title.sql title="migrations/0002_index_notes_title.sql"
 -- galleon:risk caution
 -- galleon:no-transaction
 CREATE INDEX CONCURRENTLY IF NOT EXISTS notes_title ON notes (title);
+```
+
+If the statement fails part way, the file is pending again, and the next deploy runs it again. A concurrent build that fails leaves an invalid index behind, which `IF NOT EXISTS` then skips, so the retry succeeds without building anything. Before you retry, drop it with `DROP INDEX CONCURRENTLY IF EXISTS notes_title`, and check that the index is valid afterwards:
+
+```sql
+SELECT indisvalid FROM pg_index WHERE indexrelid = 'notes_title'::regclass;
 ```
 
 The migrator is registered as in Learn:
@@ -77,8 +83,8 @@ There is no `migrate plan` command yet. Until there is, `App.Migrations().Plan` 
 ```go file=examples/guides/migrations/notes.go#plan title="notes.go"
 // PrintPlan writes what applying would do to the database app is connected
 // to: each migrator's pending steps, their risks, and the fingerprint to
-// approve. It fails when a plan couldn't be made, or the policy would
-// refuse it, so CI stops there.
+// approve. It fails when a plan couldn't be made, the database's status
+// couldn't be read, or the policy would refuse the plan, so CI stops there.
 func PrintPlan(ctx context.Context, app *galleon.App, w io.Writer) error {
 	reports, err := app.Migrations().Plan(ctx, false)
 	if err != nil {
@@ -88,7 +94,7 @@ func PrintPlan(ctx context.Context, app *galleon.App, w io.Writer) error {
 		return err
 	}
 	for _, r := range reports {
-		if r.Err != nil || r.Refused != nil {
+		if r.Err != nil || r.StatusErr != nil || r.Refused != nil {
 			return fmt.Errorf("migrator %s can't be deployed as planned", r.Name)
 		}
 	}
@@ -96,7 +102,7 @@ func PrintPlan(ctx context.Context, app *galleon.App, w io.Writer) error {
 }
 ```
 
-Call it from a command your CI runs, on an app built with the production config, `pg.Module()` and the modules that own migrators. It prints:
+Call it from a command your CI runs, on an app built with the production config, `pg.Module()` and the modules that own migrators. Run it in verify mode, never with the deploy's `NOTES_MIGRATE_MODE=apply`: `Start` would apply everything before the plan is made. It prints:
 
 ```txt
 notes: 2 step(s), max risk caution, fingerprint aeba9062426a4f9383ab70aa950f722a0d21932b7d985e74de8bb7b938536772
@@ -230,7 +236,7 @@ func TestProductionRefusesADestructiveStep(t *testing.T) {
 }
 ```
 
-Drop a column only once no running build reads it: stop using it in one release, and drop it in a later one. Then raise the limit for that one deploy, beside its approval, and set it back afterwards:
+Drop a column only once no running build reads it: stop using it in one release, and drop it in a later one. Then raise the limit for that one change, both for the plan in CI and for the deploy beside its approval, and set it back afterwards:
 
 ```sh
 NOTES_MIGRATE_MAX_RISK=destructive
