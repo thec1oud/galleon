@@ -35,8 +35,9 @@ type Config struct {
 	// replica_2 and so on in order, and an optional Zone.
 	Replicas []Source `json:"replicas"`
 	// Select is how a read chooses among the replicas that qualify:
-	// LeastLag (the default), Random, RoundRobin, or Nearest, which
-	// prefers replicas in Zone and takes the least lagging of those.
+	// "least_lag" (LeastLag, the default), "random", "round_robin", or
+	// "nearest", which prefers replicas in Zone and takes the least
+	// lagging of those.
 	Select Selection `json:"select"`
 	// Zone is this node's zone, which Nearest compares with each
 	// replica's.

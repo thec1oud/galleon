@@ -40,12 +40,17 @@ import (
 // Config is the "http" config section.
 type Config struct {
 	// Addr is where to listen: "host:port", ":port", or "unix:/path".
-	Addr              string        `json:"addr"`
+	Addr string `json:"addr"`
+	// ReadHeaderTimeout, ReadTimeout, WriteTimeout and IdleTimeout are
+	// those of net/http.Server: how long a client may take to send the
+	// request's headers, to send the whole request, and to read the
+	// response, and how long an idle keep-alive connection stays open.
 	ReadHeaderTimeout time.Duration `json:"read_header_timeout"`
 	ReadTimeout       time.Duration `json:"read_timeout"`
 	WriteTimeout      time.Duration `json:"write_timeout"`
 	IdleTimeout       time.Duration `json:"idle_timeout"`
-	MaxHeaderBytes    int           `json:"max_header_bytes"`
+	// MaxHeaderBytes bounds the size of a request's headers.
+	MaxHeaderBytes int `json:"max_header_bytes"`
 	// BodyLimit applies to operations that don't set their own.
 	BodyLimit int64 `json:"body_limit"`
 	// H2C accepts HTTP/2 without TLS, which gRPC clients use inside a cluster.
