@@ -1,0 +1,5 @@
+kind = "database"
+
+[database]
+name = "app"
+default_schema = "public"

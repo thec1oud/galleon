@@ -1,0 +1,61 @@
+{
+  "format": "1",
+  "id": "20261021T191539Z-f30d35f6b160",
+  "parent": "20261021T191539Z-55dc2499e3f0",
+  "checksum": "sha256:b85c0826dde649068d839c8065f6541cd11f6244333a25209684c490e4262b81",
+  "steps": [
+    {
+      "sql": "DO $dpg$\nDECLARE\n  r record;\n  sp text;\n  fp text;\n  fp_oid oid;\nBEGIN\n  IF coalesce(current_setting('dpg.allow_drift', true), '') = 'on' THEN\n    RETURN;\n  END IF;\n  SELECT fingerprint, pg_major INTO r FROM \"dpg\".objects WHERE log = 'app' AND kind = 'table' AND key = 'public.a';\n  IF NOT FOUND THEN\n    RAISE EXCEPTION 'DPG-E054: DPG has no record of table public.a in this database: dpg verify (connected) records it when it has no drift, or SET dpg.allow_drift = on runs the migration anyway';\n  END IF;\n  IF r.pg_major \u003c\u003e current_setting('server_version_num')::int / 10000 THEN\n    RAISE EXCEPTION 'DPG-E054: the record of table public.a was taken on PostgreSQL %: dpg verify (connected) records it again', r.pg_major;\n  END IF;\n  sp := current_setting('search_path');\n  PERFORM set_config('search_path', 'pg_catalog', true);\n  fp := (SELECT md5(concat_ws(E'\\n', concat_ws('|', c.relkind, c.relpersistence, pg_get_userbyid(c.relowner), c.relacl::text,\n\t\t\t\tc.relrowsecurity, c.relforcerowsecurity, array_to_string(c.reloptions, ','),\n\t\t\t\tobj_description(c.oid, 'pg_class'), c.relreplident,\n\t\t\t\t(SELECT t.spcname FROM pg_tablespace t WHERE t.oid = c.reltablespace),\n\t\t\t\tCASE WHEN c.relkind IN ('p') THEN pg_get_partkeydef(c.oid) END,\n\t\t\t\tCASE WHEN c.relispartition THEN pg_get_expr(c.relpartbound, c.oid) END,\n\t\t\t\tCASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid) END,\n\t\t\t\t(SELECT a.amname FROM pg_am a WHERE a.oid = c.relam),\n\t\t\t\t(SELECT string_agg(i.inhparent::regclass::text, ',' ORDER BY i.inhseqno) FROM pg_inherits i WHERE i.inhrelid = c.oid)),\n\t\t(SELECT string_agg(concat_ws('|', a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,\n\t\t\t\tpg_get_expr(d.adbin, d.adrelid), a.attidentity, a.attgenerated, a.attacl::text,\n\t\t\t\tcol_description(c.oid, a.attnum), a.attstorage, a.attcompression,\n\t\t\t\t(SELECT co.collname FROM pg_collation co WHERE co.oid = a.attcollation AND a.attcollation \u003c\u003e 0 AND co.collname \u003c\u003e 'default'),\n\t\t\t\tarray_to_string(a.attoptions, ','), array_to_string(a.attfdwoptions, ',')), E'\\n' ORDER BY a.attnum)\n\t\t\tFROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum\n\t\t\tWHERE a.attrelid = c.oid AND a.attnum \u003e 0 AND NOT a.attisdropped),\n\t\t(SELECT string_agg(concat_ws('|', k.conname, pg_get_constraintdef(k.oid), obj_description(k.oid, 'pg_constraint')), E'\\n' ORDER BY k.conname)\n\t\t\tFROM pg_constraint k WHERE k.conrelid = c.oid),\n\t\t(SELECT string_agg(concat_ws('|', pg_get_indexdef(i.indexrelid), obj_description(i.indexrelid, 'pg_class')), E'\\n' ORDER BY 1)\n\t\t\tFROM pg_index i WHERE i.indrelid = c.oid),\n\t\t(SELECT string_agg(concat_ws('|', t.tgname, pg_get_triggerdef(t.oid), t.tgenabled, obj_description(t.oid, 'pg_trigger')), E'\\n' ORDER BY t.tgname)\n\t\t\tFROM pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal),\n\t\t(SELECT string_agg(concat_ws('|', p.polname, p.polcmd, p.polpermissive, p.polroles::regrole[]::text,\n\t\t\t\tpg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid)), E'\\n' ORDER BY p.polname)\n\t\t\tFROM pg_policy p WHERE p.polrelid = c.oid),\n\t\t(SELECT concat_ws('|', format_type(s.seqtypid, NULL), s.seqstart, s.seqincrement, s.seqmax, s.seqmin, s.seqcache, s.seqcycle)\n\t\t\tFROM pg_sequence s WHERE s.seqrelid = c.oid),\n\t\t(SELECT string_agg(d.refobjid::regclass::text || '.' || a.attname, ',' ORDER BY 1)\n\t\t\tFROM pg_depend d JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid\n\t\t\tWHERE c.relkind = 'S' AND d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype IN ('a', 'i'))))\n\tFROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n\tWHERE n.nspname = 'public' AND c.relname = 'a');\n  PERFORM set_config('search_path', sp, true);\n  IF fp IS DISTINCT FROM r.fingerprint THEN\n    RAISE EXCEPTION 'DPG-E055: table public.a changed since DPG last saw it: dpg verify shows how';\n  END IF;\nEND\n$dpg$;",
+      "safety": "SAFE",
+      "stage": "check"
+    },
+    {
+      "sql": "ALTER TABLE \"public\".\"a\" ADD COLUMN \"note\" text;",
+      "safety": "SAFE",
+      "stage": "transaction",
+      "target": {
+        "Kind": "table",
+        "Key": "public.a",
+        "Effect": 0,
+        "From": ""
+      }
+    }
+  ],
+  "steps_checksum": "sha256:defd6cb3c85d77e6e2bc6d323f5e87441e83545a23de134391a0b596eac6b6c2",
+  "snapshot": "sha256:79a3cdfe4baf2d61b1298548d41684d8e93147719b767590d84c95ced790c637",
+  "origin": "record",
+  "set": {
+    "public.a": {
+      "kind": "table",
+      "table": {
+        "columns": [
+          {
+            "name": "id",
+            "not_null": true,
+            "type": "integer"
+          },
+          {
+            "name": "note",
+            "type": "text"
+          }
+        ],
+        "constraints": [
+          {
+            "expr": "PRIMARY KEY (\"id\")",
+            "name": "",
+            "type": "PRIMARY KEY"
+          }
+        ],
+        "indexes": [
+          {
+            "columns": "id DESC",
+            "method": "btree",
+            "name": "a_id_desc"
+          }
+        ],
+        "name": "a",
+        "schema": "public"
+      }
+    }
+  }
+}

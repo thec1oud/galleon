@@ -1,0 +1,4 @@
+kind = "cluster"
+
+[cluster]
+name = "c"

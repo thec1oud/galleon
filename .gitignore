@@ -4,3 +4,6 @@
 coverage.*
 .idea/
 .vscode/
+
+# A local dpg checkout, linked by adapters/dpg/scripts/link-dpg.sh.
+/.dpg

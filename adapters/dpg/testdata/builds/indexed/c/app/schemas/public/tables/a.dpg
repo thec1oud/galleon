@@ -1,0 +1,1 @@
+TABLE a (id int PRIMARY KEY) { INDEXES { CONCURRENTLY a_id_desc (id DESC); } }
