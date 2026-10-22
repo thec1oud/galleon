@@ -71,7 +71,7 @@ func TestEverySectionIsFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{"client": true, "http": true, "migrate": true, "pg": true}
+	want := map[string]bool{"client": true, "coord_pg": true, "http": true, "migrate": true, "pg": true}
 	for _, s := range sections {
 		if !want[s.Name] {
 			t.Errorf("unexpected section %q: add it to Defaults, or to this test if it has no defaults", s.Name)
@@ -309,4 +309,57 @@ func TestDefaultOf(t *testing.T) {
 			t.Errorf("defaultOf(%v) = %q, want %q", tc.index, got, tc.want)
 		}
 	}
+}
+
+// Every module of the workspace but the site's is read, the core first,
+// and each code and section is listed under its module.
+func TestEveryWorkspaceModuleIsRead(t *testing.T) {
+	s, err := load(filepath.Join("testdata", "workspace", "core"), "GOWORK="+mustAbs(t, "testdata/workspace/go.work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{Module, Module + "/extra"}; !reflect.DeepEqual(s.modules, want) {
+		t.Fatalf("modules = %v, want %v", s.modules, want)
+	}
+	codes, err := s.codes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Code{}
+	for _, c := range codes {
+		got[c.Code] = c
+	}
+	if c := got["core.missing"]; c.Module != Module || !reflect.DeepEqual(c.Packages, []string{"", "extra"}) {
+		t.Errorf("core.missing: module %q, packages %v", c.Module, c.Packages)
+	}
+	if c := got["extra.busy"]; c.Module != Module+"/extra" || c.Doc != "the extra module is busy." {
+		t.Errorf("extra.busy: %+v", c)
+	}
+	if _, ok := got["site.left_out"]; ok || len(got) != 2 {
+		t.Errorf("codes = %v: the site's must be left out", codes)
+	}
+	sections, err := s.sections()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sections) != 1 || sections[0].Module != Module+"/extra" || sections[0].Package != "extra" {
+		t.Fatalf("sections = %+v", sections)
+	}
+	page, err := renderErrors(s.modules, []string{"Internal", "InvalidArgument", "Unauthenticated", "PermissionDenied", "NotFound", "Conflict"}, codes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, extra := strings.Index(page, "\n## Core\n"), strings.Index(page, "\n## extra\n")
+	if core < 0 || extra < core || !strings.Contains(page[extra:], "`extra.busy`") || strings.Contains(page[extra:], "`core.missing`") {
+		t.Errorf("the errors page doesn't list each module's codes under it:\n%s", page)
+	}
+}
+
+func mustAbs(t *testing.T, p string) string {
+	t.Helper()
+	a, err := filepath.Abs(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
 }

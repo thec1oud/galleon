@@ -15,7 +15,8 @@ import (
 // A Code is one error catalog code.
 type Code struct {
 	Code     string
-	Packages []string // the packages that return it, relative to the module
+	Module   string   // the module it is listed under
+	Packages []string // the packages that return it, relative to the core module
 	Kinds    []string // the kinds it is returned with
 	Doc      string   // the doc comment of its constant, if it has one
 	Note     string   // the comment at the end of its constant's line
@@ -370,6 +371,12 @@ func (sc *scanner) scan(record bool) {
 // record notes that c is returned with kind by package pkgPath, with the
 // message msg, unless that is "".
 func (sc *scanner) record(c *Code, kind, pkgPath, msg string) {
+	// A code is listed under the first module, in the pages' order, that
+	// returns it: testkit's fakes return the core's codes, which stay the
+	// core's.
+	if mod := sc.s.moduleOf(pkgPath); c.Module == "" || slices.Index(sc.s.modules, mod) < slices.Index(sc.s.modules, c.Module) {
+		c.Module = mod
+	}
 	if kind != "" && !slices.Contains(c.Kinds, kind) {
 		c.Kinds = append(c.Kinds, kind)
 	}

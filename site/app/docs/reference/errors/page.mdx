@@ -1,6 +1,6 @@
 ---
 title: "Errors"
-description: "Every error kind, and every error code Galleon's core module returns."
+description: "Every error kind, and every error code Galleon's modules return."
 order: 1
 ---
 
@@ -29,25 +29,31 @@ The problem+json `type` of an HTTP error is `urn:galleon:problem:` followed by i
 | `Unavailable` | `unavailable` | 503 | 14 |
 | `Unimplemented` | `unimplemented` | 501 | 12 |
 
-## Codes
-
-A code is `<module>.<name>`. Codes are stable, so clients may switch on them. These are the codes of Galleon's core module. Adapters, such as `adapters/dpg`, have their own.
+A code is `<module>.<name>`. Codes are stable, so clients may switch on them. Each module's codes are listed under it: the core's, then those of the modules beside it in this repository. Adapters outside the workspace, such as `adapters/dpg`, have their own.
 
 A code comes with the kind shown, and a few with more than one. The HTTP status is its kind's, except where the table gives the one its HTTP routes send; gRPC always uses the kind's code. The messages are those it is returned with, where … stands for a value filled in.
 
+Codes that come with the `Internal` kind alone are listed apart. They are logged and seen by Go callers, but clients never see them: an HTTP or gRPC response carries `galleon.internal` and the message "internal error" instead.
+
+## Core
+
+Module `github.com/thec1oud/galleon`.
+
+### Codes
+
 | Code | Kind | HTTP | Package | Meaning |
 |---|---|---|---|---|
-| `data.check_violation` | `FailedPrecondition` |  | `pg` | The change breaks a check constraint. SQLSTATE 23514. Message: “the change breaks a rule of the data”. |
-| `data.consistency_timeout` | `Unavailable` |  | `pg` | A ReadYourWrites read with OrFail found no replica caught up with its causal floor within its wait. Retryable. Message: “no replica caught up with the data this request depends on in time; retry”. |
+| `data.check_violation` | `FailedPrecondition` |  | `pg`, `testkit/conformance/datatest` | The change breaks a check constraint. SQLSTATE 23514. Message: “the change breaks a rule of the data”. |
+| `data.consistency_timeout` | `Unavailable` |  | `pg`, `testkit/conformance/datatest` | A ReadYourWrites read with OrFail found no replica caught up with its causal floor within its wait. Retryable. Message: “no replica caught up with the data this request depends on in time; retry”. |
 | `data.deadlock` | `Conflict` |  | `pg` | The transaction deadlocked with another, and the database aborted it; rerunning it can succeed. Retryable. SQLSTATE 40P01. Message: “the change conflicted with another one; retry it”. |
-| `data.exclusion_violation` | `Conflict` |  | `pg` | The data overlaps data an exclusion constraint keeps apart. SQLSTATE 23P01. Message: “the data conflicts with existing data”. |
-| `data.foreign_key_violation` | `FailedPrecondition` |  | `pg` | The change refers to a row that doesn't exist, or removes one still referred to. SQLSTATE 23503. Message: “the change refers to data that doesn't exist, or removes data still referred to”. |
-| `data.lock_not_available` | `Conflict` |  | `pg` | A lock wasn't granted within lock\_timeout, or NOWAIT. SQLSTATE 55P03. Message: “the data is locked by another change”. |
-| `data.not_null_violation` | `FailedPrecondition` |  | `pg` | The change leaves a required column empty. SQLSTATE 23502. Message: “a required value is missing”. |
-| `data.serialization_failure` | `Conflict` |  | `pg` | The transaction conflicted with a concurrent one under serializable isolation; rerunning it can succeed. Retryable. SQLSTATE 40001. Message: “the change conflicted with another one; retry it”. |
-| `data.statement_timeout` | `DeadlineExceeded` |  | `pg` | statement\_timeout canceled the statement. SQLSTATE 57014. Message: “the request took too long”. |
-| `data.unavailable` | `Unavailable` |  | `pg` | The database can't be reached, or refused the session. Message: “the database is unavailable”. |
-| `data.unique_violation` | `Conflict` |  | `pg` | The data already exists, by a unique constraint. SQLSTATE 23505. Message: “the data already exists”. |
+| `data.exclusion_violation` | `Conflict` |  | `pg`, `testkit/conformance/datatest` | The data overlaps data an exclusion constraint keeps apart. SQLSTATE 23P01. Message: “the data conflicts with existing data”. |
+| `data.foreign_key_violation` | `FailedPrecondition` |  | `pg`, `testkit/conformance/datatest` | The change refers to a row that doesn't exist, or removes one still referred to. SQLSTATE 23503. Message: “the change refers to data that doesn't exist, or removes data still referred to”. |
+| `data.lock_not_available` | `Conflict` |  | `pg`, `testkit/conformance/datatest` | A lock wasn't granted within lock\_timeout, or NOWAIT. SQLSTATE 55P03. Message: “the data is locked by another change”. |
+| `data.not_null_violation` | `FailedPrecondition` |  | `pg`, `testkit/conformance/datatest` | The change leaves a required column empty. SQLSTATE 23502. Message: “a required value is missing”. |
+| `data.serialization_failure` | `Conflict` |  | `pg`, `testkit/conformance/datatest` | The transaction conflicted with a concurrent one under serializable isolation; rerunning it can succeed. Retryable. SQLSTATE 40001. Message: “the change conflicted with another one; retry it”. |
+| `data.statement_timeout` | `DeadlineExceeded` |  | `pg`, `testkit/conformance/datatest` | statement\_timeout canceled the statement. SQLSTATE 57014. Message: “the request took too long”. |
+| `data.unavailable` | `Unavailable` |  | `pg`, `testkit/conformance/datatest` | The database can't be reached, or refused the session. Message: “the database is unavailable”. |
+| `data.unique_violation` | `Conflict` |  | `pg`, `testkit/conformance/datatest` | The data already exists, by a unique constraint. SQLSTATE 23505. Message: “the data already exists”. |
 | `galleon.body_read` | `Canceled`, `InvalidArgument`, `Unavailable` |  | `codec`, `server` | Message: “reading the request body was canceled”; “the request body could not be read”; “the request body is malformed”. |
 | `galleon.body_too_large` | `InvalidArgument` |  | `codec`, `server` | Message: “the request body is too large”. |
 | `galleon.canceled` | `Canceled` |  | `client`, `errs`, `pg` | Message: “the request was canceled”. |
@@ -65,30 +71,28 @@ A code comes with the kind shown, and a few with more than one. The HTTP status 
 | `galleon.unsupported_media_type` | `InvalidArgument` | 415 | `server` | Message: “the request body's media type is not supported”; “the operation doesn't accept the … format”. |
 | `galleon.upstream_timeout` | `DeadlineExceeded` |  | `client` | An upstream call outlasted the caller's deadline. |
 | `galleon.upstream_unavailable` | `Unavailable` |  | `client` | Message: “the upstream service could not be reached”; “the upstream response could not be read”. |
-| `migrate.fingerprint_mismatch` | `FailedPrecondition` |  | `migrate`, `pg/sqlmigrate` | The plan isn't the one approved for the deploy, so nothing was applied. Message: “migrator …: …, but its plan is empty, so it can't be checked against the approved fingerprint …; nothing was applied”; “migrator …: the plan's fingerprint is …, but … was approved; review the new plan and approve it”; “sqlmigrate: migrator …: the pending plan's fingerprint is …, not … as approved; nothing was applied”. |
+| `migrate.fingerprint_mismatch` | `FailedPrecondition` |  | `migrate`, `pg/sqlmigrate`, `testkit`, `testkit/conformance/migratetest` | The plan isn't the one approved for the deploy, so nothing was applied. Message: “migrator …: …, but its plan is empty, so it can't be checked against the approved fingerprint …; nothing was applied”; “migrator …: the plan's fingerprint is …, but … was approved; review the new plan and approve it”; “sqlmigrate: migrator …: the pending plan's fingerprint is …, not … as approved; nothing was applied”; “the plan isn't the approved one”. |
 | `migrate.lease_lost` | `Unavailable` |  | `migrate` | The node lost the migration lease, so its apply stopped. Message: “the migration lease was lost”; “the migration lease was lost during the apply, which was cancelled”. |
 | `migrate.not_ready` | `Unavailable` |  | `galleon`, `migrate` | A migrator's database isn't in a state this build may take traffic in: changes are pending, it is ahead or has drifted, or its status couldn't be read. Message: “migrator …: the database is ahead of this build (database …, build …)…; tolerate it during a rolling deploy with tolerate\_ahead”; “migrator …: changes are pending (database …, build …)…; apply them with mode apply or migrate apply”; “migrator …: the database has drifted from this build (database …, build …)…”; “migrator …: status reports no state”; “migrator …: reading its status failed”. |
 | `migrate.not_supported` | `FailedPrecondition`, `Unimplemented` |  | `galleon`, `migrate` | The migrator can't do what was asked of it, such as planning. Message: “plan offline: migrator … can't plan without a database”; “plan: migrator … can't plan”; “migrator … can't plan, so no plan fingerprint can be approved for it; remove its approval”; “done: migrator … can't say whether a task is done”; “the app has no migrators, or hasn't started”. |
-| `migrate.risk_refused` | `FailedPrecondition` |  | `migrate`, `pg/sqlmigrate` | The plan has a step riskier than the policy's MaxRisk, or of unknown risk without AllowUnknown, so nothing was applied. Message: “migrator …: …, but its plan is empty, so what it would apply is of unknown risk, which needs approval (allow\_unknown); nothing was applied”; “migrator …: the policy refuses …, since …; nothing was applied”; “migrator … can't plan, and the policy refuses changes of unknown risk without approval (allow\_unknown); nothing was applied”; “sqlmigrate: migrator …: … is of … risk, which isn't allowed (max …, unknown …); nothing was applied”. |
+| `migrate.risk_refused` | `FailedPrecondition` |  | `migrate`, `pg/sqlmigrate`, `testkit` | The plan has a step riskier than the policy's MaxRisk, or of unknown risk without AllowUnknown, so nothing was applied. Message: “migrator …: …, but its plan is empty, so what it would apply is of unknown risk, which needs approval (allow\_unknown); nothing was applied”; “migrator …: the policy refuses …, since …; nothing was applied”; “migrator … can't plan, and the policy refuses changes of unknown risk without approval (allow\_unknown); nothing was applied”; “sqlmigrate: migrator …: … is of … risk, which isn't allowed (max …, unknown …); nothing was applied”; “step … is of … risk”. |
 | `migrate.unknown_migrator` | `NotFound` |  | `migrate` | No migrator has the name asked for. Message: “no migrator is named …”. |
 | `sqlmigrate.no_lock` | `FailedPrecondition` |  | `pg/sqlmigrate` | Apply was called without a lease. Message: “sqlmigrate: migrator … never applies without a lease”. |
 | `sqlmigrate.not_pending` | `FailedPrecondition` |  | `pg/sqlmigrate` | The database isn't Pending, so there's nothing Apply may do. Message: “sqlmigrate: migrator … is …, so there's nothing it may apply: …”. |
 | `sqlmigrate.stale_epoch` | `FailedPrecondition` |  | `pg/sqlmigrate` | A holder of a later coordination epoch has applied since this lease was granted. Message: “sqlmigrate: migrator …: the lease's epoch … is stale: a holder of epoch … has applied since”. |
 | `sqlmigrate.stale_token` | `FailedPrecondition` |  | `pg/sqlmigrate` | A holder with a higher fencing token has applied since this lease was granted. Message: “sqlmigrate: migrator …: the lease's fencing token … is stale: a holder of token … in its epoch has applied since”. |
 
-## Internal codes
-
-These codes come with the `Internal` kind. They are logged and seen by Go callers, but clients never see them: an HTTP or gRPC response carries `galleon.internal` and the message "internal error" instead.
+### Internal codes
 
 | Code | Package | Meaning |
 |---|---|---|
-| `data.cross_source` | `pg` | A transaction tried to join one on another source, which would need two-phase commit. Message: “the transaction in ctx belongs to another data.Manager, and joining it would need two-phase commit”; “a transaction on source … can't join one on …: there is no two-phase commit”. |
-| `data.invalid_consistency` | `pg` | A read asked for a consistency level that fails Level.Validate, in its options or its ctx. The level is the server's choice, not the client's, so it is a bug. |
-| `data.propagation` | `data`, `pg` | A transaction's propagation or isolation can't be honored, such as Mandatory without a transaction, Never within one, or a write joining a read. Message: “data.AfterCommit needs a callback”; “data.AfterCommit needs a write transaction in ctx; without one there is no commit to run the callback after”; “data.Retry applies to the Read and Write closures; a pair never retries (use data.Retry(p).Do to rerun one)”; “unknown isolation level …”; “data.Mandatory needs an enclosing transaction, and ctx has none”; “data.Independent can't run inside a transaction of a Within manager, which has one connection”; “data.Never refuses to run inside a transaction, and ctx has one”; “unknown propagation …”; “a write transaction can't join or nest in a read transaction; use data.Independent for a separate one”; “the isolation level of the transaction in ctx can't be read, so a transaction with an explicit one can't join it”; “a … transaction can't join one begun with isolation …”. |
-| `data.rollback_only` | `pg` | A transaction that joined this one rolled back, so the commit rolled back instead. Message: “a transaction that joined this one rolled back, so it was rolled back instead of committed”. |
-| `data.tx_ended` | `data`, `pg` | A transaction handle was used after Commit or Rollback. Message: “data.AfterCommit was called with a handle that has ended; register with the handle of the transaction still open around it”; “the transaction handle was used after it ended”; “the transaction in ctx has ended”; “Commit called twice”; “Commit called after Rollback”. |
-| `data.tx_leaked` | `pg` | A transaction was still open when its operation ended. Message: “a transaction was left open”. |
-| `data.tx_open` | `pg` | A nested transaction was still open at commit. Message: “a Within manager runs one root transaction at a time, and the open one didn't end within …; it began at: …”; “Commit called while a nested transaction was still open; rolled back instead”. |
+| `data.cross_source` | `pg`, `testkit/conformance/datatest` | A transaction tried to join one on another source, which would need two-phase commit. Message: “the transaction in ctx belongs to another data.Manager, and joining it would need two-phase commit”; “a transaction on source … can't join one on …: there is no two-phase commit”. |
+| `data.invalid_consistency` | `pg`, `testkit/conformance/datatest` | A read asked for a consistency level that fails Level.Validate, in its options or its ctx. The level is the server's choice, not the client's, so it is a bug. |
+| `data.propagation` | `data`, `pg`, `testkit/conformance/datatest`, `testkit/conformance/ormtest` | A transaction's propagation or isolation can't be honored, such as Mandatory without a transaction, Never within one, or a write joining a read. Message: “data.AfterCommit needs a callback”; “data.AfterCommit needs a write transaction in ctx; without one there is no commit to run the callback after”; “data.Retry applies to the Read and Write closures; a pair never retries (use data.Retry(p).Do to rerun one)”; “unknown isolation level …”; “data.Mandatory needs an enclosing transaction, and ctx has none”; “data.Independent can't run inside a transaction of a Within manager, which has one connection”; “data.Never refuses to run inside a transaction, and ctx has one”; “unknown propagation …”; “a write transaction can't join or nest in a read transaction; use data.Independent for a separate one”; “the isolation level of the transaction in ctx can't be read, so a transaction with an explicit one can't join it”; “a … transaction can't join one begun with isolation …”; “no transaction in ctx to run the statement in”. |
+| `data.rollback_only` | `pg`, `testkit/conformance/datatest` | A transaction that joined this one rolled back, so the commit rolled back instead. Message: “a transaction that joined this one rolled back, so it was rolled back instead of committed”. |
+| `data.tx_ended` | `data`, `pg`, `testkit/conformance/datatest` | A transaction handle was used after Commit or Rollback. Message: “data.AfterCommit was called with a handle that has ended; register with the handle of the transaction still open around it”; “the transaction handle was used after it ended”; “the transaction in ctx has ended”; “Commit called twice”; “Commit called after Rollback”. |
+| `data.tx_leaked` | `pg`, `testkit/conformance/datatest` | A transaction was still open when its operation ended. Message: “a transaction was left open”. |
+| `data.tx_open` | `pg`, `testkit/conformance/datatest` | A nested transaction was still open at commit. Message: “a Within manager runs one root transaction at a time, and the open one didn't end within …; it began at: …”; “Commit called while a nested transaction was still open; rolled back instead”. |
 | `data.unknown_source` | `pg` | No data source has the name asked for. Message: “no data source is named …”. |
 | `galleon.bad_request` | `client` | The client couldn't build the HTTP request for an upstream call. |
 | `galleon.encode_failed` | `client`, `server` | A body couldn't be encoded: the client's request to an upstream, or the server's response. |
@@ -97,3 +101,31 @@ These codes come with the `Internal` kind. They are logged and seen by Go caller
 | `galleon.upstream_invalid` | `client` | Message: “the upstream response is not the expected JSON”. |
 | `galleon.upstream_too_large` | `client` | Message: “the upstream response is over … bytes”. |
 | `galleon.wrong_input` | `galleon` | Message: “operation … takes a non-nil …, not …”. |
+
+## coord-pg
+
+Module `github.com/thec1oud/galleon/coord-pg`.
+
+### Codes
+
+| Code | Kind | HTTP | Package | Meaning |
+|---|---|---|---|---|
+| `coord_pg.invalid_argument` | `InvalidArgument` |  | `coord-pg` | A lease's TTL under 1ms, a key's TTL below zero, a counter's window under 1µs, or a topic that isn't valid UTF-8 without NUL bytes. Message: “a key's ttl must not be negative”; “a counter's window must be at least 1µs”; “a lease's ttl must be at least 1ms”; “a topic must be valid UTF-8 without NUL bytes”. |
+| `coord_pg.message_too_large` | `InvalidArgument` |  | `coord-pg` | A published message's topic and base64-encoded data don't fit a NOTIFY payload. Message: “a message on topic … is … bytes encoded, over the … a NOTIFY payload takes”. |
+| `coord_pg.no_database` | `FailedPrecondition` |  | `coord-pg` | The backend was started with neither a pool (UsePool) nor a DSN. Message: “the coordination backend has no database: give it a pool or a DSN”; “the coordination backend's DSN can't be used”. |
+| `coord_pg.not_started` | `FailedPrecondition` |  | `coord-pg` | The backend was used before Start. Message: “the coordination backend hasn't started”. |
+| `coord_pg.schema_newer` | `FailedPrecondition` |  | `coord-pg` | The schema was created by a newer version of coord-pg than this node's. Message: “schema … is at version …, newer than this node's …: upgrade the node”. |
+| `coord_pg.unavailable` | `Unavailable` |  | `coord-pg` | The coordination database couldn't be reached, or failed a statement. Retryable. Message: “the coordination database failed”. |
+
+## testkit
+
+Module `github.com/thec1oud/galleon/testkit`.
+
+### Codes
+
+| Code | Kind | HTTP | Package | Meaning |
+|---|---|---|---|---|
+| `testkit.no_lock` | `FailedPrecondition` |  | `testkit` | Message: “a fake migrator never applies without a lease”. |
+| `testkit.not_pending` | `FailedPrecondition` |  | `testkit` | Message: “the store has drifted or is ahead”. |
+| `testkit.stale_epoch` | `FailedPrecondition` |  | `testkit` | Message: “epoch … was superseded by …”. |
+| `testkit.stale_token` | `FailedPrecondition` |  | `testkit` | Message: “fencing token … is below … in epoch …”. |

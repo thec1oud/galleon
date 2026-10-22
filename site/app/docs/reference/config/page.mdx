@@ -14,7 +14,13 @@ A key marked **env** can also be set with the environment variable `<APP>_<SECTI
 
 A `time.Duration` key is a number of nanoseconds in the file, as `encoding/json` reads it, and a string with a unit, such as `30s`, in the environment. The `migrate` section's durations are strings with a unit in both. Defaults are shown with a unit. A blank default is the type's zero value: empty, `false` or `0`.
 
-## client
+Sections are listed under the module that reads them: the core's, then those of the modules beside it in this repository.
+
+## Core
+
+Module `github.com/thec1oud/galleon`.
+
+### client
 
 Read by package `client`.
 
@@ -34,7 +40,7 @@ Read by package `client`.
 | `allow_private` **env** | `bool` |  | AllowNetworks are CIDRs the egress guard lets through, such as an internal service's range. AllowPrivate turns the guard off. |
 | `max_response_bytes` **env** | `int64` | `10485760` | MaxResponseBytes bounds a response body Send decodes. |
 
-## http
+### http
 
 Read by package `server`.
 
@@ -53,7 +59,7 @@ Read by package `server`.
 | `trusted_proxies` | `[]string` |  | TrustedProxies are the CIDRs whose X-Forwarded-For header is believed when working out the caller's address. "unix" trusts connections on a Unix socket, from a proxy on the same host. Without it, callers on a Unix socket have no address, so rate limits keyed by address skip them. |
 | `access_log` **env** | `bool` |  | AccessLog logs one line per request. |
 
-## migrate
+### migrate
 
 Read by package `galleon`. Its keys, other than `recheck` and `apply_timeout`, override the app's migration policy. A key left unset keeps the policy's value, which is the environment profile's unless the app changes it (see [Migrations](/docs/concepts/migrations#the-deploy-policy)).
 
@@ -70,7 +76,7 @@ Read by package `galleon`. Its keys, other than `recheck` and `apply_timeout`, o
 | `apply_timeout` **env** | `string` | `10m` | ApplyTimeout bounds applying at boot, waiting for the lock included: at least 1s, and 10m by default. |
 | `debug` **env** | `bool` |  | Debug records step descriptions, which may hold SQL, in spans and logs. |
 
-## pg
+### pg
 
 Read by package `pg`.
 
@@ -116,3 +122,20 @@ Read by package `pg`.
 | `retry_backoff` **env** | `time.Duration` |  | RetryAttempts, RetryBackoff and RetryBackoffMax are the default retry policy of Read and Write closures (see data.RetryPolicy); zero takes that policy's defaults. |
 | `retry_backoff_max` **env** | `time.Duration` |  | RetryAttempts, RetryBackoff and RetryBackoffMax are the default retry policy of Read and Write closures (see data.RetryPolicy); zero takes that policy's defaults. |
 | `leaks` **env** | `string` | `error` | Leaks says what happens to a root transaction still open when the operation that began it ends. It is always rolled back. With "error", the default, the call also fails with an Internal error whose cause has the stack of where the transaction began, and it is logged; with "log" it is only logged, and the call's own result stands. Use "error" in development and tests; "log" suits production, where a leaked read shouldn't fail a request that otherwise worked. |
+
+## coord-pg
+
+Module `github.com/thec1oud/galleon/coord-pg`.
+
+### coord_pg
+
+Read by package `coord-pg`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `dsn` **env** **secret** | `string` |  | DSN is the database to coordinate through, when the backend isn't given a pool with UsePool. Its pool\_max\_conns parameter sizes the pool the backend opens. |
+| `schema` **env** | `string` | `galleon_coord` | Schema holds the backend's tables, and is created at start if it doesn't exist. Every node of a cluster must name the same one; two apps on one database keep apart by naming different ones. |
+| `heartbeat` **env** | `time.Duration` | `1s` | Heartbeat is how often a node renews its membership. |
+| `failure_detection` **env** | `time.Duration` | `5s` | FailureDetection is how long after its last heartbeat a node that stopped is still listed as a member. It is the bound Capabilities reports, and must be at least twice Heartbeat. |
+| `leader_ttl` **env** | `time.Duration` | `10s` | LeaderTTL is the TTL of a leader's lease, renewed every third of it: how long leadership outlives a leader that died. |
+| `history` **env** | `time.Duration` | `10m` | History is how long key-value changes are kept for watchers to catch up on. |

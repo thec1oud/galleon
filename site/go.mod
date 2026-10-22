@@ -11,6 +11,7 @@ ignore ./node_modules
 require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/thec1oud/galleon v0.0.0-00010101000000-000000000000
+	github.com/thec1oud/galleon/coord-pg v0.0.0-00010101000000-000000000000
 	github.com/thec1oud/galleon/testkit v0.0.0-00010101000000-000000000000
 	golang.org/x/tools v0.36.0
 )
@@ -37,5 +38,6 @@ require (
 
 replace (
 	github.com/thec1oud/galleon => ../
+	github.com/thec1oud/galleon/coord-pg => ../coord-pg
 	github.com/thec1oud/galleon/testkit => ../testkit
 )

@@ -14,7 +14,8 @@ import (
 // A Section is one config section.
 type Section struct {
 	Name    string
-	Package string // the package that loads it, relative to the module
+	Module  string // the module that loads it
+	Package string // the package that loads it, relative to the core module
 	Fields  []Field
 }
 
@@ -77,7 +78,7 @@ func (s *source) sections() ([]Section, error) {
 				for _, pr := range w.problems {
 					problems = append(problems, fmt.Sprintf("section %q: %s", name, pr))
 				}
-				out = append(out, Section{Name: name, Package: rel(p.PkgPath), Fields: w.out})
+				out = append(out, Section{Name: name, Module: p.Module.Path, Package: rel(p.PkgPath), Fields: w.out})
 				return true
 			})
 		}
