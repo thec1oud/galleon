@@ -232,7 +232,7 @@ func (m *Manager) begin(ctx context.Context, write bool, o data.Options, closure
 			return nil, misuse(data.CodePropagation, "data.Independent can't run inside a transaction of a Within manager, which has one connection")
 		}
 		if !write && enc != nil && enc.root.write && enc.state == open && m.leaks == leaksError {
-			// The classic bug (design §7.4), flagged where leaks fail
+			// The classic bug (see ADR 0015), flagged where leaks fail
 			// calls too: in development and tests.
 			m.logger().WarnContext(ctx, "an Independent read began while a write transaction is open: it doesn't see that transaction's writes, and may run on a replica",
 				"began", firstFrame(callers()))

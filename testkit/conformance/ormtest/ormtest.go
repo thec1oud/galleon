@@ -9,7 +9,8 @@
 //		}})
 //	}
 //
-// It checks the rules of the ORM seam (06-seam-specifications.md, §6.2):
+// It checks the rules of the ORM seam (§6.2 of the seam specifications,
+// https://github.com/thec1oud/galleon/blob/0897d74/docs/design/06-seam-specifications.md):
 // that every statement runs through the handle the adapter is given, or the
 // one in ctx, never on a connection of its own, so it never chooses a host;
 // that side effects wait for the commit; and that the models it registers
@@ -96,7 +97,7 @@ type Factory struct {
 }
 
 // Run runs every conformance test. Rule numbers are those of the ORM
-// seam's specification (06-seam-specifications.md, §6.2).
+// seam's specification (§6.2, linked above).
 func Run(t *testing.T, f Factory) {
 	t.Run("StatementsGoThroughTheHandle", func(t *testing.T) { report(t, statementsGoThroughTheHandle(newEnv(t, f))) }) // rule 1
 	t.Run("NoConnectionOfItsOwn", func(t *testing.T) { report(t, noConnectionOfItsOwn(newEnv(t, f))) })                 // rules 1, 2

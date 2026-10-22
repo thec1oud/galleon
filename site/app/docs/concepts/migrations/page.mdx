@@ -1,0 +1,59 @@
+---
+title: "Migrations"
+description: "How Galleon applies schema changes once across the cluster, with any migration tool, under a deploy policy."
+order: 7
+---
+
+# Migrations
+
+Package [`migrate`](https://pkg.go.dev/github.com/thec1oud/galleon/migrate) is a seam: what Galleon expects from any migration tool. Galleon provides the same behaviour around every tool: one apply across the cluster, a deploy policy, ordering, and telemetry ([0019](/docs/decisions/0019-tool-neutral-migration-seam)).
+
+## The seam
+
+A tool implements one required interface, `migrate.Migrator`. It has a `Name`, a `Status` that compares the database with what this build expects, and an `Apply` that runs under a lock.
+
+It may also implement optional capabilities, which Galleon finds with a type assertion, as `net/http` finds `http.Flusher`:
+
+| Capability | The tool can… |
+|---|---|
+| `Planner` | say what `Apply` would do, without doing it |
+| `OfflinePlanner` | plan without a database, such as in CI |
+| `Verifier` | detect drift beyond which version was applied |
+| `Backgrounder` | list work that continues after `Apply`, such as a backfill |
+| `Completion` | say whether a named task is finished |
+
+A tool never fakes a capability it lacks.
+
+Two migrators exist: [`pg/sqlmigrate`](https://pkg.go.dev/github.com/thec1oud/galleon/pg/sqlmigrate), built in, for numbered SQL files, and [`adapters/dpg`](https://github.com/thec1oud/galleon/blob/dev/adapters/dpg/README.md), for DPG, which is provisional and not built by CI yet.
+
+## At boot
+
+A module registers a migrator with `galleon.Migrator(r, name, ctor)`. After providers start and before `OnStart` hooks run, the kernel acts on every migrator in order, as the policy's mode says:
+
+| Mode | At boot |
+|---|---|
+| `off` | Nothing: no status read, no readiness gate |
+| `verify` | Reads each status and gates readiness on it, but never applies. The `Production` default. |
+| `apply` | Applies each migrator under the coordination lock, then gates readiness on its new status. The `Development` and `Test` default. |
+
+Each migrator's gate is named `migrate.<name>`. `MigrateOrder` and `MigrateAfter` set the order of several migrators.
+
+## One apply across the cluster
+
+Every apply holds a coordination lock for its migrator, so only one node applies at a time; the others wait, then find nothing pending. The lease's fencing token goes to the tool. A tool that checks it can refuse a node whose lease has passed to another. `pg/sqlmigrate` records it, and refuses a lower token of the same epoch or any lease of a superseded epoch.
+
+A module with a migrator therefore needs the `locks` capability.
+
+## The deploy policy
+
+The policy decides what a deploy may apply:
+
+- **Risk.** Every step has a risk: `safe`, `caution`, `destructive`, `manual`, or `unknown`, which ranks above them all. The policy sets the highest risk allowed. `Production` allows up to `caution`.
+- **Unknown risk.** A step nobody classified is `unknown`, and `Production` refuses it unless the deploy allows it. A tool that can't plan can only apply when unknown risk is allowed.
+- **Approved plans.** The policy can pin, per migrator, the fingerprint of the plan CI approved. Apply refuses any other plan.
+
+The `migrate` config section and `galleon.MigrationPolicy` adjust the policy. The environment profile sets its defaults.
+
+## Not built yet
+
+Running background tasks, which needs the job system, and an `app migrate status|plan|apply` command. Until the command exists, `App.Migrations()` is the Go API for the same operations.
