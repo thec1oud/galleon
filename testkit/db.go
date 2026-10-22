@@ -73,21 +73,7 @@ type Database struct {
 // named galleon_tpl_* to reclaim them; the next run rebuilds what it needs.
 func DB(t testing.TB, opts ...DBOption) *Database {
 	t.Helper()
-	admin := adminDSN()
-	if admin == "" {
-		if os.Getenv("CI") != "" {
-			t.Fatalf("%s must be set in CI, so the tests that need Postgres run", PostgresEnv)
-		}
-		t.Skipf("%s is not set; skipping a test that needs Postgres", PostgresEnv)
-	}
-	var s dbSettings
-	for _, o := range opts {
-		o(&s)
-	}
-	dsn, err := packageDB(admin, s.schema)
-	if err != nil {
-		t.Fatalf("testkit.DB: %v", err)
-	}
+	dsn := PackageDSN(t, opts...)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cc, err := pgx.ParseConfig(dsn)
@@ -118,6 +104,33 @@ func DB(t testing.TB, opts ...DBOption) *Database {
 	m := pg.Within(tx)
 	fwd.set(m.QueryTracer())
 	return &Database{dsn: dsn, manager: m}
+}
+
+// PackageDSN is the DSN of the package's database, as Database.DSN is,
+// without the test's transaction DB opens, for tests that only connect to
+// it themselves. It skips the test when PostgresEnv is unset, as DB does.
+//
+// Unlike a DB's transaction, which is rolled back when the test ends, what
+// is written through it is committed, and every test of the package sees
+// it, so a test that uses it cleans up after itself.
+func PackageDSN(t testing.TB, opts ...DBOption) string {
+	t.Helper()
+	admin := adminDSN()
+	if admin == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("%s must be set in CI, so the tests that need Postgres run", PostgresEnv)
+		}
+		t.Skipf("%s is not set; skipping a test that needs Postgres", PostgresEnv)
+	}
+	var s dbSettings
+	for _, o := range opts {
+		o(&s)
+	}
+	dsn, err := packageDB(admin, s.schema)
+	if err != nil {
+		t.Fatalf("testkit: the package's database: %v", err)
+	}
+	return dsn
 }
 
 // forwardTracer passes pgx's tracing calls to a tracer set after the

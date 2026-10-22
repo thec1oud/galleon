@@ -21,7 +21,10 @@
 //
 // Transactions get a span each, and statements, batches and copies a client
 // span each, with the database semantic conventions. Statement spans carry
-// the SQL text, never its arguments.
+// the SQL text, never its arguments. The spans of statements whose ctx
+// names a model (data.ForModel) carry it as galleon.data.model, and, when
+// a module registered it (galleon.Collect of a data.ModelInfo), its table
+// as db.collection.name.
 //
 // The primary may have streaming replicas ("replicas"). A read that begins
 // a transaction on the primary source runs on one when its read consistency
@@ -50,7 +53,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
@@ -89,15 +94,26 @@ type Manager struct {
 
 var _ data.Manager = (*Manager)(nil)
 
-// telemetry is where a Manager sends spans and logs. A Within manager gets
-// the app's when the module is installed, after it was built.
+// telemetry is where a Manager sends spans and logs, and the models its
+// spans name. A Within manager gets the app's when the module is installed,
+// after it was built.
 type telemetry struct {
 	tracer trace.Tracer
 	log    *slog.Logger
+	// tables is each registered model's table, as a span names it.
+	tables map[string]attribute.KeyValue
 }
 
-func (m *Manager) setTelemetry(tp trace.TracerProvider, log *slog.Logger) {
-	t := &telemetry{tracer: tp.Tracer(tracerName), log: log}
+func newTelemetry(tp trace.TracerProvider, log *slog.Logger, models *data.Models) *telemetry {
+	t := &telemetry{tracer: tp.Tracer(tracerName), log: log, tables: map[string]attribute.KeyValue{}}
+	for _, m := range models.All() {
+		t.tables[m.Name] = semconv.DBCollectionName(m.Identifier().Sanitize())
+	}
+	return t
+}
+
+func (m *Manager) setTelemetry(tp trace.TracerProvider, log *slog.Logger, models *data.Models) {
+	t := newTelemetry(tp, log, models)
 	m.apps.mu.Lock()
 	defer m.apps.mu.Unlock()
 	m.apps.own = t
@@ -132,6 +148,13 @@ func (m *Manager) popTelemetry(t *telemetry) {
 }
 
 func (m *Manager) tracer() trace.Tracer { return m.tel.Load().tracer }
+
+// table is the table of the model named name, as a span names it, when the
+// model is registered.
+func (m *Manager) table(name string) (attribute.KeyValue, bool) {
+	kv, ok := m.tel.Load().tables[name]
+	return kv, ok
+}
 func (m *Manager) logger() *slog.Logger { return m.tel.Load().log }
 
 // source is one database and its pool.
@@ -150,10 +173,11 @@ type source struct {
 type Option func(*settings)
 
 type settings struct {
-	tp    trace.TracerProvider
-	mp    metric.MeterProvider
-	log   *slog.Logger
-	clock clock.Clock
+	tp     trace.TracerProvider
+	mp     metric.MeterProvider
+	log    *slog.Logger
+	clock  clock.Clock
+	models *data.Models
 }
 
 // TracerProvider, MeterProvider, Logger and Clock replace the defaults (no
@@ -164,6 +188,11 @@ func TracerProvider(tp trace.TracerProvider) Option { return func(s *settings) {
 func MeterProvider(mp metric.MeterProvider) Option  { return func(s *settings) { s.mp = mp } }
 func Logger(l *slog.Logger) Option                  { return func(s *settings) { s.log = l } }
 func Clock(c clock.Clock) Option                    { return func(s *settings) { s.clock = c } }
+
+// Models is the model registry whose tables statement spans name, for
+// statements whose ctx names a model (data.ForModel). The module sets it
+// from the models modules collect.
+func Models(r *data.Models) Option { return func(s *settings) { s.models = r } }
 
 func (s *settings) defaults() {
 	if s.tp == nil {
@@ -204,7 +233,7 @@ func New(cfg Config, opts ...Option) (*Manager, error) {
 		keys:    newKeyring(cfg),
 		clock:   s.clock,
 	}
-	m.setTelemetry(s.tp, s.log)
+	m.setTelemetry(s.tp, s.log, s.models)
 	beforePools()
 	build := func(name string, src Source, tracer *queryTracer) (*source, error) {
 		// Validate parsed it, but parsing reads files, such as an
@@ -425,7 +454,7 @@ func Within(tx pgx.Tx, opts ...Option) *Manager {
 		clock:   s.clock,
 		metrics: newMetrics(s.mp, nil),
 	}
-	m.setTelemetry(s.tp, s.log)
+	m.setTelemetry(s.tp, s.log, s.models)
 	return m
 }
 
@@ -483,28 +512,38 @@ type moduleSettings struct {
 // Use makes the module provide m, as built, instead of one from the config
 // section. The app never starts or stops m: its caller does. While the app
 // runs, from its start to its stop, m sends spans and logs to the app's
-// tracer provider and logger. With several apps on one Manager at once,
-// the latest started of those still running gets them; with none, m uses
-// its own. data.Manager is built once the app's
-// telemetry is in place, so a provider that starts with it should depend on
-// it rather than on *Manager. testkit.DB uses it.
+// tracer provider and logger, and its spans name the app's models. With
+// several apps on one Manager at once, the latest started of those still
+// running gets them; with none, m uses its own. data.Manager is built once
+// the app's telemetry is in place, so a provider that starts with it should
+// depend on it rather than on *Manager. testkit.DB uses it.
 func Use(m *Manager) ModuleOption { return func(s *moduleSettings) { s.use = m } }
 
 // Module returns the data module: it provides *pg.Manager and data.Manager
 // from the "pg" config section, registers a readiness gate per source, and
 // tracks the transactions each operation begins.
+//
+// It also provides the model registry, *data.Models, built from the
+// data.ModelInfo every module adds with galleon.Collect. An invalid model,
+// or one collected as a *data.ModelInfo, fails boot (New); two that share
+// a name or a table fail Start, when the registry is built.
 func Module(opts ...ModuleOption) galleon.Module {
 	var s moduleSettings
 	for _, o := range opts {
 		o(&s)
 	}
 	return galleon.ModuleFunc("pg", func(r *galleon.Registry) error {
+		// Declares the models collection. Models collected by pointer, as
+		// *data.ModelInfo, are a collection nothing declares or takes, which
+		// fails boot.
+		galleon.Collect[data.ModelInfo](r)
+		galleon.Provide[*data.Models](r, func(models []data.ModelInfo) (*data.Models, error) { return data.NewModels(models...) })
 		if s.use != nil {
 			m := s.use
 			// Supplied, so the kernel doesn't start or stop it.
 			galleon.Supply[*Manager](r, m)
-			galleon.Provide[*appTelemetry](r, func(tp trace.TracerProvider, log *slog.Logger) *appTelemetry {
-				return &appTelemetry{m: m, tel: &telemetry{tracer: tp.Tracer(tracerName), log: log}}
+			galleon.Provide[*appTelemetry](r, func(tp trace.TracerProvider, log *slog.Logger, models *data.Models) *appTelemetry {
+				return &appTelemetry{m: m, tel: newTelemetry(tp, log, models)}
 			})
 			// Built after the app's telemetry is in place, so what depends
 			// on data.Manager starts with it. A managerView has no Start or
@@ -517,9 +556,9 @@ func Module(opts ...ModuleOption) galleon.Module {
 		}
 		cfg := galleon.Config[Config](r, "pg")
 		var m *Manager
-		galleon.Provide[*Manager](r, func(tp trace.TracerProvider, mp metric.MeterProvider, log *slog.Logger, clk clock.Clock) (*Manager, error) {
+		galleon.Provide[*Manager](r, func(tp trace.TracerProvider, mp metric.MeterProvider, log *slog.Logger, clk clock.Clock, models *data.Models) (*Manager, error) {
 			var err error
-			m, err = New(*cfg, TracerProvider(tp), MeterProvider(mp), Logger(log), Clock(clk))
+			m, err = New(*cfg, TracerProvider(tp), MeterProvider(mp), Logger(log), Clock(clk), Models(models))
 			return m, err
 		})
 		galleon.Provide[data.Manager](r, func(m *Manager) data.Manager { return managerView{m} })
