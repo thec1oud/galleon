@@ -49,13 +49,15 @@ type Filter struct {
 }
 
 // Filter constructors.
-func Always() Filter                       { return Filter{Op: FilterAlways} }
-func Never() Filter                        { return Filter{Op: FilterNever} }
-func And(fs ...Filter) Filter              { return Filter{Op: FilterAnd, Args: fs} }
-func Or(fs ...Filter) Filter               { return Filter{Op: FilterOr, Args: fs} }
-func Not(f Filter) Filter                  { return Filter{Op: FilterNot, Args: []Filter{f}} }
-func Eq(field string, value any) Filter    { return Filter{Op: FilterEq, Field: field, Value: value} }
-func In(field string, values ...any) Filter { return Filter{Op: FilterIn, Field: field, Values: values} }
+func Always() Filter                    { return Filter{Op: FilterAlways} }
+func Never() Filter                     { return Filter{Op: FilterNever} }
+func And(fs ...Filter) Filter           { return Filter{Op: FilterAnd, Args: fs} }
+func Or(fs ...Filter) Filter            { return Filter{Op: FilterOr, Args: fs} }
+func Not(f Filter) Filter               { return Filter{Op: FilterNot, Args: []Filter{f}} }
+func Eq(field string, value any) Filter { return Filter{Op: FilterEq, Field: field, Value: value} }
+func In(field string, values ...any) Filter {
+	return Filter{Op: FilterIn, Field: field, Values: values}
+}
 
 // Match reports whether a resource with attrs matches f. A missing
 // attribute equals nothing. A malformed filter, such as a FilterNot without
