@@ -14,7 +14,7 @@ export function ChannelBanner() {
         ? [`This is a preview of the docs on branch ${c.branch}.`, "Preview docs."]
         : ["This is a preview deployment of the docs.", "Preview docs."];
   return (
-    <div role="note" className="sticky top-0 z-40 flex h-12 items-center justify-center gap-1 overflow-hidden border-b border-amber-300 bg-amber-100 px-4 text-center text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+    <div role="note" className="sticky top-0 z-40 flex h-12 items-center justify-center gap-1 overflow-hidden border-b border-amber-300 bg-amber-100 px-4 text-center text-sm text-amber-950 [.dark_&]:border-amber-800 [.dark_&]:bg-amber-950 [.dark_&]:text-amber-100">
       <style>{":root { --fd-banner-height: 3rem; }"}</style>
       <span className="truncate max-md:hidden">{long}</span>
       <span className="md:hidden">{short}</span>

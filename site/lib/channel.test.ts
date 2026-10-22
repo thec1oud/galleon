@@ -25,7 +25,15 @@ describe("channel", () => {
       .toEqual({ kind: "preview", branch: "feature/x", stableURL: undefined });
   });
 
-  test("a deployment with no branch, such as from the CLI, is a preview", () => {
+  test("a production deployment with no branch, such as from the CLI, is stable", () => {
+    expect(channel({ VERCEL_ENV: "production" })).toEqual({ kind: "stable" });
+  });
+
+  test("a production deployment of another branch is labelled with it", () => {
+    expect(channel({ VERCEL_ENV: "production", VERCEL_GIT_COMMIT_REF: "feature/x" }).kind).toBe("preview");
+  });
+
+  test("a preview deployment with no branch, such as from the CLI, is a preview", () => {
     expect(channel({ VERCEL_ENV: "preview" })).toEqual({ kind: "preview", branch: undefined, stableURL: undefined });
   });
 });

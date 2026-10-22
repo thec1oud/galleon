@@ -14,7 +14,9 @@ export type Channel =
 export function channel(env: Record<string, string | undefined> = process.env): Channel {
   if (env.VERCEL_ENV !== "preview" && env.VERCEL_ENV !== "production") return { kind: "stable" };
   const branch = env.VERCEL_GIT_COMMIT_REF || undefined;
-  if (branch === "master") return { kind: "stable" };
+  // A production deployment without git metadata, such as `vercel --prod`
+  // from the CLI, is taken to be the stable docs it replaces.
+  if (branch === "master" || (env.VERCEL_ENV === "production" && !branch)) return { kind: "stable" };
   // The production domain, without a scheme, such as docs.example.com.
   const host = env.VERCEL_PROJECT_PRODUCTION_URL;
   const stableURL = host ? `https://${host}/docs` : undefined;
