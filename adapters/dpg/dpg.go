@@ -41,13 +41,15 @@
 // the migration builds it; a valid one defined otherwise (made by hand,
 // say), or an index of the name on another table, makes it refuse
 // (DPG-E058, DPG-E057) for a person to drop or rename, since neither is
-// DPG's to drop. That drop isn't in the plan, nor in
-// its fingerprint: it is DPG's, like its ledger's records, and runs only
-// when finishing a migration. A cancelled build may go on on the server:
-// pgx stops waiting and closes the connection without asking the server
-// to cancel the statement. The drop waits for it, and a build that
-// completes first leaves a valid index, taken as built. Two statements DPG may run
-// after a transaction still aren't: CREATE SUBSCRIPTION, and ALTER TABLE
+// DPG's to drop. That drop isn't in the plan, nor in its fingerprint: DPG
+// runs it for the migration, like its ledger's records, only when
+// finishing it. A cancelled call asks the server to cancel the statement
+// it runs, so a build stops there too; should that request not reach the
+// server in time (cancelWait), the connection is closed and the build may
+// go on until it finishes or fails. The drop waits for it, and a build
+// that completes first leaves a valid index, taken as built. Two
+// statements DPG may run after a transaction still aren't: CREATE
+// SUBSCRIPTION, and ALTER TABLE
 // ... DETACH PARTITION ... CONCURRENTLY, which a cancel leaves pending; a
 // person finishes those. See README.md.
 //
@@ -85,8 +87,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thec1oud/dpg/pkg/dpg/engine"
@@ -192,8 +197,19 @@ func (m *Migrator) connect(ctx context.Context) (*pgx.Conn, error) {
 			return nil, err
 		}
 	}
+	// A call cancelled (a lost lease, a shutdown) asks the server to
+	// cancel the statement it runs, rather than only stop waiting for it,
+	// so a CREATE INDEX CONCURRENTLY doesn't go on building; pgx closes
+	// the connection after cancelWait without an answer.
+	cfg.BuildContextWatcherHandler = func(c *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.CancelRequestContextWatcherHandler{Conn: c, DeadlineDelay: cancelWait}
+	}
 	return pgx.ConnectConfig(ctx, cfg)
 }
+
+// cancelWait is how long a cancelled call waits for the server to cancel
+// its statement before closing the connection.
+const cancelWait = 2 * time.Second
 
 // session runs f on an engine over a connection of its own, and returns
 // its error as wrap does, with the statements of the log the engine loaded
@@ -246,11 +262,33 @@ var absPath = regexp.MustCompile(`(^|[\s"'(])((?:[A-Za-z]:)?[/\\][^\s"'():]*)`)
 // relative makes the paths in msg that are in one of roots relative to it,
 // spaces and all, and leaves only the last element of any other absolute
 // path: whole when the message starts with it ("<path>: <problem>", as
-// DPG's warnings are), else up to a space.
+// DPG's warnings are), else up to a space. A root is matched only where a
+// path starts (at the start of msg, or after a space, quote or
+// parenthesis) and up to a separator, the longest root first, so a root
+// inside another path, or one that is another's suffix (/var and
+// /private/var), is left alone.
 func relative(msg string, roots []string) string {
+	sep := string(filepath.Separator)
+	var prefixes []string
 	for _, r := range roots {
-		msg = strings.ReplaceAll(msg, r+string(filepath.Separator), "")
+		if !strings.HasSuffix(r, sep) {
+			r += sep
+		}
+		prefixes = append(prefixes, r)
 	}
+	slices.SortStableFunc(prefixes, func(a, b string) int { return len(b) - len(a) })
+	var b strings.Builder
+	for i := 0; i < len(msg); {
+		if i == 0 || strings.ContainsRune(" \t\n\"'(", rune(msg[i-1])) {
+			if p := firstPrefix(msg[i:], prefixes); p != "" {
+				i += len(p)
+				continue
+			}
+		}
+		b.WriteByte(msg[i])
+		i++
+	}
+	msg = b.String()
 	if i := strings.Index(msg, ": "); i > 0 && filepath.IsAbs(msg[:i]) {
 		msg = filepath.Base(msg[:i]) + msg[i:]
 	}
@@ -261,6 +299,15 @@ func relative(msg string, roots []string) string {
 		}
 		return sub[1] + filepath.Base(sub[2])
 	})
+}
+
+func firstPrefix(s string, prefixes []string) string {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return p
+		}
+	}
+	return ""
 }
 
 // withWarnings adds what DPG warned of, such as a snapshot of another
@@ -588,12 +635,12 @@ func (m *Migrator) stale(err error) error {
 // around it, and keeps SQL out of its message: a statement that failed (an
 // engine.StatementError) or that DPG's checks refused (an
 // engine.GateError) is named by its step ID, a guard DPG runs for a
-// migration as "a guard of migration <m>", and one of DPG's own (its
-// ledger's records, the drop of an invalid index before a build) as "a
-// statement of DPG's"; a statement of the log that the message quotes
-// otherwise is replaced by its step ID too. The adapter's own refusals
-// are returned as they are. The error still wraps the original, for
-// errors.Is and errors.As.
+// migration as "a guard of migration <m>", the drop of an invalid index
+// before a build as "a statement DPG runs to finish migration <m>", and
+// one of its ledger's records as "a statement of DPG's"; a statement of
+// the log that the message quotes otherwise is replaced by its step ID
+// too. The adapter's own refusals are returned as they are. The error
+// still wraps the original, for errors.Is and errors.As.
 func (m *Migrator) wrap(r redactor, err error) error {
 	if err == nil {
 		return nil
@@ -631,25 +678,31 @@ func (r redactor) redact(err error) string {
 	return redactWith(err, byLength)
 }
 
+// statementNamed names a statement DPG's typed errors report: by its step
+// ID, as a guard of its migration's, as a statement DPG runs to finish its
+// migration (the drop of an invalid index), or else as other.
+func statementNamed(step, migration string, guard bool, other string) string {
+	switch {
+	case step != "":
+		return "statement " + step
+	case guard && migration != "":
+		return "a guard of migration " + migration
+	case migration != "":
+		return "a statement DPG runs to finish migration " + migration
+	}
+	return other
+}
+
 func redactWith(err error, byLength []engine.Step) string {
 	msg := err.Error()
 	var se *engine.StatementError
 	if errors.As(err, &se) {
-		named := "a statement of DPG's"
-		switch {
-		case se.Step != "":
-			named = "statement " + se.Step
-		case se.Migration != "":
-			named = "a guard of migration " + se.Migration
-		}
+		named := statementNamed(se.Step, se.Migration, se.Guard, "a statement of DPG's")
 		msg = strings.Replace(msg, se.Error(), "executor: "+named+": "+redactWith(se.Err, byLength), 1)
 	}
 	var ge *engine.GateError
 	if errors.As(err, &ge) {
-		named := "a statement of the source's change"
-		if ge.Step != "" {
-			named = "statement " + ge.Step
-		}
+		named := statementNamed(ge.Step, ge.Migration, ge.Guard, "a statement of the source's change")
 		msg = strings.Replace(msg, ge.Error(), ge.Reason+"; first: "+named, 1)
 	}
 	// Any statement of the log an error quotes otherwise, longest first so

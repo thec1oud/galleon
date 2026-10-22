@@ -162,8 +162,8 @@ func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 		},
 		{
 			// The drop of an invalid index before building it again.
-			fmt.Errorf("engine: c/app: finishing migration m1: %w", &engine.StatementError{SQL: `DROP INDEX CONCURRENTLY IF EXISTS "public"."a_x";`, Err: context.Canceled}),
-			`dpg: migrator "schema": engine: c/app: finishing migration m1: executor: a statement of DPG's: context canceled`,
+			fmt.Errorf("engine: c/app: finishing migration m1: %w", &engine.StatementError{Migration: "m1", SQL: `DROP INDEX CONCURRENTLY IF EXISTS "public"."a_x";`, Err: context.Canceled}),
+			`dpg: migrator "schema": engine: c/app: finishing migration m1: executor: a statement DPG runs to finish migration m1: context canceled`,
 		},
 		{
 			// Named by the step the engine says it is, not by its SQL,
@@ -173,13 +173,18 @@ func TestErrorsNameStatementsByTheirStepIDs(t *testing.T) {
 		},
 		{
 			// A guard of a migration's, which runs twice, so is no step.
-			fmt.Errorf("engine: c/app: migration m1: %w", &engine.StatementError{Migration: "m1", SQL: "DO $dpg$ BEGIN RAISE EXCEPTION 'DPG-E055: table public.a changed'; END $dpg$;", Err: errors.New("ERROR: DPG-E055: table public.a changed (SQLSTATE P0001)")}),
+			fmt.Errorf("engine: c/app: migration m1: %w", &engine.StatementError{Migration: "m1", Guard: true, SQL: "DO $dpg$ BEGIN RAISE EXCEPTION 'DPG-E055: table public.a changed'; END $dpg$;", Err: errors.New("ERROR: DPG-E055: table public.a changed (SQLSTATE P0001)")}),
 			`dpg: migrator "schema": engine: c/app: migration m1: executor: a guard of migration m1: ERROR: DPG-E055: table public.a changed (SQLSTATE P0001)`,
 		},
 		{
 			// Refused by DPG's own check of safety.
 			fmt.Errorf("engine: c/app: %w", &engine.GateError{Reason: "DPG-E025: migration m1 contains destructive operations; re-run with --allow-destructive to proceed", Step: "m1/9", SQL: `DROP TABLE "secret";`}),
 			`dpg: migrator "schema": engine: c/app: DPG-E025: migration m1 contains destructive operations; re-run with --allow-destructive to proceed; first: statement m1/9`,
+		},
+		{
+			// A guard refused by that check.
+			fmt.Errorf("engine: c/app: %w", &engine.GateError{Reason: "migration m1 contains CAUTION operations, which aren't allowed here", Migration: "m1", Guard: true, SQL: `DO $dpg$ BEGIN END $dpg$;`}),
+			`dpg: migrator "schema": engine: c/app: migration m1 contains CAUTION operations, which aren't allowed here; first: a guard of migration m1`,
 		},
 		{
 			// Quoted outside a StatementError: the longer statement is
@@ -231,21 +236,32 @@ func TestWarningsAreAddedToTheDetail(t *testing.T) {
 }
 
 func TestWarningsNameNoAbsolutePath(t *testing.T) {
-	sep := string(filepath.Separator)
-	root := filepath.Join(sep+"srv", "my app", "schema")
-	inside := filepath.Join(root, ".dpg", "snapshots", "c", "app.json")
-	rel := filepath.Join(".dpg", "snapshots", "c", "app.json")
-	elsewhere := filepath.Join(sep+"home", "x y", "snap shot.json")
-	for msg, want := range map[string]string{
-		inside + ": written by dpg 9.0.0, format 9.0.0":                      rel + ": written by dpg 9.0.0, format 9.0.0",
-		elsewhere + ": written by dpg 9.0.0":                                 "snap shot.json: written by dpg 9.0.0",
-		"reading " + filepath.Join(sep+"home", "x", "s.json") + " (skipped)": "reading s.json (skipped)",
-		"a/b and c:d stay": "a/b and c:d stay",
-		`"` + inside + `"`: `"` + rel + `"`,
-		filepath.Join(sep+"srv", "my app", "schema-old", "x") + ": y": "x: y",
+	if filepath.Separator != '/' {
+		t.Skip("the cases are written with Unix paths")
+	}
+	for _, c := range []struct {
+		roots     []string
+		msg, want string
+	}{
+		// A path in the project, with spaces.
+		{[]string{"/srv/my app"}, "/srv/my app/.dpg/snap shot.json: format 9", ".dpg/snap shot.json: format 9"},
+		{[]string{"/srv/my app"}, `reading "/srv/my app/.dpg/a b.json" (skipped)`, `reading ".dpg/a b.json" (skipped)`},
+		// A root that is inside another path isn't its project's: the
+		// path is cut to its last element.
+		{[]string{"/app"}, "/data/app/x.json: bad", "x.json: bad"},
+		{[]string{"/srv/app"}, "/srv/app-old/x.json: bad", "x.json: bad"},
+		// The root and its symlink-resolved form, either way round.
+		{[]string{"/var/folders/p", "/private/var/folders/p"}, "/private/var/folders/p/.dpg/s.json: w", ".dpg/s.json: w"},
+		{[]string{"/private/var/folders/p", "/var/folders/p"}, "/var/folders/p/.dpg/s.json: w", ".dpg/s.json: w"},
+		// The filesystem's root.
+		{[]string{"/"}, "/srv/x y/.dpg/a.json: w", "srv/x y/.dpg/a.json: w"},
+		// Elsewhere, and not a path at all.
+		{nil, "/home/x y/snap shot.json: written by dpg 9.0.0", "snap shot.json: written by dpg 9.0.0"},
+		{nil, "reading /home/x/s.json (skipped)", "reading s.json (skipped)"},
+		{[]string{"/srv"}, "a/b and c:d stay", "a/b and c:d stay"},
 	} {
-		if got := relative(msg, []string{root}); got != want {
-			t.Errorf("relative(%q) = %q, want %q", msg, got, want)
+		if got := relative(c.msg, c.roots); got != c.want {
+			t.Errorf("relative(%q, %q) = %q, want %q", c.msg, c.roots, got, c.want)
 		}
 	}
 }

@@ -556,8 +556,9 @@ func TestDPGsWarningsAreInTheStatus(t *testing.T) {
 }
 
 // An apply cancelled while CREATE INDEX CONCURRENTLY waits (a lease lost,
-// a shutdown) leaves the index behind invalid; the next apply, on any
-// node, rebuilds it, and the error quotes no SQL.
+// a shutdown) asks the server to cancel the build, which leaves the index
+// behind invalid; the next apply, on any node, rebuilds it, and the error
+// quotes no SQL.
 func TestAnIndexBuildCancelledPartWayIsRebuiltByTheNextApply(t *testing.T) {
 	ctx := context.Background()
 	dsn := database(t)
@@ -599,27 +600,6 @@ func TestAnIndexBuildCancelledPartWayIsRebuiltByTheNextApply(t *testing.T) {
 	err = <-done
 	if err == nil || strings.Contains(err.Error(), "CREATE") || strings.Contains(err.Error(), "--resume") {
 		t.Fatalf("the cancelled apply: %v", err)
-	}
-	// The cancel only stops the client waiting: pgx closes the connection
-	// rather than send the server a cancel request, so the build may go on
-	// (as the package's docs say). Stop it on the server too, as a
-	// statement timeout or a person would, to leave it cancelled part way.
-	const builds = "FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND query LIKE 'CREATE INDEX CONCURRENTLY%' AND state = 'active'"
-	if _, err := pool.Exec(ctx, "SELECT pg_cancel_backend(pid) "+builds); err != nil {
-		t.Fatal(err)
-	}
-	for deadline := time.Now().Add(30 * time.Second); ; {
-		var n int
-		if err := pool.QueryRow(ctx, "SELECT count(*) "+builds).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		if n == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the index build didn't stop")
-		}
-		time.Sleep(5 * time.Millisecond) // a poll interval, not synchronization
 	}
 	if err := blocker.Rollback(ctx); err != nil {
 		t.Fatal(err)
