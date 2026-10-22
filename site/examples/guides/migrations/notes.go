@@ -1,15 +1,17 @@
-// Package notes is the sample behind the "Deploy migrations safely" guide:
-// a module with a migrator, and a plan report for CI.
-package notes
+// Command notes is the sample behind the "Deploy migrations safely" guide:
+// a service with a migrator, whose binary plans and applies its own
+// migrations.
+package main
 
 import (
 	"context"
 	"embed"
-	"fmt"
-	"io"
 	"io/fs"
+	"os"
 
 	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/cli"
+	"github.com/thec1oud/galleon/coord/local"
 	"github.com/thec1oud/galleon/migrate"
 	"github.com/thec1oud/galleon/pg"
 	"github.com/thec1oud/galleon/pg/sqlmigrate"
@@ -36,25 +38,22 @@ func (n Notes) Register(r *galleon.Registry) error {
 
 // docs:end module
 
-// docs:start plan
-// PrintPlan writes what applying would do to the database app is connected
-// to: each migrator's pending steps, their risks, and the fingerprint to
-// approve. It fails when a plan couldn't be made, the database's status
-// couldn't be read, or the policy would refuse the plan, so CI stops there.
-func PrintPlan(ctx context.Context, app *galleon.App, w io.Writer) error {
-	reports, err := app.Migrations().Plan(ctx, false)
-	if err != nil {
-		return err
-	}
-	if err := migrate.WritePlans(w, reports); err != nil {
-		return err
-	}
-	for _, r := range reports {
-		if r.Err != nil || r.StatusErr != nil || r.Refused != nil {
-			return fmt.Errorf("migrator %s can't be deployed as planned", r.Name)
-		}
-	}
-	return nil
+// docs:start main
+// options is the service, as every command runs it, over the migrations
+// in files; more adds to it, such as its config.
+func options(files fs.FS, more ...galleon.Option) []galleon.Option {
+	return append([]galleon.Option{
+		galleon.Name("notes"),
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode),
+		galleon.Modules(pg.Module(), Notes{files}),
+	}, more...)
 }
 
-// docs:end plan
+// main serves without a command, and runs `notes migrate status|plan|apply`
+// with one.
+func main() {
+	os.Exit(cli.Main(context.Background(), os.Args[1:], options(Migrations, galleon.ConfigFile("config.json"))...))
+}
+
+// docs:end main

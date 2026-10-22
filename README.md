@@ -66,7 +66,7 @@ The docs are in [`site`](site), and every Go sample in them is tested in CI.
 - [Learn](site/app/docs/learn/page.mdx): build a service from zero, one chapter at a time.
 - [Guides](site/app/docs/guides/page.mdx): get a specific job done.
 - [Concepts](site/app/docs/concepts/page.mdx): how each part works, and why.
-- [Reference](site/app/docs/reference/page.mdx): every config key and error code, generated from the source.
+- [Reference](site/app/docs/reference/page.mdx): every config key, error code and command, generated from the source.
 - [Decisions](docs/adr/README.md): the architecture decision records, append-only.
 
 To read them locally, with [Bun](https://bun.sh/) installed: `cd site && bun install && bun run dev`, then open http://localhost:3000/docs.

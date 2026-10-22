@@ -6,11 +6,11 @@ import (
 	"testing"
 )
 
-// The kernel, the op plane and the transports know nothing of Postgres:
-// none of them links a Postgres driver, even through the data package's
-// seam.
+// The kernel, the op plane, the transports and the command line know
+// nothing of Postgres: none of them links a Postgres driver, even through
+// the data package's seam.
 func TestTheKernelTheOpPlaneAndTheTransportsDontLinkPostgres(t *testing.T) {
-	for _, pkg := range []string{".", "./op", "./server", "./client"} {
+	for _, pkg := range []string{".", "./op", "./server", "./client", "./cli"} {
 		for _, dep := range deps(t, pkg) {
 			if strings.HasPrefix(dep, "github.com/jackc/") {
 				t.Errorf("%s depends on %s", pkg, dep)

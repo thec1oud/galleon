@@ -478,3 +478,122 @@ func TestAMigrateSectionSetOnlyInTheEnvironmentIsCheckedWithoutMigrators(t *test
 		t.Fatalf("got %v, want an error about lock_ttl", err)
 	}
 }
+
+// lifecycle is a provider that records its Start and Stop.
+type lifecycle struct {
+	name string
+	log  *[]string
+}
+
+func (l *lifecycle) Start(context.Context) error {
+	*l.log = append(*l.log, "start "+l.name)
+	return nil
+}
+func (l *lifecycle) Stop(context.Context) error { *l.log = append(*l.log, "stop "+l.name); return nil }
+
+type (
+	dbHandle  struct{ *lifecycle }
+	poolStats struct{ *lifecycle }
+	webServer struct{ *lifecycle }
+)
+
+func TestWithMigrationsStartsOnlyWhatTheMigratorsNeed(t *testing.T) {
+	var mu sync.Mutex
+	var applied, life []string
+	s := newStub("schema", &applied, &mu)
+	mod := migratorModule("m", func(r *galleon.Registry) {
+		galleon.Provide[*poolStats](r, func() *poolStats { return &poolStats{&lifecycle{"stats", &life}} })
+		galleon.Provide[*dbHandle](r, func(*poolStats) *dbHandle { return &dbHandle{&lifecycle{"db", &life}} })
+		galleon.Provide[*webServer](r, func(*dbHandle) *webServer { return &webServer{&lifecycle{"web", &life}} })
+		galleon.Migrator(r, "schema", func(*dbHandle) migrate.Migrator { return s })
+		for _, hook := range []func(func(context.Context) error){r.OnStart, r.OnReady, r.OnStop, r.OnDrain} {
+			hook(func(context.Context) error { life = append(life, "hook"); return nil })
+		}
+	})
+	// Mode apply would apply at boot; WithMigrations applies only when asked.
+	app, err := galleon.New(append(base(mod), galleon.ConfigJSON([]byte(`{"migrate": {"mode": "apply", "allow_unknown": true}}`)))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = app.WithMigrations(context.Background(), func(ctx context.Context, m *galleon.Migrations) error {
+		reps, err := m.Status(ctx)
+		if err != nil {
+			return err
+		}
+		if len(applied) != 0 || len(reps) != 1 || reps[0].Status.State != migrate.Pending {
+			t.Errorf("before apply: applied %v, status %+v", applied, reps)
+		}
+		_, err = m.Apply(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(applied, ","); got != "schema" {
+		t.Errorf("applied %q", got)
+	}
+	if got := strings.Join(life, ","); got != "start stats,start db,stop db,stop stats" {
+		t.Errorf("lifecycle %q: want only the migrator's providers, started and stopped in order, and no hooks", got)
+	}
+	if err := app.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "runs once") {
+		t.Errorf("Start after WithMigrations: %v", err)
+	}
+	if err := app.WithMigrations(context.Background(), func(context.Context, *galleon.Migrations) error { return nil }); err == nil {
+		t.Error("WithMigrations ran twice")
+	}
+}
+
+func TestWithMigrationsStopsWhatItStartedWhenFnFails(t *testing.T) {
+	var mu sync.Mutex
+	var applied, life []string
+	s := newStub("schema", &applied, &mu)
+	mod := migratorModule("m", func(r *galleon.Registry) {
+		galleon.Provide[*dbHandle](r, func() *dbHandle { return &dbHandle{&lifecycle{"db", &life}} })
+		galleon.Migrator(r, "schema", func(*dbHandle) migrate.Migrator { return s })
+	})
+	app, err := galleon.New(base(mod)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("boom")
+	if err := app.WithMigrations(context.Background(), func(context.Context, *galleon.Migrations) error { return boom }); !errors.Is(err, boom) {
+		t.Fatalf("err = %v", err)
+	}
+	if got := strings.Join(life, ","); got != "start db,stop db" {
+		t.Errorf("lifecycle %q", got)
+	}
+}
+
+func TestWithMigrationsNeedsAMigrator(t *testing.T) {
+	app, err := galleon.New(base()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err = app.WithMigrations(context.Background(), func(context.Context, *galleon.Migrations) error { called = true; return nil })
+	if called || err == nil || !strings.Contains(err.Error(), "migrate.not_supported") {
+		t.Fatalf("called %v, err %v", called, err)
+	}
+	if err := app.Start(context.Background()); err == nil {
+		t.Error("the app started after WithMigrations")
+	}
+}
+
+func TestWithMigrationsRefusesARunningApp(t *testing.T) {
+	var mu sync.Mutex
+	var applied []string
+	s := newStub("schema", &applied, &mu)
+	app, err := galleon.New(append(base(migratorModule("m", func(r *galleon.Registry) {
+		galleon.Migrator(r, "schema", func() migrate.Migrator { return s })
+	})), galleon.Environment(galleon.Development))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer app.Shutdown(context.Background())
+	if err := app.WithMigrations(context.Background(), func(context.Context, *galleon.Migrations) error { return nil }); err == nil || !strings.Contains(err.Error(), "running") {
+		t.Fatalf("err = %v", err)
+	}
+}

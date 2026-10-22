@@ -421,33 +421,7 @@ func (a *App) startMigrations(ctx context.Context) error {
 	if mg == nil {
 		return nil
 	}
-	var built []migrate.Migrator
-	for _, m := range mg.order {
-		args := make([]reflect.Value, len(m.params))
-		for i, dep := range m.params {
-			args[i] = a.providers[dep].value
-		}
-		out := m.ctor.Call(args)
-		if m.returnsErr && !out[1].IsNil() {
-			return fmt.Errorf("constructing migrator %q (module %q, %s): %w", m.name, m.module, m.site, out[1].Interface().(error))
-		}
-		mm, _ := out[0].Interface().(migrate.Migrator)
-		if mm == nil || isNil(out[0]) {
-			return fmt.Errorf("constructing migrator %q (module %q, %s): the constructor returned nil", m.name, m.module, m.site)
-		}
-		if mm.Name() != m.name {
-			return fmt.Errorf("migrator %q (module %q, %s) is named %q by its constructor", m.name, m.module, m.site, mm.Name())
-		}
-		built = append(built, mm)
-	}
-	runner, err := migrate.NewRunner(migrate.Config{
-		Locker:         a.backend.Locks(),
-		Migrators:      built,
-		Policy:         mg.policy,
-		Logger:         a.log.With("component", "migrate"),
-		TracerProvider: a.settings.tracerProvider,
-		MeterProvider:  a.settings.meterProvider,
-	})
+	runner, built, err := a.buildMigrators()
 	if err != nil {
 		return err
 	}
@@ -478,6 +452,135 @@ func (a *App) startMigrations(ctx context.Context) error {
 	// status as found.
 	refresh(ctx)
 	return nil
+}
+
+// buildMigrators builds every migrator, in order, from the started
+// providers, and a runner over them with the app's policy.
+func (a *App) buildMigrators() (*migrate.Runner, []migrate.Migrator, error) {
+	mg := a.migrations
+	var built []migrate.Migrator
+	for _, m := range mg.order {
+		args := make([]reflect.Value, len(m.params))
+		for i, dep := range m.params {
+			args[i] = a.providers[dep].value
+		}
+		out := m.ctor.Call(args)
+		if m.returnsErr && !out[1].IsNil() {
+			return nil, nil, fmt.Errorf("constructing migrator %q (module %q, %s): %w", m.name, m.module, m.site, out[1].Interface().(error))
+		}
+		mm, _ := out[0].Interface().(migrate.Migrator)
+		if mm == nil || isNil(out[0]) {
+			return nil, nil, fmt.Errorf("constructing migrator %q (module %q, %s): the constructor returned nil", m.name, m.module, m.site)
+		}
+		if mm.Name() != m.name {
+			return nil, nil, fmt.Errorf("migrator %q (module %q, %s) is named %q by its constructor", m.name, m.module, m.site, mm.Name())
+		}
+		built = append(built, mm)
+	}
+	runner, err := migrate.NewRunner(migrate.Config{
+		Locker:         a.backend.Locks(),
+		Migrators:      built,
+		Policy:         mg.policy,
+		Logger:         a.log.With("component", "migrate"),
+		TracerProvider: a.settings.tracerProvider,
+		MeterProvider:  a.settings.meterProvider,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return runner, built, nil
+}
+
+// WithMigrations starts only what the app's migrators need, builds them,
+// and calls fn with the app's Migrations, then stops what it started, in
+// reverse order. It is how the migrate command runs the app: it never acts
+// on the policy's boot mode, so mode apply in the config doesn't make it
+// apply anything fn doesn't, and it runs no hooks, gates nothing and
+// starts no other provider, such as a server. The policy, the
+// coordination lock and the config are the ones boot would use.
+//
+// Like Start, it runs once: the app can't be started afterwards. It fails
+// without calling fn when the app has no migrators.
+func (a *App) WithMigrations(ctx context.Context, fn func(ctx context.Context, m *Migrations) error) error {
+	a.mu.Lock()
+	if a.state != stateBuilt {
+		st := a.state
+		a.mu.Unlock()
+		if st == stateStopped {
+			return errors.New("galleon: WithMigrations called after the app ran; an app runs once")
+		}
+		return errors.New("galleon: WithMigrations called on an app that is running")
+	}
+	a.state = stateStarting
+	a.mu.Unlock()
+
+	err := a.withMigrations(ctx, fn)
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.settings.stopTimeout)
+	defer cancel()
+	if serr := a.stopAll(stopCtx); serr != nil {
+		err = errors.Join(err, serr)
+	}
+	if terr := shutdownTelemetry(stopCtx, &a.settings); terr != nil {
+		err = errors.Join(err, terr)
+	}
+	a.mu.Lock()
+	a.state = stateStopped
+	a.mu.Unlock()
+	return err
+}
+
+func (a *App) withMigrations(ctx context.Context, fn func(ctx context.Context, m *Migrations) error) error {
+	if a.migrations == nil {
+		return errs.New(errs.FailedPrecondition, migrate.CodeNotSupported, "the app has no migrators: a module registers one with galleon.Migrator")
+	}
+	need := a.migratorProviders()
+	for _, p := range a.buildOrder {
+		if !need[p] {
+			continue
+		}
+		if err := a.build(p); err != nil {
+			return err
+		}
+		if s, ok := p.value.Interface().(Starter); ok && p.ctor.IsValid() {
+			sctx, cancel := context.WithTimeout(ctx, a.settings.startTimeout)
+			err := s.Start(sctx)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("starting %s: %w", p.describe(), err)
+			}
+		}
+		a.started = append(a.started, p)
+	}
+	runner, _, err := a.buildMigrators()
+	if err != nil {
+		return err
+	}
+	// No gate is polled here, so an apply has none to refresh.
+	a.migrations.handle.set(runner, func(context.Context) {})
+	return fn(ctx, a.migrations.handle)
+}
+
+// migratorProviders returns the providers the migrators' constructors
+// take, and every provider those depend on.
+func (a *App) migratorProviders() map[*provider]bool {
+	need := map[*provider]bool{}
+	var visit func(t reflect.Type)
+	visit = func(t reflect.Type) {
+		p := a.providers[t]
+		if p == nil || need[p] {
+			return
+		}
+		need[p] = true
+		for _, dep := range p.params {
+			visit(dep)
+		}
+	}
+	for _, m := range a.migrations.order {
+		for _, dep := range m.params {
+			visit(dep)
+		}
+	}
+	return need
 }
 
 // migrationGate is one migrator's readiness gate. It reads the migrator's

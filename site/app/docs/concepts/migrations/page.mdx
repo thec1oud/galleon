@@ -54,6 +54,20 @@ The policy decides what a deploy may apply:
 
 The `migrate` config section and `galleon.MigrationPolicy` adjust the policy. The environment profile sets its defaults.
 
+## From the command line
+
+The app's own binary runs the operator commands, once its `main` hands its arguments to [`cli.Main`](/docs/reference/cli):
+
+| Command | Does |
+|---|---|
+| `<app> migrate status` | Prints each migrator's status, drift and background tasks, and exits 1 if any isn't ready |
+| `<app> migrate plan` | Prints what an apply would do, with each plan's fingerprint, and exits 1 if the policy would refuse it |
+| `<app> migrate apply` | Applies every migrator in order, under the coordination lock |
+
+They are commands of the app, not of a separate tool, because only the app's binary has its migrators compiled in ([0500](/docs/decisions/0500-commands-are-subcommands-of-the-apps-binary)). Each builds the app from the same config and environment it boots with, then starts only the providers its migrators need. It never acts on the boot mode, runs no hooks and serves nothing ([0501](/docs/decisions/0501-commands-start-only-what-they-need)). So `migrate plan` changes nothing even where the deploy sets mode `apply`, while `migrate apply` is still held to the policy's risk limit and approved fingerprints.
+
+`App.WithMigrations` is the Go API under the commands, and `App.Migrations()` the same operations on a started app.
+
 ## Not built yet
 
-Running background tasks, which needs the job system, and an `app migrate status|plan|apply` command. Until the command exists, `App.Migrations()` is the Go API for the same operations.
+Running background tasks, which needs the job system.
