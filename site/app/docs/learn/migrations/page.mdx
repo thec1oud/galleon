@@ -1,0 +1,234 @@
+---
+title: "4. Migrations"
+description: "Let the service create and change its own schema, applied at boot in development and approved for production."
+order: 4
+---
+
+# Migrations
+
+In this chapter the bookmarks service creates its own table, and then changes it. You see how migrations apply at boot in development, and why production waits until you ask.
+
+This chapter starts from the service at the end of [A database](/docs/learn/database). Start from an empty `bookmarks` database, without the table you made by hand:
+
+```sh
+dropdb bookmarks && createdb bookmarks
+```
+
+## Write the migrations
+
+A migration is a numbered SQL file. The first creates the table:
+
+```sql file=examples/learn/migrations/migrations/0001_create_bookmarks.sql title="migrations/0001_create_bookmarks.sql"
+-- galleon:risk safe
+CREATE TABLE bookmarks (
+    id    bigserial PRIMARY KEY,
+    url   text NOT NULL,
+    title text NOT NULL
+);
+```
+
+The second adds a column for when a bookmark was saved:
+
+```sql file=examples/learn/migrations/migrations/0002_add_created_at.sql title="migrations/0002_add_created_at.sql"
+-- galleon:risk safe
+ALTER TABLE bookmarks ADD COLUMN created_at timestamptz;
+ALTER TABLE bookmarks ALTER COLUMN created_at SET DEFAULT now();
+```
+
+The column allows NULL, so adding it doesn't touch existing rows, which is what makes it safe. Bookmarks saved before it have no time; new ones get the time they were saved.
+
+The `-- galleon:risk safe` line declares how risky the file is. Without it, a file is of unknown risk, and production refuses it unless someone approves it.
+
+## Register a migrator
+
+Embed the files in the binary, and register a migrator for them in the module. `sqlmigrate` is Galleon's built-in migrator for SQL files on PostgreSQL:
+
+```go file=examples/learn/migrations/bookmarks.go#module title="bookmarks.go"
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+// Bookmarks is the module that serves bookmarks.
+type Bookmarks struct{}
+
+func (Bookmarks) Name() string { return "bookmarks" }
+
+func (Bookmarks) Register(r *galleon.Registry) error {
+	galleon.Migrator(r, "bookmarks", func(m *pg.Manager) (migrate.Migrator, error) {
+		pool := m.Pool("")
+		if pool == nil { // a Manager made with pg.Within, as testkit.DB's, has no pool
+			return nil, errors.New("bookmarks: migrations need a database connection pool")
+		}
+		files, err := fs.Sub(migrations, "migrations")
+		if err != nil {
+			return nil, err
+		}
+		return sqlmigrate.New("bookmarks", files, pool)
+	})
+	galleon.Config[Limits](r, "limits")
+	var s *Store
+	galleon.Provide[*Store](r, func(db data.Manager, limits *Limits) *Store {
+		s = &Store{db: db, max: limits.MaxBookmarks}
+		return s
+	})
+	r.Operation(Create, func(ctx context.Context, in *CreateIn) (*Bookmark, error) { return s.Create(ctx, in) })
+	r.Operation(Get, func(ctx context.Context, in *GetIn) (*Bookmark, error) { return s.Get(ctx, in.ID) })
+	return nil
+}
+```
+
+Galleon builds the migrator once the database is connected. It applies the files in order, each in its own transaction, and records them in a `galleon_migrations` table. The migrator needs the database's connection pool, which a test's `testkit.DB` doesn't have, so the function returns an error rather than a migrator that would fail later.
+
+## Choose the environment
+
+What Galleon does with pending migrations at boot depends on the environment. Production, the default, only checks them. Development applies them. Add a flag to choose:
+
+```go file=examples/learn/migrations/main.go#main title="main.go"
+func options(env galleon.Env) []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("bookmarks"),
+		galleon.Environment(env),
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode),
+		galleon.ConfigFile("config.json"),
+		galleon.Modules(server.Module(), pg.Module(), Bookmarks{}),
+	}
+}
+
+func main() {
+	dev := flag.Bool("dev", false, "apply migrations at boot, as in development")
+	flag.Parse()
+	env := galleon.Production
+	if *dev {
+		env = galleon.Development
+	}
+	app, err := galleon.New(options(env)...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := app.Run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+## Run it in development
+
+```sh
+go run . -dev
+```
+
+The log shows each file applied before the server starts (trimmed to the fields that matter here):
+
+```txt
+level=INFO msg="migration step applied" migrator=bookmarks step=0001_create_bookmarks risk=safe
+level=INFO msg="migration step applied" migrator=bookmarks step=0002_add_created_at risk=safe
+level=INFO msg="migration applied" migrator=bookmarks outcome=applied steps=2
+level=INFO msg="http server listening" addr=0.0.0.0:8080 routes=2
+```
+
+Start it again, and nothing is applied: the database is up to date.
+
+## Run it as in production
+
+Make another empty database, and point the service at it in `config.json`:
+
+```sh
+createdb bookmarks_prod
+```
+
+```json
+"pg": {"primary": {"dsn": "postgres://postgres:postgres@localhost:5432/bookmarks_prod?sslmode=disable"}},
+```
+
+Run it without `-dev`. It starts, but it doesn't open its port. The log says why:
+
+```txt
+level=WARN msg="migration gate fails: the app takes no traffic until it passes" migrator=bookmarks reason="migrate.not_ready: migrator \"bookmarks\": changes are pending (database none, build 2): 2 pending: 0001_create_bookmarks.sql, 0002_add_created_at.sql; apply them with mode apply or migrate apply"
+```
+
+Production never changes a schema on its own. To apply the pending files, set the mode for that deploy:
+
+```sh
+BOOKMARKS_MIGRATE_MODE=apply go run .
+```
+
+The production policy applies files up to `caution` risk. It refuses a riskier file, or one of unknown risk, unless the `migrate` section allows it with `max_risk` or `allow_unknown`; see the [configuration reference](/docs/reference/config#migrate).
+
+<Callout type="warn">
+Never edit a migration that has been applied. Galleon records each file's hash, and a changed file makes the status drifted, which keeps the app out of traffic. Add a new file instead.
+</Callout>
+
+## Test it
+
+Tests run in the Test profile, which applies migrations at boot like development. Migrations commit, so they can't run in `testkit.DB`'s rolled-back transaction. Replace `bookmarks_test.go` with a test that uses `testkit.PackageDSN`, an empty database for the test package, and cleans up after itself:
+
+```go file=examples/learn/migrations/bookmarks_test.go title="bookmarks_test.go"
+package main
+
+import (
+	"context"
+	"testing"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/migrate"
+	"github.com/thec1oud/galleon/pg"
+	"github.com/thec1oud/galleon/testkit"
+)
+
+func TestTheServiceMigratesItsSchema(t *testing.T) {
+	dsn := testkit.PackageDSN(t)          // an empty database; skips unless GALLEON_TEST_POSTGRES is set
+	t.Cleanup(func() { dropAll(t, dsn) }) // registered first, so it runs after the app stops
+	h := testkit.New(t,                   // the Test profile applies migrations at boot
+		galleon.Modules(pg.Module(), Bookmarks{}),
+		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}}`)),
+	)
+	ctx := context.Background()
+
+	reports, err := h.Migrations().Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range reports {
+		if r.Name == "bookmarks" {
+			found = true
+			if r.Status.State != migrate.UpToDate {
+				t.Fatalf("the bookmarks migrator is %s, want up_to_date", r.Status.State)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no status for the bookmarks migrator")
+	}
+	saved, err := testkit.Get[*Store](h).Create(ctx, &CreateIn{URL: "https://go.dev", Title: "Go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testkit.Get[*Store](h).Get(ctx, saved.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// dropAll removes what the test made: PackageDSN's writes are committed,
+// and other tests in the package would see them.
+func dropAll(t *testing.T, dsn string) {
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "DROP TABLE IF EXISTS bookmarks, galleon_migrations, galleon_migrations_fence"); err != nil {
+		t.Error(err)
+	}
+}
+```
+
+## Checkpoint
+
+The service owns its schema. Development applies migrations at boot. Production checks them, keeps the node out of traffic until they are applied, and applies them only when you set the mode.
+
+That is the end of Learn for now. Later chapters will cover authorization, several nodes, and replicas. Meanwhile, see [Migrations](/docs/concepts/migrations) for how migrations run across a cluster, and the [Guides](/docs/guides) for specific tasks.

@@ -1,0 +1,211 @@
+---
+title: "3. A database"
+description: "Move the bookmarks into PostgreSQL, with transactions Galleon manages, and test against a real database."
+order: 3
+---
+
+# A database
+
+In this chapter the bookmarks move into PostgreSQL, so they outlast the process. The store reads and writes in transactions that Galleon opens, commits and rolls back.
+
+This chapter starts from the service at the end of [Configuration and modules](/docs/learn/configuration). You need a PostgreSQL server you can create a database on.
+
+## Create the table
+
+Create a database named `bookmarks`, and the table in it:
+
+```sql file=examples/learn/database/schema.sql title="schema.sql"
+CREATE TABLE bookmarks (
+    id    bigserial PRIMARY KEY,
+    url   text NOT NULL,
+    title text NOT NULL
+);
+```
+
+```sh
+createdb bookmarks
+psql bookmarks -f schema.sql
+```
+
+Creating the table by hand is temporary. In the [next chapter](/docs/learn/migrations), the service creates it itself.
+
+## Add the data module
+
+`pg.Module()` connects to PostgreSQL and provides `data.Manager`, which opens transactions. Add it to the app:
+
+```go file=examples/learn/database/main.go#main title="main.go"
+func options() []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("bookmarks"),
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode),
+		galleon.ConfigFile("config.json"),
+		galleon.Modules(server.Module(), pg.Module(), Bookmarks{}),
+	}
+}
+```
+
+It reads the `pg` section of the config. Change the DSN to match your server:
+
+```json file=examples/learn/database/config.json title="config.json"
+{
+  "http": {"addr": ":8080"},
+  "pg": {"primary": {"dsn": "postgres://postgres:postgres@localhost:5432/bookmarks?sslmode=disable"}},
+  "limits": {"max_bookmarks": 500}
+}
+```
+
+At boot, the data module adds a readiness check for the database. The app takes no traffic until it can reach it.
+
+## Read and write in transactions
+
+The store now takes a `data.Manager`. `Write` runs a function in a write transaction, and `Read` in a read transaction:
+
+```go file=examples/learn/database/bookmarks.go#store title="bookmarks.go"
+// Store keeps up to max bookmarks in the database.
+type Store struct {
+	db  data.Manager
+	max int
+}
+
+func (s *Store) Create(ctx context.Context, in *CreateIn) (*Bookmark, error) {
+	var b Bookmark
+	err := s.db.Write(ctx, func(ctx context.Context, tx data.WriteTx) error {
+		// A soft limit: two requests at once can both pass this count.
+		var n int
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM bookmarks").Scan(&n); err != nil {
+			return err
+		}
+		if n >= s.max {
+			return errs.New(errs.FailedPrecondition, CodeFull, "the store is full")
+		}
+		return tx.QueryRow(ctx,
+			"INSERT INTO bookmarks (url, title) VALUES ($1, $2) RETURNING id::text, url, title",
+			in.URL, in.Title).Scan(&b.ID, &b.URL, &b.Title)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+func (s *Store) Get(ctx context.Context, id string) (*Bookmark, error) {
+	notFound := errs.New(errs.NotFound, CodeNotFound, "no such bookmark")
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || strconv.FormatInt(n, 10) != id {
+		return nil, notFound // IDs are numbers, written one way: "1", not "01" or "+1"
+	}
+	var b Bookmark
+	err = s.db.Read(ctx, func(ctx context.Context, tx data.ReadTx) error {
+		return tx.QueryRow(ctx,
+			"SELECT id::text, url, title FROM bookmarks WHERE id = $1", n).Scan(&b.ID, &b.URL, &b.Title)
+	})
+	if errors.Is(err, data.ErrNoRows) {
+		return nil, notFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+```
+
+When the function returns nil, the transaction commits. When it returns an error, the transaction rolls back and `Write` returns the error. A full store returns its error from inside the function, so nothing is written.
+
+The limit is now a soft one. Two requests at the same moment can both count fewer than the limit, and both insert. That is fine for a limit like this one; a hard limit needs a lock.
+
+A read transaction can't write. When you add read replicas later, `Read` is what may run on one.
+
+## Provide it to the store
+
+Ask for `data.Manager` where the store is built:
+
+```go file=examples/learn/database/bookmarks.go#module title="bookmarks.go"
+// Bookmarks is the module that serves bookmarks.
+type Bookmarks struct{}
+
+func (Bookmarks) Name() string { return "bookmarks" }
+
+func (Bookmarks) Register(r *galleon.Registry) error {
+	galleon.Config[Limits](r, "limits")
+	var s *Store
+	galleon.Provide[*Store](r, func(db data.Manager, limits *Limits) *Store {
+		s = &Store{db: db, max: limits.MaxBookmarks}
+		return s
+	})
+	r.Operation(Create, func(ctx context.Context, in *CreateIn) (*Bookmark, error) { return s.Create(ctx, in) })
+	r.Operation(Get, func(ctx context.Context, in *GetIn) (*Bookmark, error) { return s.Get(ctx, in.ID) })
+	return nil
+}
+```
+
+Run the service as before. Save a bookmark, stop the service, start it again, and the bookmark is still there.
+
+## Test against a real database
+
+The tests from the earlier chapters no longer fit: they boot the app without a database, and the store now needs one. Replace `bookmarks_test.go` with tests that use `testkit.DB`. It gives each test its own transaction in a database made from your schema. The transaction is rolled back when the test ends, so tests never see each other's data:
+
+```go file=examples/learn/database/bookmarks_test.go title="bookmarks_test.go"
+package main
+
+import (
+	"context"
+	_ "embed"
+	"testing"
+
+	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/errs"
+	"github.com/thec1oud/galleon/testkit"
+)
+
+//go:embed schema.sql
+var schema string
+
+func TestABookmarkIsSavedInTheDatabase(t *testing.T) {
+	db := testkit.DB(t, testkit.Schema(schema)) // skips unless GALLEON_TEST_POSTGRES is set
+	h := testkit.New(t, galleon.Modules(db.Module(), Bookmarks{}))
+	store := testkit.Get[*Store](h)
+	ctx := context.Background()
+
+	saved, err := store.Create(ctx, &CreateIn{URL: "https://go.dev", Title: "Go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, saved.ID)
+	if err != nil || got.Title != "Go" {
+		t.Fatalf("Get = %+v, %v", got, err)
+	}
+	for _, id := range []string{"999", "abc", "0" + saved.ID} {
+		if _, err := store.Get(ctx, id); errs.KindOf(err) != errs.NotFound {
+			t.Errorf("bookmark %s: %v, want NotFound", id, err)
+		}
+	}
+}
+
+func TestTheStoreKeepsItsLimit(t *testing.T) {
+	db := testkit.DB(t, testkit.Schema(schema))
+	h := testkit.New(t, galleon.Modules(db.Module(), Bookmarks{}), galleon.ConfigJSON([]byte(`{"limits": {"max_bookmarks": 1}}`)))
+	store := testkit.Get[*Store](h)
+	ctx := context.Background()
+	if _, err := store.Create(ctx, &CreateIn{URL: "https://go.dev", Title: "Go"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, &CreateIn{URL: "https://pkg.go.dev", Title: "Packages"}); errs.KindOf(err) != errs.FailedPrecondition {
+		t.Fatalf("the second bookmark: %v, want the store to be full", err)
+	}
+}
+```
+
+Set `GALLEON_TEST_POSTGRES` to the DSN of a server the tests may create databases on, then run them:
+
+```sh
+GALLEON_TEST_POSTGRES='postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable' go test ./...
+```
+
+Without it, the test is skipped. With `CI` set, it fails instead, so a pipeline can't pass by skipping it.
+
+## Checkpoint
+
+The bookmarks live in PostgreSQL, and every change runs in a transaction Galleon manages. The table, though, was made by hand.
+
+Next, in [Migrations](/docs/learn/migrations), the service creates and changes its own schema. For transactions, replicas and read consistency, see [Data](/docs/concepts/data).

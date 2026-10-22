@@ -1,0 +1,203 @@
+---
+title: "2. Configuration and modules"
+description: "Give the service a setting from a config file or the environment, and let Galleon build the store."
+order: 2
+---
+
+# Configuration and modules
+
+In this chapter the bookmarks service gets a limit on how many bookmarks it keeps. The limit comes from a config file, and the environment can override it. Galleon builds the store and hands it to the handlers.
+
+This chapter starts from the service at the end of [Your first service](/docs/learn/first-service).
+
+## Declare a config section
+
+A config section is a struct. `Default` fills in what the config leaves out, and `Validate` refuses values the service can't run with:
+
+```go file=examples/learn/config/bookmarks.go#config title="bookmarks.go"
+// Limits is the "limits" section of the config.
+type Limits struct {
+	// MaxBookmarks is how many bookmarks the store keeps.
+	MaxBookmarks int `json:"max_bookmarks"`
+}
+
+// Default fills in what the config leaves out.
+func (l *Limits) Default() { l.MaxBookmarks = 1000 }
+
+// Validate refuses a config the service can't run with, at boot.
+func (l *Limits) Validate() error {
+	if l.MaxBookmarks < 1 {
+		return errors.New("max_bookmarks must be at least 1")
+	}
+	return nil
+}
+```
+
+## Provide the store
+
+The store becomes a type of its own, `Store`, built from the limit. A full store returns a `FailedPrecondition` error, which becomes HTTP 422:
+
+```go file=examples/learn/config/bookmarks.go#store title="bookmarks.go"
+// Store keeps up to max bookmarks in memory.
+type Store struct {
+	max  int
+	log  *slog.Logger
+	mu   sync.Mutex
+	last int
+	byID map[string]Bookmark
+}
+
+func NewStore(max int, log *slog.Logger) *Store {
+	return &Store{max: max, log: log, byID: map[string]Bookmark{}}
+}
+
+func (s *Store) Create(ctx context.Context, in *CreateIn) (*Bookmark, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.byID) >= s.max {
+		return nil, errs.New(errs.FailedPrecondition, CodeFull, "the store is full")
+	}
+	s.last++
+	b := Bookmark{ID: fmt.Sprint(s.last), URL: in.URL, Title: in.Title}
+	s.byID[b.ID] = b
+	s.log.InfoContext(ctx, "bookmark saved", "id", b.ID)
+	return &b, nil
+}
+
+func (s *Store) Get(ctx context.Context, id string) (*Bookmark, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.byID[id]
+	if !ok {
+		return nil, errs.New(errs.NotFound, CodeNotFound, "no such bookmark")
+	}
+	return &b, nil
+}
+```
+
+Declare the new code, and add it to the `Create` operation:
+
+```go file=examples/learn/config/bookmarks.go#operations title="bookmarks.go"
+// The error codes of the bookmarks operations.
+const (
+	CodeNotFound = "bookmarks.not_found"
+	CodeFull     = "bookmarks.full"
+)
+
+var (
+	Create = op.Unary[CreateIn, Bookmark]("bookmarks.create").
+		HTTP("POST", "/bookmarks").
+		Public().
+		Errors(CodeFull)
+
+	Get = op.Unary[GetIn, Bookmark]("bookmarks.get").
+		HTTP("GET", "/bookmarks/{id}").
+		Public().
+		Errors(CodeNotFound)
+)
+```
+
+The module now claims the `limits` section and provides a `*Store`. Galleon reads the section into a `*Limits`, and passes it to the function that builds the store. The function also asks for the app's `*slog.Logger`, which Galleon provides.
+
+```go file=examples/learn/config/bookmarks.go#module title="bookmarks.go"
+// Bookmarks is the module that serves bookmarks.
+type Bookmarks struct{}
+
+func (Bookmarks) Name() string { return "bookmarks" }
+
+func (Bookmarks) Register(r *galleon.Registry) error {
+	galleon.Config[Limits](r, "limits")
+	var s *Store
+	galleon.Provide[*Store](r, func(limits *Limits, log *slog.Logger) *Store {
+		s = NewStore(limits.MaxBookmarks, log)
+		return s
+	})
+	r.Operation(Create, func(ctx context.Context, in *CreateIn) (*Bookmark, error) { return s.Create(ctx, in) })
+	r.Operation(Get, func(ctx context.Context, in *GetIn) (*Bookmark, error) { return s.Get(ctx, in.ID) })
+	return nil
+}
+```
+
+Galleon calls every provider's function at boot, before the server opens its port, so `s` is set by the time a handler runs. A parameter that nothing provides is a boot error, not a crash at the first request.
+
+<Callout type="warn">
+A test that swaps the store with `galleon.Replace[*Store](fake)` skips the function, so `s` stays nil and the handlers panic. To change the store in a test, change what it is built from, such as the config, as the test below does.
+</Callout>
+
+## Add a config file
+
+Point the app at a file:
+
+```go file=examples/learn/config/main.go#main title="main.go"
+func options() []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("bookmarks"),
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode),
+		galleon.ConfigFile("config.json"),
+		galleon.Modules(server.Module(), Bookmarks{}),
+	}
+}
+```
+
+Each section is a key of the file. `http` is the server's own section, listed with every other in the [configuration reference](/docs/reference/config).
+
+```json file=examples/learn/config/config.json title="config.json"
+{
+  "http": {"addr": ":8080"},
+  "limits": {"max_bookmarks": 500}
+}
+```
+
+## Override it from the environment
+
+A top-level field of a section can be set with an environment variable named `<APP>_<SECTION>_<FIELD>`, in upper case. The environment wins over the file:
+
+```sh
+BOOKMARKS_LIMITS_MAX_BOOKMARKS=2 go run .
+```
+
+Save three bookmarks, and the third is refused:
+
+```json
+{"type":"urn:galleon:problem:failed_precondition","title":"the store is full","status":422,"code":"bookmarks.full"}
+```
+
+## Bad config fails at boot
+
+Set the limit to 0 and the app doesn't start. `galleon.New` returns every problem it found, with the module and the line that registered it:
+
+```txt
+$ BOOKMARKS_LIMITS_MAX_BOOKMARKS=0 go run .
+2026/10/22 12:16:36 galleon: 1 boot problem(s):
+  - module "bookmarks" (/home/you/bookmarks/bookmarks.go:84): config section "limits" is invalid: max_bookmarks must be at least 1
+exit status 1
+```
+
+## Test it
+
+The tests from chapter 1 still pass. Add one for the limit. A test can give the app its config directly, and ask for any type the app built, so this one tests the store without HTTP:
+
+```go file=examples/learn/config/bookmarks_test.go#limit title="bookmarks_test.go"
+func TestTheStoreKeepsItsLimit(t *testing.T) {
+	h := testkit.New(t,
+		galleon.Modules(Bookmarks{}),
+		galleon.ConfigJSON([]byte(`{"limits": {"max_bookmarks": 1}}`)),
+	)
+	store := testkit.Get[*Store](h)
+	ctx := context.Background()
+	if _, err := store.Create(ctx, &CreateIn{URL: "https://go.dev", Title: "Go"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.Create(ctx, &CreateIn{URL: "https://pkg.go.dev", Title: "Packages"})
+	if errs.KindOf(err) != errs.FailedPrecondition {
+		t.Fatalf("the second bookmark: %v, want the store to be full", err)
+	}
+}
+```
+
+## Checkpoint
+
+The service reads a setting from a file or the environment, refuses a bad one at boot, and gets its store by dependency injection. Its bookmarks are still lost when it stops.
+
+Next, in [A database](/docs/learn/database), the store moves to PostgreSQL. For the order in which config sources apply, see [Modules and wiring](/docs/concepts/modules#configuration).
