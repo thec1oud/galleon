@@ -103,7 +103,8 @@ func nodes(t *testing.T, f Factory) []coord.Backend {
 }
 
 // checkCapabilities enforces rule 6 (honest scope) and rule 7 (a reported
-// failure-detection bound) of the coordination specification.
+// failure-detection bound) of the coordination specification, §4 of
+// https://github.com/thec1oud/galleon/blob/0897d74/docs/design/06-seam-specifications.md.
 func checkCapabilities(caps coord.Capabilities, hasPeer bool) error {
 	var errs []error
 	if caps.Name == "" {

@@ -87,7 +87,7 @@ type ApplyOptions struct {
 	// node that paused past its lease. Lost closes if the lease ends; the
 	// Runner then also cancels ctx.
 	//
-	// Part 4 sketched a Locker here. The Runner takes the lock itself, so the
+	// The design discussion sketched a Locker here. The Runner takes the lock itself, so the
 	// lock is held before any migrator code runs, and passes the lease.
 	Lock coord.Lease
 	// MaxRisk is the riskiest step allowed. A migrator that can classify its

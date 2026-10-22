@@ -68,7 +68,10 @@ type Factory struct {
 }
 
 // Run runs every conformance test. Rule numbers are those of the data
-// seam's specification (06-seam-specifications.md, §6.1).
+// seam's specification, §6.1 of
+// https://github.com/thec1oud/galleon/blob/0897d74/docs/design/06-seam-specifications.md,
+// and §7.4 is the propagation section of
+// https://github.com/thec1oud/galleon/blob/0897d74/docs/design/05-architecture.md.
 func Run(t *testing.T, f Factory) {
 	t.Run("ReadTxCannotWrite", func(t *testing.T) { readTxCannotWrite(t, f) })
 	t.Run("JoinIsTheDefault", func(t *testing.T) { joinIsTheDefault(t, f) })                               // rule 1

@@ -1,0 +1,101 @@
+---
+title: "Data"
+description: "Transactions on PostgreSQL through pgx: the two forms, how they nest, where reads go, and how read-your-writes crosses requests."
+order: 6
+---
+
+# Data
+
+Galleon's data plane is PostgreSQL only, through [pgx](https://github.com/jackc/pgx). Package [`data`](https://pkg.go.dev/github.com/thec1oud/galleon/data) is the seam: typed transaction handles and the `data.Manager` that opens them. Package [`pg`](https://pkg.go.dev/github.com/thec1oud/galleon/pg) implements it ([0013](/docs/decisions/0013-pgx-native-postgres-data-plane)).
+
+Rows, batches and command tags are pgx's own types, so code written against pgx reads the same here.
+
+## Sources
+
+`pg.Module()` reads the `pg` config section:
+
+```json
+{"pg": {"primary": {"dsn": "postgres://app@db/orders", "max_conns": 20},
+        "replicas": [{"dsn": "postgres://app@db-replica/orders"}],
+        "named": {"analytics": {"dsn": "postgres://app@warehouse/events"}}}}
+```
+
+The **primary** takes every write. **Replicas** are streaming replicas of the primary, used for reads. **Named** sources are other databases, chosen with `data.Source(name)`; they have no replicas. The primary and each named source open at start, which fails if one can't be reached, and each is a readiness gate. An unreachable replica only stays out of rotation.
+
+## Typed handles
+
+A transaction is a `data.ReadTx` or a `data.WriteTx`. A read handle has no `Exec`, so code that holds one can't write ([0016](/docs/decisions/0016-typed-handles-and-causal-tokens)).
+
+## Two forms
+
+The **closure form** begins, commits or rolls back for you. When it owns the transaction, it reruns the whole closure after a serialization failure or a deadlock:
+
+```go file=examples/concepts/orders.go#closure
+err := m.Write(ctx, func(ctx context.Context, tx data.WriteTx) error {
+	_, err := tx.Exec(ctx, "UPDATE accounts SET balance = balance - $1 WHERE id = $2", amount, id)
+	return err
+})
+```
+
+The **pair form** gives you the handle to end yourself, and never retries:
+
+```go file=examples/concepts/orders.go#pair
+tx, err := m.BeginWrite(ctx)
+if err != nil {
+	return err
+}
+defer tx.Rollback(ctx) // a no-op after Commit
+if _, err := tx.Exec(ctx, "UPDATE accounts SET balance = balance - $1 WHERE id = $2", amount, id); err != nil {
+	return err
+}
+return tx.Commit(ctx)
+```
+
+Use the closure when the code is safe to run again. `data.Retry(policy).Do` reruns other code that is ([0014](/docs/decisions/0014-transaction-pairs-and-closures)).
+
+## Propagation
+
+A new transaction relates to the one already in `ctx` in one of five ways:
+
+| Propagation | Behaviour |
+|---|---|
+| `Join` (default) | Reuses the enclosing transaction, or begins one |
+| `Independent` | Begins a separate transaction on its own connection |
+| `Nested` | Begins a savepoint in the enclosing transaction, or a new transaction |
+| `Mandatory` | Joins the enclosing transaction, and fails without one |
+| `Never` | Begins a new transaction, and fails inside one |
+
+The closure form puts its handle in the `ctx` it passes on; with pairs, `data.With(ctx, tx)` does. A read that joins a write transaction sees its uncommitted writes ([0015](/docs/decisions/0015-reads-join-the-enclosing-transaction)).
+
+Every root transaction an operation begins is tracked. One still open when the operation ends is rolled back and reported.
+
+## Read consistency
+
+A read that begins a transaction on the primary source can run on a replica. Its read consistency decides when:
+
+| Level | Reads |
+|---|---|
+| `Primary` | Always the primary |
+| `Any` | Any replica in rotation, or the primary when none qualifies |
+| `BoundedStaleness(d)` | A replica no more than `d` behind, or the primary |
+| `ReadYourWrites` (default) | A replica that has replayed everything this request committed, or the primary at once. `Wait(d)` waits for one first, and `OrFail()` fails instead of reading the primary. |
+
+A read's own option wins over its operation's declared default, which wins over the `consistency` config. Writes never run on a replica. A read that joins or nests in a write transaction never leaves the primary. An `Independent` read is routed like any other, and doesn't see the write.
+
+A background tracker polls each replica's replay position and lag. A replica too far behind (`max_lag`, 2s by default) leaves rotation until it catches up.
+
+## Causal tokens
+
+Within a request, read-your-writes tracks the WAL position of each write the request commits. With `token_key` set, a request that committed a write also returns a signed token in the `Galleon-Consistency` response header. A later request that sends it back, to any node sharing the key, reads at least that far.
+
+## ORMs and query builders
+
+Galleon owns the transaction; an ORM, query builder or repository joins it. It takes the handle it is given, or the one in `ctx` with `data.QuerierFrom` or `data.ReaderFrom`. It never opens a connection or picks a host of its own. It fires side effects with `data.AfterCommit`, so they never run for a change that rolls back. `testkit/conformance/ormtest` checks an adapter against these rules.
+
+## Not built yet
+
+`Snapshot` reads, sharing lag readings through coordination, replicas of named sources, a cookie for the causal token, and `WAIT FOR LSN` on PostgreSQL 19.
+
+## Why it is built this way
+
+Every component assumes replicas exist and lag ([0012](/docs/decisions/0012-every-component-is-replication-aware)). Typed handles and causal tokens make the right read the default, not a discipline ([0016](/docs/decisions/0016-typed-handles-and-causal-tokens)).

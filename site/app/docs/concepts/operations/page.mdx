@@ -1,0 +1,88 @@
+---
+title: "Operations"
+description: "How every API operation is described once and runs through one fixed pipeline, whatever transport it arrives on."
+order: 4
+---
+
+# Operations
+
+An operation is one thing your API can do, such as "create an order". Each one is described once, as an [`op.Descriptor`](https://pkg.go.dev/github.com/thec1oud/galleon/op#Descriptor). Routing, limits, validation and authorization are all derived from it ([0017](/docs/decisions/0017-one-operation-model)).
+
+```go file=examples/concepts/orders.go#operation title="orders.go"
+var CreateOrder = op.Unary[CreateOrderIn, CreateOrderOut]("orders.create").
+	HTTP("POST", "/orders").
+	RPC("orders.v1.Orders", "Create").
+	Authorize("orders:create").
+	Timeout(5 * time.Second)
+
+type Orders struct{}
+
+func (Orders) Name() string { return "orders" }
+
+func (Orders) Register(r *galleon.Registry) error {
+	r.Operation(CreateOrder, createOrder)
+	return nil
+}
+
+func createOrder(ctx context.Context, in *CreateOrderIn) (*CreateOrderOut, error) {
+	return &CreateOrderOut{ID: "ord_1"}, nil
+}
+```
+
+The handler is a plain function from a decoded input to an output. It never sees the transport.
+
+## Bindings
+
+A binding is one way to reach an operation. Two are served today:
+
+- **HTTP:** a method and a `net/http` `ServeMux` pattern, such as `GET /orders/{id}`.
+- **RPC:** a service and method, served over the Connect protocol, gRPC and gRPC-Web on the same server.
+
+A hand-built descriptor can also carry an event topic (`op.Topic`), but nothing serves topics yet. Package [`server`](https://pkg.go.dev/github.com/thec1oud/galleon/server) serves HTTP and RPC on one `net/http` server. Boot fails if two operations claim the same route, or if an HTTP binding uses an RPC procedure's exact path.
+
+## The pipeline
+
+Every call runs the same fixed stages, in this order:
+
+| # | Stage | Does |
+|---|---|---|
+| 1 | route | Matches the binding to the operation |
+| 2 | admit | Applies the timeout and the rate limit |
+| 3 | authenticate | Produces a principal, or anonymous |
+| 4 | resolve context | Produces the operating context, such as a tenant |
+| 5 | gate | Checks that the operation accepts that context |
+| 5b | pre-authorize | Checks the action, before the body is read |
+| 6 | decode | Produces the input |
+| 7 | validate shape | Runs pure validators |
+| 8 | authorize | Checks access to the resource the input names |
+| 9 | validate meaning | Runs validators that may read the database |
+| 10 | handle | Your handler |
+| 11 | commit hooks | A slot for work after the commit, such as events; nothing fills it yet |
+| 12 | encode | Prepares the output; the transport serializes it |
+
+The kernel compiles each operation's chain once, at boot, so a call walks a prepared list.
+
+A module can add an interceptor before or after any stage with `r.Intercept`, for every operation. The kernel implements admit, decode and both validation stages. Authenticate, resolve context, gate, pre-authorize, authorize, commit hooks and encode are slots a module fills with `r.ImplementStage`. The transport matches the route before the pipeline starts.
+
+## Security is declared
+
+Every operation must either be `Public()` or name an action with `Authorize` or `AuthorizeResource`. Boot fails otherwise. It also fails when a declaration needs a stage that no module implements:
+
+- an action needs pre-authorize;
+- `AuthorizeResource` needs authorize;
+- `Schemes` needs authenticate;
+- `Contexts` needs resolve context and gate.
+
+<Callout type="warn">
+The security plane isn't built yet, so no module of Galleon's implements those stages. Until it is, an app either marks its operations `Public()` or implements the stages itself.
+</Callout>
+
+## Input
+
+Decode reads the body with a codec chosen by content negotiation; JSON is built in ([`codec`](https://pkg.go.dev/github.com/thec1oud/galleon/codec)). Unknown fields are rejected unless the operation allows them. Package [`bind`](https://pkg.go.dev/github.com/thec1oud/galleon/bind) fills fields tagged `path`, `query` or `header` from the request.
+
+Shape validation runs `validate` struct tags ([`validate`](https://pkg.go.dev/github.com/thec1oud/galleon/validate)) and any validator the declaration adds. Every validator returns the same `*op.ValidationError`, whose violations carry JSON Pointer paths such as `/items/3/quantity` ([0018](/docs/decisions/0018-shared-validation-seam)).
+
+## Why it is built this way
+
+One description per operation means HTTP, RPC and in-process calls can't drift apart, and a missing security declaration is caught at boot ([0017](/docs/decisions/0017-one-operation-model), [0021](/docs/decisions/0021-generic-authorization-seams)).

@@ -1,0 +1,50 @@
+---
+title: "Repository layout"
+description: "The modules in the repository, what each package is for, and the rules on what may import what."
+order: 1
+---
+
+# Repository layout
+
+The repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each module has its own `go.mod`, and `go.work` at the root lists them all except `adapters/dpg`.
+
+| Module | Path | Contents |
+|---|---|---|
+| `github.com/thec1oud/galleon` | `/` | The kernel and every plane built so far |
+| `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness, conformance suites and test databases |
+| `github.com/thec1oud/galleon/site` | `/site` | This site, and the Go samples its pages show |
+| `github.com/thec1oud/galleon/adapters/dpg` | `/adapters/dpg` | The migration adapter for DPG. It builds only against a local DPG checkout, so it isn't in `go.work` or CI yet. |
+
+## Packages of the core module
+
+| Package | Is |
+|---|---|
+| `galleon` (root) | The kernel: app, modules, dependency injection, config, lifecycle, readiness, node identity, roles, telemetry |
+| `op` | The operation model and pipeline |
+| `bind`, `validate`, `codec` | Input binding, tag validation, payload formats |
+| `server`, `client` | The HTTP and RPC transport, and the outbound HTTP client |
+| `errs` | The error model |
+| `coord`, `coord/local` | The coordination seam and the in-process backend |
+| `data`, `pg` | The data seam and its PostgreSQL implementation |
+| `migrate`, `pg/sqlmigrate` | The migration seam and the built-in SQL migrator |
+| `clock` | The time seam |
+| `process` | The multi-process supervisor |
+| `internal/dsn` | Telling the forms of a PostgreSQL connection string apart |
+
+## Dependency rules
+
+Dependencies point one way ([0008](/docs/decisions/0008-dependency-direction)):
+
+- The core imports no battery and no adapter.
+- A battery will import only the core's public API.
+- An adapter imports the core and its one tool.
+- Only tests import `testkit`.
+
+Tests enforce part of this today, in [`deps_test.go`](https://github.com/thec1oud/galleon/blob/dev/deps_test.go):
+
+- The kernel, `op`, `server` and `client` don't link a PostgreSQL driver.
+- `data` links pgx's types and `errs`, and nothing else of Galleon. An ORM adapter that imports it gets neither the kernel nor a pool.
+
+## Adding a module
+
+Create it with its own `go.mod`, then add it to the workspace with `go work use ./<dir>`. CI vets and tests every module that `go.work` lists.

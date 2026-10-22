@@ -1,0 +1,63 @@
+---
+title: "Testing"
+description: "How Galleon is tested: the harness, the databases, the conformance suites, and what CI runs."
+order: 2
+---
+
+# Testing
+
+Galleon is tested with the same kit apps use: package [`testkit`](https://pkg.go.dev/github.com/thec1oud/galleon/testkit) ([0020](/docs/decisions/0020-one-integration-kit)).
+
+## Running the tests
+
+From the repository root, vet and test every workspace module:
+
+```sh
+bash -ec 'for dir in $(go list -m -f "{{.Dir}}"); do (cd "$dir" && go vet ./... && go test -race ./...); done'
+```
+
+CI also fails if `gofmt -l .` lists any file.
+
+## Tests that need PostgreSQL
+
+They skip unless `GALLEON_TEST_POSTGRES` holds the DSN of a server they may create databases on, such as `postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable`.
+
+Tests that need a streaming replica also skip unless `GALLEON_TEST_POSTGRES_REPLICA` holds the DSN of a standby of that server. Its user must be allowed to pause and resume replay; a superuser will do.
+
+[`.github/scripts/postgres-replica.sh`](https://github.com/thec1oud/galleon/blob/dev/.github/scripts/postgres-replica.sh) starts both in Docker, on ports 5432 and 5433. CI runs it and sets both variables. With `CI` set, these tests fail instead of skipping.
+
+## The harness
+
+`testkit.New(t, opts...)` builds and starts a real app for one test, and shuts it down when the test ends. It runs on:
+
+- a fake clock, `h.Clock`, starting at `testkit.Epoch`;
+- the in-process coordination backend, as a single node;
+- the `Test` profile, so migrators apply at boot;
+- a logger that records into `h.Logs`, printed only if the test fails.
+
+Your options come after these defaults, so any of them can be overridden. `galleon.Replace[T]` swaps a fake in for whatever provides `T`. `testkit.Get[T](h)` returns the app's `T`.
+
+<Callout type="warn">
+The in-process coordination backend keeps real time. Advancing `h.Clock` doesn't expire its leases, TTLs or counter windows.
+</Callout>
+
+## Databases
+
+- `testkit.DB(t, testkit.Schema(sql...))` gives each package its own database, cloned from a template of the schema. Each test runs in a transaction that is rolled back when it ends.
+- `testkit.PackageDSN` returns the package's database alone, without the per-test transaction.
+- `db.Replica(t)`, on a database from `testkit.DB`, is a test's view of the replica, with replay to pause and resume. Tests that use it take turns.
+- `testkit.NewProxy` puts a TCP proxy in front of a server. It can cut a database off and bring it back, or record what a client sends.
+- `testkit.MigrationStore` and `testkit.FakeMigrator` stand in for a migration tool.
+
+## Conformance suites
+
+Four seams have a suite in `testkit/conformance`, run with `Run(t, factory)`:
+
+| Suite | Checks |
+|---|---|
+| `coordtest` | A coordination backend |
+| `datatest` | A `data.Manager` |
+| `migratetest` | A migrator |
+| `ormtest` | An ORM or query builder adapter |
+
+Every implementation in this repository runs its suite, and so should any new one.
