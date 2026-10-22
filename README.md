@@ -47,6 +47,10 @@ func (Module) Register(r *galleon.Registry) error {
 }
 ```
 
+## Decisions
+
+Every significant architecture decision, why it was made and what was rejected, is recorded in [docs/adr](docs/adr/README.md). Records are append-only: a decision changes by a new record that supersedes the old one.
+
 ## Design documents
 
 The design was worked out in [docs/design](docs/design):

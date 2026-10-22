@@ -40,3 +40,32 @@ jobs:
         run: |
           docker logs galleon-pg-primary || true
           docker logs galleon-pg-standby || true
+
+  adr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test the ADR check
+        run: .github/scripts/adr-check-test.sh
+      # Records accepted before this change must be unchanged except for
+      # their Status: line. On a pull request the base is where the branch
+      # left its target; on a push, the commit before it, unless the push
+      # created the branch.
+      - name: Check the ADRs
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          base=""
+          if [ -n "$PR_BASE" ]; then
+            base=$(git merge-base "$PR_BASE" HEAD)
+          elif [ -n "$PUSH_BEFORE" ] && ! [[ "$PUSH_BEFORE" =~ ^0+$ ]]; then
+            base=$PUSH_BEFORE
+          fi
+          if [ -n "$base" ] && ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "::warning::base $base isn't in the clone (a force push?); checking format only"
+            base=""
+          fi
+          .github/scripts/adr-check.sh $base
