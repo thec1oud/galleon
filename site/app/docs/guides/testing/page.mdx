@@ -1,0 +1,194 @@
+---
+title: "Test with testkit"
+description: "Boot a real app in a test, control its clock, swap a dependency for a fake, and run each test in its own database transaction."
+order: 1
+---
+
+# Test with testkit
+
+Package [`testkit`](https://pkg.go.dev/github.com/thec1oud/galleon/testkit) boots your real modules in a test, so a test exercises the same wiring, config and lifecycle as production. This guide tests a small module that sends reminders when they fall due.
+
+## The module under test
+
+The module provides a `Sender` and a `*Reminders`. `Reminders` takes the time from a `clock.Clock`, which the kernel provides, never from `time.Now`:
+
+```go file=examples/guides/testing/reminders.go#module title="reminders.go"
+// Sender delivers a reminder. The real one would send an email.
+type Sender interface {
+	Send(ctx context.Context, to, text string) error
+}
+
+// logSender is the Sender the module provides: it only logs.
+type logSender struct{ log *slog.Logger }
+
+func (s logSender) Send(ctx context.Context, to, text string) error {
+	s.log.InfoContext(ctx, "reminder sent", "to", to)
+	return nil
+}
+
+// Reminders keeps reminders and sends the ones that are due.
+type Reminders struct {
+	clock  clock.Clock
+	sender Sender
+	mu     sync.Mutex
+	due    []reminder
+}
+
+type reminder struct {
+	at       time.Time
+	to, text string
+}
+
+// Add schedules a reminder after d.
+func (r *Reminders) Add(to, text string, d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.due = append(r.due, reminder{at: r.clock.Now().Add(d), to: to, text: text})
+}
+
+// SendDue sends every reminder whose time has come, and returns how many.
+func (r *Reminders) SendDue(ctx context.Context) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now, sent := r.clock.Now(), 0
+	var kept []reminder
+	for i, m := range r.due {
+		if m.at.After(now) {
+			kept = append(kept, m)
+			continue
+		}
+		if err := r.sender.Send(ctx, m.to, m.text); err != nil {
+			r.due = append(kept, r.due[i:]...) // keep what wasn't sent
+			return sent, err
+		}
+		sent++
+	}
+	r.due = kept
+	return sent, nil
+}
+
+// Module provides the Sender and the Reminders.
+type Module struct{}
+
+func (Module) Name() string { return "reminders" }
+
+func (Module) Register(r *galleon.Registry) error {
+	galleon.Provide[Sender](r, func(log *slog.Logger) Sender { return logSender{log} })
+	galleon.Provide[*Reminders](r, func(c clock.Clock, s Sender) *Reminders {
+		return &Reminders{clock: c, sender: s}
+	})
+	return nil
+}
+```
+
+## Boot the app
+
+`testkit.New` builds and starts an app from the options you pass, and shuts it down when the test ends. It fills in what a test needs:
+
+- a fake clock, starting at `testkit.Epoch`
+- the in-process coordination backend, as a single node
+- the `Test` profile, so migrations apply at boot
+- a logger that records into `h.Logs`, and prints them only if the test fails
+
+Any option you pass overrides these. `testkit.Get[T](h)` returns the app's instance of `T`.
+
+## Control time
+
+`h.Clock` is the clock every module got. Advance it, and the module sees the time pass at once:
+
+```go file=examples/guides/testing/reminders_test.go#clock title="reminders_test.go"
+func TestAReminderIsSentWhenItIsDue(t *testing.T) {
+	h := testkit.New(t, galleon.Modules(Module{}))
+	reminders := testkit.Get[*Reminders](h)
+	ctx := context.Background()
+
+	reminders.Add("ada@example.com", "standup", time.Hour)
+	if n, _ := reminders.SendDue(ctx); n != 0 {
+		t.Fatalf("sent %d before it was due", n)
+	}
+	h.Clock.Advance(time.Hour) // the app's clock; no test waits an hour
+	if n, _ := reminders.SendDue(ctx); n != 1 {
+		t.Fatalf("sent %d once due, want 1", n)
+	}
+	if !h.Logs.Contains("reminder sent") {
+		t.Errorf("nothing logged:\n%s", h.Logs)
+	}
+}
+```
+
+The in-process coordination backend keeps real time: advancing the clock doesn't expire its leases or counter windows.
+
+## Swap a dependency for a fake
+
+`galleon.Replace[T](value)` puts `value` in place of whatever provides `T`. It is used as is: its constructor never runs, and it is not started or stopped.
+
+```go file=examples/guides/testing/reminders_test.go#replace
+// fakeSender records what it is asked to send.
+type fakeSender struct{ sent []string }
+
+func (f *fakeSender) Send(ctx context.Context, to, text string) error {
+	f.sent = append(f.sent, to)
+	return nil
+}
+
+func TestTheSenderGetsEachDueReminder(t *testing.T) {
+	fake := &fakeSender{}
+	h := testkit.New(t, galleon.Modules(Module{}), galleon.Replace[Sender](fake))
+	reminders := testkit.Get[*Reminders](h)
+
+	reminders.Add("ada@example.com", "standup", 0)
+	reminders.Add("alan@example.com", "review", 0)
+	if _, err := reminders.SendDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.sent) != 2 {
+		t.Errorf("sent to %v, want both", fake.sent)
+	}
+}
+```
+
+Boot fails if nothing provides `T`, so a replacement can't go stale silently when the module changes.
+
+## Test against a real database
+
+`testkit.DB` gives the test a PostgreSQL database with your schema applied. Each test runs inside a transaction that is rolled back when it ends, so tests never see each other's rows and need no cleanup:
+
+```go file=examples/guides/testing/reminders_test.go#db
+func TestEachTestHasItsOwnTransaction(t *testing.T) {
+	db := testkit.DB(t, testkit.Schema("CREATE TABLE notes (body text NOT NULL)"))
+	ctx := context.Background()
+	m := db.Manager()
+
+	err := m.Write(ctx, func(ctx context.Context, tx data.WriteTx) error {
+		_, err := tx.Exec(ctx, "INSERT INTO notes VALUES ('only in this test')")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	err = m.Read(ctx, func(ctx context.Context, tx data.ReadTx) error {
+		return tx.QueryRow(ctx, "SELECT count(*) FROM notes").Scan(&n)
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("count = %d, %v; another test's rows would show here", n, err)
+	}
+}
+```
+
+Point `GALLEON_TEST_POSTGRES` at a server the tests may create databases on:
+
+```sh
+export GALLEON_TEST_POSTGRES='postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable'
+go test ./...
+```
+
+Without it, tests that need PostgreSQL skip. With `CI` set they fail instead, so a pipeline missing its database can't pass by skipping.
+
+To use the database from your app, pass `db.Module()` in place of `pg.Module()`. [A database](/docs/learn/database#test-against-a-real-database) in Learn does that.
+
+Because everything runs in one transaction, `testkit.DB` can't show what another connection sees. A test of migrations, or of replicas, needs committed data: use `testkit.PackageDSN` (for replicas, `db.DSN()` and `db.Replica(t)`) and clean up after the test, as [Deploy migrations safely](/docs/guides/migrations) does.
+
+## Test over HTTP
+
+`server.Server.Handler()` serves the app's routes to an `httptest` recorder, with no listener. [Your first service](/docs/learn/first-service#test-it) tests that way.
