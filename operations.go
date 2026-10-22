@@ -62,9 +62,9 @@ type registeredOp struct {
 }
 
 type stageImpl struct {
-	i      op.Interceptor
-	module string
-	site   string
+	prepare func(d *op.Descriptor) (op.Interceptor, error)
+	module  string
+	site    string
 }
 
 // Operation registers an operation and its handler, which must be a
@@ -175,22 +175,46 @@ var implementable = map[op.Stage]bool{
 }
 
 // ImplementStage installs the implementation of a pipeline stage, such as
-// authentication or authorization. Each stage has at most one implementation.
+// authentication or authorization, the same for every operation. Each stage
+// has at most one implementation.
 func (r *Registry) ImplementStage(s op.Stage, i op.Interceptor) {
-	site := callerSite(2)
-	switch {
-	case !implementable[s]:
-		r.errorf("ImplementStage: the %v stage is implemented by the kernel", s)
-		return
-	case i == nil:
+	if i == nil {
 		r.errorf("ImplementStage(%v): the implementation is nil", s)
+		return
+	}
+	r.implementStage(s, "ImplementStage", func(*op.Descriptor) (op.Interceptor, error) { return i, nil })
+}
+
+// PrepareStage installs the implementation of a pipeline stage, prepared
+// once for each operation while New compiles the pipelines, so that work
+// which depends only on the descriptor, such as checking its declaration or
+// planning how to read its input, is done at boot rather than per call.
+//
+// prepare gets each operation's descriptor, which it must not modify. It
+// returns the stage's interceptor for that operation, or nil when the stage
+// has nothing to do for it, which leaves the stage out of its chain. An
+// error fails boot, naming the operation. A stage the operation's security
+// declaration needs can't be left out: a nil interceptor for it fails boot
+// too. Each stage has at most one implementation.
+func (r *Registry) PrepareStage(s op.Stage, prepare func(d *op.Descriptor) (op.Interceptor, error)) {
+	if prepare == nil {
+		r.errorf("PrepareStage(%v): the preparation is nil", s)
+		return
+	}
+	r.implementStage(s, "PrepareStage", prepare)
+}
+
+func (r *Registry) implementStage(s op.Stage, method string, prepare func(d *op.Descriptor) (op.Interceptor, error)) {
+	site := callerSite(3)
+	if !implementable[s] {
+		r.errorf("%s: the %v stage is implemented by the kernel", method, s)
 		return
 	}
 	if prev, ok := r.app.stageImpls[s]; ok {
 		r.errorf("the %v stage is already implemented by module %q (%s)", s, prev.module, prev.site)
 		return
 	}
-	r.app.stageImpls[s] = stageImpl{i: i, module: r.module, site: site}
+	r.app.stageImpls[s] = stageImpl{prepare: prepare, module: r.module, site: site}
 }
 
 // compileOperations checks operations against each other and against the
@@ -203,11 +227,6 @@ func (a *App) compileOperations() {
 	httpOwners := map[string]string{} // pattern -> operation ID
 	httpPaths := map[string]string{}  // HTTP binding path -> operation ID
 	rpcPaths := map[string]string{}   // RPC procedure path -> operation ID
-	needStage := func(o registeredOp, s op.Stage, why string) {
-		if _, ok := a.stageImpls[s]; !ok {
-			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q %s, but no module implements the %v stage", o.module, o.site, o.desc.ID, why, s))
-		}
-	}
 	for _, o := range a.ops {
 		if prev, ok := ids[o.desc.ID]; ok {
 			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q is already registered at %s", o.module, o.site, o.desc.ID, prev.site))
@@ -258,36 +277,28 @@ func (a *App) compileOperations() {
 				httpOwners["POST "+path] = o.desc.ID
 			}
 		}
-		sec := o.desc.Security
-		if !sec.Public {
-			needStage(o, op.StagePreAuthorize, "requires permission for "+sec.Action)
-		}
-		if sec.Resource != nil {
-			needStage(o, op.StageAuthorize, "checks access to a "+sec.Resource.Kind)
-		}
-		if len(sec.Schemes) > 0 {
-			needStage(o, op.StageAuthenticate, "restricts authentication schemes")
-		}
-		if len(sec.Contexts) > 0 {
-			needStage(o, op.StageResolveContext, "accepts only some operating contexts")
-			needStage(o, op.StageGate, "accepts only some operating contexts")
+		for _, n := range securityNeeds(&o.desc) {
+			if _, ok := a.stageImpls[n.stage]; !ok {
+				a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q %s, but no module implements the %v stage", o.module, o.site, o.desc.ID, n.why, n.stage))
+			}
 		}
 	}
 
-	stages := map[op.Stage]op.Interceptor{
+	kernelStages := map[op.Stage]op.Interceptor{
 		op.StageAdmit:           a.admit,
 		op.StageDecode:          decodeStage,
 		op.StageValidateShape:   validateStage(func(d *op.Descriptor) func(context.Context, any) *op.ValidationError { return d.Shape }),
 		op.StageValidateMeaning: validateStage(func(d *op.Descriptor) func(context.Context, any) *op.ValidationError { return d.Meaning }),
-	}
-	for s, impl := range a.stageImpls {
-		stages[s] = impl.i
 	}
 	for _, o := range a.ops {
 		if _, dup := a.operations.byID[o.desc.ID]; dup {
 			continue
 		}
 		d := o.desc
+		stages, ok := a.prepareStages(o, &d, kernelStages)
+		if !ok {
+			continue
+		}
 		inv, steps := op.Compile(o.handler, op.Plan{Stages: stages, Placed: a.interceptors})
 		x := &Operation{Desc: &d, Module: o.module, Site: o.site, Steps: steps, inType: reflect.PointerTo(d.Input.Type)}
 		// The invoker always runs this operation's descriptor, whatever the
@@ -302,6 +313,68 @@ func (a *App) compileOperations() {
 		a.operations.all = append(a.operations.all, x)
 		a.operations.byID[d.ID] = x
 	}
+}
+
+// securityNeed is a stage an operation's security declaration can't run
+// without, and why.
+type securityNeed struct {
+	stage op.Stage
+	why   string
+}
+
+// securityNeeds lists the stages d's security declaration needs.
+func securityNeeds(d *op.Descriptor) []securityNeed {
+	var needs []securityNeed
+	sec := &d.Security
+	if !sec.Public {
+		needs = append(needs, securityNeed{op.StagePreAuthorize, "requires permission for " + sec.Action})
+	}
+	if sec.Resource != nil {
+		needs = append(needs, securityNeed{op.StageAuthorize, "checks access to a " + sec.Resource.Kind})
+	}
+	if len(sec.Schemes) > 0 {
+		needs = append(needs, securityNeed{op.StageAuthenticate, "restricts authentication schemes"})
+	}
+	if len(sec.Contexts) > 0 {
+		needs = append(needs,
+			securityNeed{op.StageResolveContext, "accepts only some operating contexts"},
+			securityNeed{op.StageGate, "accepts only some operating contexts"})
+	}
+	return needs
+}
+
+// prepareStages returns the stage implementations operation o runs: the
+// kernel's, and each module's as prepared for d. It reports false, having
+// recorded why, when a preparation fails or leaves out a stage o's security
+// declaration needs.
+func (a *App) prepareStages(o registeredOp, d *op.Descriptor, kernel map[op.Stage]op.Interceptor) (map[op.Stage]op.Interceptor, bool) {
+	stages := make(map[op.Stage]op.Interceptor, len(kernel)+len(a.stageImpls))
+	for s, i := range kernel {
+		stages[s] = i
+	}
+	ok := true
+	for s := op.StageRoute; s <= op.StageEncode; s++ {
+		impl, has := a.stageImpls[s]
+		if !has {
+			continue
+		}
+		i, err := impl.prepare(d)
+		if err != nil {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q: the %v stage of module %q: %w", o.module, o.site, d.ID, s, impl.module, err))
+			ok = false
+			continue
+		}
+		if i != nil {
+			stages[s] = i
+		}
+	}
+	for _, n := range securityNeeds(d) {
+		if impl, has := a.stageImpls[n.stage]; has && stages[n.stage] == nil {
+			a.bootErrs = append(a.bootErrs, fmt.Errorf("module %q (%s): operation %q %s, but module %q (%s) leaves the %v stage out of its pipeline", o.module, o.site, d.ID, n.why, impl.module, impl.site, n.stage))
+			ok = false
+		}
+	}
+	return stages, ok
 }
 
 // probePattern registers pattern on a scratch ServeMux, turning its panic on

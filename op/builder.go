@@ -34,6 +34,7 @@ func (b *Builder[In, Out]) Describe() Descriptor {
 	d.Errors = append([]string(nil), d.Errors...)
 	d.Security.Schemes = append([]string(nil), d.Security.Schemes...)
 	d.Security.Contexts = append([]string(nil), d.Security.Contexts...)
+	d.Security.Inputs = append([]string(nil), d.Security.Inputs...)
 	d.Docs.Tags = append([]string(nil), d.Docs.Tags...)
 	d.Input.Codecs = append([]Codec(nil), d.Input.Codecs...)
 	d.Output.Codecs = append([]Codec(nil), d.Output.Codecs...)
@@ -91,9 +92,18 @@ func (b *Builder[In, Out]) Schemes(s ...string) *Builder[In, Out] {
 	return b
 }
 
-// Contexts restricts the operating context kinds the operation accepts.
-func (b *Builder[In, Out]) Contexts(kinds ...string) *Builder[In, Out] {
-	b.d.Security.Contexts = append(b.d.Security.Contexts, kinds...)
+// Contexts restricts the operating context domains the operation accepts,
+// such as "org".
+func (b *Builder[In, Out]) Contexts(domains ...string) *Builder[In, Out] {
+	b.d.Security.Contexts = append(b.d.Security.Contexts, domains...)
+	return b
+}
+
+// Inputs names the context providers, such as "request" or a billing
+// provider, whose attributes resolving the operation's context may use.
+// Resolution gets only these.
+func (b *Builder[In, Out]) Inputs(providers ...string) *Builder[In, Out] {
+	b.d.Security.Inputs = append(b.d.Security.Inputs, providers...)
 	return b
 }
 

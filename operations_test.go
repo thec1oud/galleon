@@ -212,6 +212,58 @@ func TestAStageHasOneImplementation(t *testing.T) {
 	bootFails(t, `the authorize stage is already implemented by module "authz1"`, impl("authz1"), impl("authz2"))
 }
 
+func TestAPreparedStageIsPreparedOncePerOperation(t *testing.T) {
+	var prepared []string
+	secret := op.Unary[GreetIn, GreetOut]("greet.secret").Authorize("greet:secret")
+	mod := opsModule(func(r *galleon.Registry) {
+		r.Operation(Greet, greet)
+		r.Operation(secret, greet)
+		r.PrepareStage(op.StagePreAuthorize, func(d *op.Descriptor) (op.Interceptor, error) {
+			prepared = append(prepared, d.ID)
+			if d.Security.Public {
+				return nil, nil // public operations skip the stage
+			}
+			action := d.Security.Action
+			return func(next op.Invoker) op.Invoker {
+				return func(ctx context.Context, c *op.Call) (any, error) {
+					return nil, errs.New(errs.PermissionDenied, "test.denied", action)
+				}
+			}, nil
+		})
+	})
+	_, ops := bootOps(t, mod)
+	if got := strings.Join(prepared, ","); got != "greet.hello,greet.secret" {
+		t.Fatalf("prepared for %s", got)
+	}
+	if steps := strings.Join(ops.Lookup("greet.hello").Steps, ","); strings.Contains(steps, "pre_authorize") {
+		t.Fatalf("the public operation runs the stage: %s", steps)
+	}
+	if _, err := ops.Call(context.Background(), "greet.hello", &GreetIn{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ops.Call(context.Background(), "greet.secret", &GreetIn{}); errs.From(err).Message != "greet:secret" {
+		t.Fatalf("secret: %v", err)
+	}
+}
+
+func TestAPreparationCantFailOrLeaveOutANeededStage(t *testing.T) {
+	secret := op.Unary[GreetIn, GreetOut]("greet.secret").Authorize("greet:secret")
+	bootFails(t, `operation "greet.secret": the pre_authorize stage of module "greet": no such policy`, opsModule(func(r *galleon.Registry) {
+		r.Operation(secret, greet)
+		r.PrepareStage(op.StagePreAuthorize, func(*op.Descriptor) (op.Interceptor, error) { return nil, errors.New("no such policy") })
+	}))
+	bootFails(t, `operation "greet.secret" requires permission for greet:secret, but module "greet" (`, opsModule(func(r *galleon.Registry) {
+		r.Operation(secret, greet)
+		r.PrepareStage(op.StagePreAuthorize, func(*op.Descriptor) (op.Interceptor, error) { return nil, nil })
+	}))
+	bootFails(t, "PrepareStage(pre_authorize): the preparation is nil", opsModule(func(r *galleon.Registry) {
+		r.PrepareStage(op.StagePreAuthorize, nil)
+	}))
+	bootFails(t, "PrepareStage: the decode stage is implemented by the kernel", opsModule(func(r *galleon.Registry) {
+		r.PrepareStage(op.StageDecode, func(*op.Descriptor) (op.Interceptor, error) { return nil, nil })
+	}))
+}
+
 func TestPreAuthorizeRunsBeforeDecodeAndShapeBeforeAuthorize(t *testing.T) {
 	var log []string
 	mark := func(name string) op.Interceptor {

@@ -88,7 +88,8 @@ type Codec interface {
 type Security struct {
 	Public   bool
 	Schemes  []string     // accepted authentication schemes; empty means any
-	Contexts []string     // accepted operating context kinds; empty means any
+	Contexts []string     // accepted operating context domains; empty means any
+	Inputs   []string     // context providers whose attributes resolving the context may use
 	Action   string       // checked before decode (stage 5b)
 	Resource *ResourceRef // checked after decode (stage 8)
 }
