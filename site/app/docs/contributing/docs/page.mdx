@@ -79,3 +79,15 @@ bun run typecheck
 bun run build                    # fails on a stale sample, a missing region, or a broken page
 test -z "$(gofmt -l examples)" && go vet ./... && go test -race ./...   # the samples
 ```
+
+## Deploys
+
+The site is hosted on [Vercel](https://vercel.com/), from `site/vercel.json`:
+
+| Branch | Deploys to |
+|---|---|
+| `master` | the docs' own domain, the stable docs |
+| `dev` | the dev domain, with a banner saying it may describe work that hasn't reached `master` |
+| any other | a preview link on its pull request, with a banner naming the branch |
+
+Only the stable docs are indexed by search engines. The banner and the indexing come from the environment Vercel sets at build time, so local and CI builds look like the stable docs.

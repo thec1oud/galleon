@@ -44,5 +44,8 @@
     "typescript": "5.9.3",
     "unist-util-visit": "5.1.0"
   },
+  "engines": {
+    "node": "22.x"
+  },
   "packageManager": "bun@1.4.2"
 }
