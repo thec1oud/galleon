@@ -1,0 +1,197 @@
+---
+title: "Read from replicas"
+description: "Add streaming replicas, choose each read's consistency, and keep read-your-writes across requests with a causal token."
+order: 3
+---
+
+# Read from replicas
+
+Galleon sends reads to PostgreSQL streaming replicas when it is safe to, and to the primary when it isn't. Your code never names a replica: you add them in config, and each read's consistency decides where it goes. This guide adds a replica to a small notes service and tests what each read sees while the replica lags.
+
+You need a primary with at least one streaming replica. For how routing and tokens work, see [Data](/docs/concepts/data#read-consistency) in Concepts.
+
+## Add the replicas
+
+List them in the `pg` section. Set `token_key` too, so read-your-writes holds across requests:
+
+```go file=examples/guides/replicas/notes_test.go#config title="notes_test.go"
+// config is the "pg" section with one replica, and a key that signs the
+// token a write returns.
+func config(primary, replica string) []byte {
+	return []byte(`{"pg": {
+		"primary": {"dsn": "` + primary + `"},
+		"replicas": [{"dsn": "` + replica + `"}],
+		"max_lag": 60000000000,
+		"token_key": "a key of at least 32 bytes, from a secret store"
+	}}`)
+}
+```
+
+In production, `token_key` comes from a secret store, through the environment variable `<APP>_PG_TOKEN_KEY`. Every node sharing the database must share it.
+
+`max_lag` takes a replica out of rotation while it is that far behind; the default is two seconds. Durations in this section are numbers of nanoseconds in the file, so `60000000000` is one minute, and strings with a unit, such as `1m`, in the environment.
+
+Each replica is polled in the background. One that can't be reached leaves rotation, and the app stays ready.
+
+## Choose each read's consistency
+
+A read that begins a transaction can run on a replica, as its consistency allows:
+
+| Level | Reads |
+|---|---|
+| `data.ReadYourWrites` (the default) | a replica that has every write this call, or the call whose token it brought, committed; else the primary |
+| `data.Any` | any replica in rotation |
+| `data.BoundedStaleness(d)` | a replica at most `d` behind |
+| `data.Primary` | always the primary |
+
+An operation declares the default for its reads with `Consistency`. Here `Get` keeps read-your-writes, and `Count` accepts a count a little behind:
+
+```go file=examples/guides/replicas/notes.go#operations title="notes.go"
+var (
+	Create = op.Unary[CreateIn, Note]("notes.create").
+		HTTP("POST", "/notes").
+		Public()
+
+	// Get reads at the default consistency, read_your_writes: a replica
+	// that has every write the caller made, or else the primary.
+	Get = op.Unary[GetIn, Note]("notes.get").
+		HTTP("GET", "/notes/{id}").
+		Public().
+		Errors(CodeNotFound)
+
+	// Count may be a little behind, so any replica in rotation will do.
+	Count = op.Unary[struct{}, Stats]("notes.count").
+		HTTP("GET", "/notes/count").
+		Public().
+		Consistency(data.Any)
+)
+```
+
+The store reads and writes as it would without replicas. Writes, and reads inside a write transaction, never leave the primary:
+
+```go file=examples/guides/replicas/notes.go#store
+// Store keeps notes in the database. Its code never names a replica: each
+// read goes where its operation's consistency allows.
+type Store struct{ db data.Manager }
+
+func (s *Store) Create(ctx context.Context, body string) (*Note, error) {
+	var n Note
+	err := s.db.Write(ctx, func(ctx context.Context, tx data.WriteTx) error {
+		return tx.QueryRow(ctx, "INSERT INTO notes (body) VALUES ($1) RETURNING id::text, body", body).Scan(&n.ID, &n.Body)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+func (s *Store) Get(ctx context.Context, id string) (*Note, error) {
+	notFound := errs.New(errs.NotFound, CodeNotFound, "no such note")
+	key, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || strconv.FormatInt(key, 10) != id {
+		return nil, notFound
+	}
+	var n Note
+	err = s.db.Read(ctx, func(ctx context.Context, tx data.ReadTx) error {
+		return tx.QueryRow(ctx, "SELECT id::text, body FROM notes WHERE id = $1", key).Scan(&n.ID, &n.Body)
+	})
+	if errors.Is(err, data.ErrNoRows) {
+		return nil, notFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+func (s *Store) Count(ctx context.Context) (*Stats, error) {
+	var st Stats
+	err := s.db.Read(ctx, func(ctx context.Context, tx data.ReadTx) error {
+		return tx.QueryRow(ctx, "SELECT count(*) FROM notes").Scan(&st.Notes)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+```
+
+A single read can ask for a level of its own with `data.Consistency(level)`, which wins over the operation's.
+
+## Send the token back
+
+A call that commits a write returns a signed token in the `Galleon-Consistency` response header. A client that sends it back on its next call reads at least that write, from whichever node serves the call. Without it, read-your-writes holds within one call only.
+
+This test pauses replay on the replica, so it lags behind every write, then reads with and without the token:
+
+```go file=examples/guides/replicas/notes_test.go#test
+func TestTheTokenReadsTheCallersOwnWrite(t *testing.T) {
+	db := testkit.DB(t, testkit.Schema(schema)) // skips unless GALLEON_TEST_POSTGRES is set
+	rep := db.Replica(t)                        // skips unless GALLEON_TEST_POSTGRES_REPLICA is set
+	t.Cleanup(func() { deleteAll(t, db.DSN()) })
+	t.Setenv("NOTES_HTTP_ADDR", "127.0.0.1:0")
+	h := testkit.New(t,
+		galleon.Name("notes"),
+		galleon.Modules(server.Module(), pg.Module(), Notes{}),
+		galleon.ConfigJSON(config(db.DSN(), rep.DSN())),
+	)
+	api := testkit.Get[*server.Server](h).Handler()
+
+	rep.Pause() // from here on, the replica lags behind every write
+
+	w := call(api, "POST", "/notes", `{"body": "replicas lag"}`, "")
+	var saved Note
+	if err := json.Unmarshal(w.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	token := w.Header().Get(pg.ConsistencyHeader)
+	if token == "" {
+		t.Fatal("the write returned no token")
+	}
+
+	// With the token, the read goes to the primary: the replica hasn't
+	// replayed the write.
+	if w := call(api, "GET", "/notes/"+saved.ID, "", token); w.Code != http.StatusOK {
+		t.Fatalf("with the token: %d %s", w.Code, w.Body)
+	}
+	// Without it, the replica qualifies, and doesn't have the note yet.
+	// (The tracker polls in the background, so the replica joins the
+	// rotation a moment after boot.)
+	eventually(t, "a read without the token to miss the note", func() bool {
+		return call(api, "GET", "/notes/"+saved.ID, "", "").Code == http.StatusNotFound
+	})
+	// Count reads any replica, so it is behind too.
+	if w := call(api, "GET", "/notes/count", "", ""); !strings.Contains(w.Body.String(), `"notes":0`) {
+		t.Fatalf("count: %s", w.Body)
+	}
+}
+
+// call sends a request to api, with a token when it isn't empty.
+func call(api http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set(pg.ConsistencyHeader, token)
+	}
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	return w
+}
+```
+
+Tokens are honored for ten minutes (`token_ttl`). An expired, forged or malformed token is ignored, and the read behaves as if none was sent.
+
+## Test with a replica
+
+`testkit` can pause and resume replay on a real replica. Point `GALLEON_TEST_POSTGRES_REPLICA` at a streaming replica of the server `GALLEON_TEST_POSTGRES` names, as a user allowed to pause replay:
+
+```sh
+export GALLEON_TEST_POSTGRES='postgres://postgres@localhost:5432/postgres?sslmode=disable'
+export GALLEON_TEST_POSTGRES_REPLICA='postgres://postgres@localhost:5433/postgres?sslmode=disable'
+```
+
+`db.Replica(t)` returns the test's database on the replica, once replay has caught up. Tests that use it take turns, since pausing replay pauses it for everyone. Without the variable they skip, and with `CI` set they fail.
+
+A replica only has committed data, so these tests commit, and clean up after themselves.

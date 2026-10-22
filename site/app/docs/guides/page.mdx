@@ -1,13 +1,18 @@
 ---
 title: "Guides"
-description: "Step-by-step answers to \"how do I…?\". None are written yet."
+description: "Step-by-step answers to \"how do I…?\", each ending with tested code."
 order: 2
 ---
 
 # Guides
 
-Each guide starts from a goal, such as "run a migration safely" or "test with a fake clock", and ends with working code. Guides assume you know the basics from [Learn](/docs/learn), and link to [Concepts](/docs/concepts) for the why.
+Each guide starts from a goal and ends with working code, tested in CI. Guides assume you know the basics from [Learn](/docs/learn), and link to [Concepts](/docs/concepts) for the why.
 
-<Callout>
-No guides are written yet. The first will cover what already works: migrations, replicas, and testing with `testkit`.
-</Callout>
+| Guide | Goal |
+|---|---|
+| [Test with testkit](/docs/guides/testing) | Boot a real app in a test, with a fake clock, fakes and a database |
+| [Deploy migrations safely](/docs/guides/migrations) | Get a schema change to production, applying only the approved plan |
+| [Read from replicas](/docs/guides/replicas) | Spread reads across replicas without reading stale data by accident |
+| [Choose a coordination backend](/docs/guides/coordination) | Match the backend to the deploy, and let boot catch a mismatch |
+
+Guides cover what is built. The job system and cluster coordination backends get theirs when they ship.

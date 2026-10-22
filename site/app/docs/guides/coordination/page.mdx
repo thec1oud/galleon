@@ -1,0 +1,112 @@
+---
+title: "Choose a coordination backend"
+description: "Pick the backend for how your app is deployed, declare what each module needs, and let boot catch a mismatch."
+order: 4
+---
+
+# Choose a coordination backend
+
+Locks, leader election and rate limits need a coordination backend, and Galleon has no default: every app passes one to `galleon.Coordination`. This guide picks one, and shows how boot refuses a backend that can't keep a module's guarantees. For the why, see [Coordination](/docs/concepts/coordination).
+
+## Pick one for how you deploy
+
+Today there is one backend, [`coord/local`](https://pkg.go.dev/github.com/thec1oud/galleon/coord/local). It is exact, but only inside one process. Use it when the app runs as a single process, and say so:
+
+```go
+galleon.Coordination(local.New()),
+galleon.Deploy(galleon.SingleNode),
+```
+
+Without `galleon.Deploy`, the app boots and logs a line asking you to declare it.
+
+For an app that runs as several processes, there is no backend yet. Cluster backends, on PostgreSQL first, are planned.
+
+## Declare what each module needs
+
+A module that relies on a capability declares it with `r.Needs`. This one sends a daily digest, and uses a lock so that only one node sends it at a time:
+
+```go file=examples/guides/coordination/digest.go#module title="digest.go"
+// Digest sends the daily digest. However many nodes run it, the lock lets
+// only one send at a time.
+type Digest struct {
+	locks coord.Locker
+	log   *slog.Logger
+}
+
+// Module provides *Digest, and declares that it needs locks: boot fails on
+// a backend that can't give them, or can give them only per process while
+// the app runs as several.
+func Module() galleon.Module {
+	return galleon.ModuleFunc("digest", func(r *galleon.Registry) error {
+		r.Needs(coord.Locks)
+		galleon.Provide[*Digest](r, func(b coord.Backend, log *slog.Logger) *Digest {
+			return &Digest{locks: b.Locks(), log: log}
+		})
+		return nil
+	})
+}
+
+// Send sends the digest, unless another node is sending it: then it
+// returns false and does nothing.
+func (d *Digest) Send(ctx context.Context) (bool, error) {
+	lease, ok, err := d.locks.TryAcquire(ctx, "digest.daily", time.Minute)
+	if err != nil || !ok {
+		return false, err
+	}
+	defer lease.Release(context.WithoutCancel(ctx))
+	d.log.InfoContext(ctx, "digest sent")
+	return true, nil
+}
+```
+
+On a single node, the lock works as it would across a cluster:
+
+```go file=examples/guides/coordination/digest_test.go#single title="digest_test.go"
+func TestOneNodeSendsAtATime(t *testing.T) {
+	h := testkit.New(t, galleon.Modules(Module())) // local.New() as a single node
+	d := testkit.Get[*Digest](h)
+	ctx := context.Background()
+
+	// Another node holds the lock: this one doesn't send.
+	lease, _, err := h.Coordination().Locks().TryAcquire(ctx, "digest.daily", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent, err := d.Send(ctx); sent || err != nil {
+		t.Fatalf("Send while the lock was held = %v, %v", sent, err)
+	}
+	if err := lease.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sent, err := d.Send(ctx); !sent || err != nil {
+		t.Fatalf("Send = %v, %v", sent, err)
+	}
+	if !h.Logs.Contains("digest sent") {
+		t.Fatal("nothing logged")
+	}
+}
+```
+
+## Let boot catch a mismatch
+
+Boot fails if the backend lacks a capability a module needs. It also fails when a process-scoped backend meets an app that runs as several processes, with `galleon.Deploy(galleon.MultiNode)` or under the [process supervisor](https://pkg.go.dev/github.com/thec1oud/galleon/process):
+
+```go file=examples/guides/coordination/digest_test.go#multi
+func TestAnInProcessBackendRefusesSeveralNodes(t *testing.T) {
+	_, err := galleon.New(
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.MultiNode),
+		galleon.Modules(Module()),
+	)
+	if err == nil || !strings.Contains(err.Error(), "only guarantees within one process") {
+		t.Fatalf("New = %v", err)
+	}
+}
+```
+
+```txt
+galleon: 1 boot problem(s):
+  - the app runs as several processes (multi-node, or under a supervisor) but coordination backend "local" only guarantees within one process; use a cluster backend, or set galleon.AllowPerProcessGuarantees() to accept per-process guarantees
+```
+
+`galleon.AllowPerProcessGuarantees()` boots anyway, and logs a warning for each guarantee that now holds per process only. With it, two nodes could each send the digest. Use it only where that is acceptable.
