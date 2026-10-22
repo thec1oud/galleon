@@ -10,7 +10,7 @@ import (
 // none of them links a Postgres driver, even through the data package's
 // seam.
 func TestTheKernelTheOpPlaneAndTheTransportsDontLinkPostgres(t *testing.T) {
-	for _, pkg := range []string{".", "./op", "./server", "./client"} {
+	for _, pkg := range []string{".", "./op", "./server", "./client", "./security/..."} {
 		for _, dep := range deps(t, pkg) {
 			if strings.HasPrefix(dep, "github.com/jackc/") {
 				t.Errorf("%s depends on %s", pkg, dep)
