@@ -35,6 +35,11 @@ the old one. [ADR 0001](0001-record-architecture-decisions.md) explains why.
 | 0020 | [Integrate every external service through one kit, with CloudEvents on the wire](0020-one-integration-kit.md) | Accepted |
 | 0021 | [Keep authorization generic: resolve context first, then decide locally](0021-generic-authorization-seams.md) | Accepted |
 | 0022 | [Ship the frontend as a battery: templ, fragment responses, and Vite as a seam](0022-frontend-battery.md) | Accepted |
+| 0201 | [Choose each operation's authenticators by scheme, and stop at invalid credentials](0201-choose-authenticators-by-scheme.md) | Proposed |
+| 0202 | [Cache authorization decisions per call only, and leave longer caching to the engine](0202-cache-decisions-per-call.md) | Proposed |
+| 0203 | [Prepare each module's pipeline stage once per operation, at boot](0203-prepare-stages-per-operation.md) | Proposed |
+| 0204 | [Run calls made in process as their caller, and never trust a caller from a network call's context](0204-in-process-calls-keep-their-caller.md) | Proposed |
+| 0205 | [Verify bearer tokens only with an issuer's published asymmetric keys](0205-asymmetric-bearer-tokens.md) | Proposed |
 
 Records 0002 to 0022 were written on 2026-10-22 from the design discussion
 that preceded them. Their dates are when each decision was first committed
