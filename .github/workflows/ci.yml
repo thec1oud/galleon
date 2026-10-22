@@ -40,3 +40,36 @@ jobs:
         run: |
           docker logs galleon-pg-primary || true
           docker logs galleon-pg-standby || true
+
+  adr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test the ADR check
+        run: .github/scripts/adr-check-test.sh
+      # Records accepted before this change must be unchanged except for
+      # their Status: line, and nothing merges while still Proposed. On a
+      # pull request, HEAD is GitHub's merge of the branch into its target,
+      # so its first parent is the target as the merge saw it. On a push,
+      # the base is the commit before the push, fetched if a force push
+      # left it out of the clone; a push that created the branch has none.
+      - name: Check the ADRs
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          base=""
+          if [ "$EVENT" = pull_request ]; then
+            base=$(git rev-parse HEAD^1)
+          elif [ -n "$PUSH_BEFORE" ] && ! [[ "$PUSH_BEFORE" =~ ^0+$ ]]; then
+            base=$PUSH_BEFORE
+            if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$base" || {
+                echo "::error::the commit before this push ($base) can't be fetched, so accepted ADRs can't be checked for edits"
+                exit 1
+              }
+            fi
+          fi
+          .github/scripts/adr-check.sh --decided $base
