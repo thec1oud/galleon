@@ -90,7 +90,7 @@ The site is hosted on [Vercel](https://vercel.com/), from `site/vercel.json`:
 | `dev` | the dev domain, with a banner saying it may describe work that hasn't reached `master` |
 | any other | a preview link on its pull request, with a banner naming the branch |
 
-Only the stable docs are indexed by search engines. The banner and the indexing come from the branch and environment Vercel sets at build time, so local and CI builds look like the stable docs. Vercel installs the dependencies with Bun 1.4.2, the version CI uses, through `bunx`, since the Bun its build image ships comes first on its `PATH`. That Bun runs the build scripts. The site runs on Node 22, as in CI.
+Only the stable docs are indexed by search engines. The banner and the indexing come from the branch and environment Vercel sets at build time, so local and CI builds look like the stable docs. Vercel installs and builds with the Bun its build image ships, and prints its version at the start of the install step. The frozen lockfile keeps the dependencies the same as CI's, and the site runs on Node 22, as in CI.
 
 The Vercel project needs these settings:
 
