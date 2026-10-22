@@ -19,8 +19,9 @@ there is one implementation. Three rules keep pairs correct:
    it. `Begin` on a handle you were given creates a savepoint, so a callee's
    `Commit` can never commit its caller's work. The type enforces this.
 2. **`defer tx.Rollback(ctx)` is always safe**: a no-op after `Commit`.
-3. **Leak detection.** A transaction still open when its request or job ends
-   is reported with where it began, and rolled back.
+3. **Leak detection.** A transaction still open when the operation that
+   began it ends (and, once the job system exists, its job) is reported with
+   where it began, and rolled back.
 
 Only the closure form **retries automatically** on serialization failures
 and deadlocks (SQLSTATE `40001` and `40P01`), because only a closure can be

@@ -18,7 +18,10 @@ and it imported Galleon, neither could be used alone.
 - A battery imports only the core's public API, never its internals.
 - Nothing imports `testkit` except tests.
 
-These rules are checked in CI by import-graph tests.
+These rules are to be enforced in CI by an import-graph check. Today,
+`deps_test.go` checks the narrower rules that the kernel, the operation
+plane and the transports link no Postgres driver, and that the data seam
+links only pgx's types and the error model.
 
 ## Consequences
 

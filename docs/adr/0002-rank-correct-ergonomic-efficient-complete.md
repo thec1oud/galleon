@@ -18,8 +18,8 @@ core**.
 
 Efficiency has a hard budget: no ergonomic feature may add per-request
 reflection or allocation on the hot path unless the user opts in. Each
-component documents its hot-path cost, and benchmarks in CI catch
-regressions.
+component is to document its hot-path cost, and benchmarks in CI are to
+catch regressions.
 
 Completeness is delivered through batteries and seams, not a bigger core.
 
@@ -45,5 +45,7 @@ Completeness is delivered through batteries and seams, not a bigger core.
 
 ## Sources
 
-- [Part 4: decision D5, Round 2 and Pushback 7](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/04-desires-debate.md#decisions-so-far)
+- [Part 4: decision D5](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/04-desires-debate.md#decisions-so-far)
+- [Part 4: ergonomics vs efficiency, in Round 2](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/04-desires-debate.md#ergonomics-vs-efficiency-d5-ergonomics-with-an-efficiency-budget)
+- [Part 4: Pushback 7](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/04-desires-debate.md#pushback-7-correct-complete-ergonomic-will-conflict-so-rank-them)
 - [Part 5: principle 1](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/05-architecture.md#0-principles)

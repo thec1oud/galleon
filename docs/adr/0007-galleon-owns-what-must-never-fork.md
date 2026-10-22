@@ -38,5 +38,5 @@ Galleon owns these, and they are never seams:
 
 ## Sources
 
-- [Part 4: Pushback 8, revised by Pushback 10](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/04-desires-debate.md#pushback-8-what-should-never-be-a-seam)
+- [Part 4: Pushback 8](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/04-desires-debate.md#pushback-8-what-should-never-be-a-seam), revised by [Pushback 10](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/04-desires-debate.md#pushback-10-themis-the-api-dsl)
 - [Part 5: principle 6](https://github.com/thec1oud/galleon/blob/0897d74/docs/design/05-architecture.md#0-principles)

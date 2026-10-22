@@ -19,11 +19,12 @@ explicitly, including `local` for single-node deployments.
 - Components declare what they need from coordination, and boot checks those
   needs against the configured backend.
 - With `local`, components that need cluster-wide guarantees still work, but
-  Galleon logs that their guarantees are per process, at boot and in the
-  operations endpoint.
-- An app declares its deployment. With `Deploy(MultiNode)`, a
-  process-scoped backend fails boot unless the app explicitly accepts
-  per-process guarantees.
+  Galleon tells the operator that those guarantees hold only within one
+  process.
+- An app declares its deployment. When it runs as several processes
+  (declared with `Deploy(MultiNode)`, or detected, as under a process
+  supervisor) and a component needs coordination, a process-scoped backend
+  fails boot unless the app explicitly accepts per-process guarantees.
 
 Planned backends are `local`, Postgres, Redis, NATS and etcd, none of them
 the default.

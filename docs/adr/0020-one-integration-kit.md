@@ -13,10 +13,10 @@ problems three times, and every third-party service would need a fourth.
 
 ## Decision
 
-Galleon's core has one **integration kit**: outbox, inbox and
+Galleon's core will have one **integration kit**: outbox, inbox and
 deduplication, event consumer, resilient typed client, a local cache with
 invalidation built on coordination, and webhook verification. comms,
-vantage, billing and any third party (Stripe, Auth0, Twilio) become thin
+vantage, billing and any third party (Stripe, Auth0, Twilio) will be thin
 adapters on it. **CloudEvents** is the envelope for everything passing
 through the outbox and inbox.
 

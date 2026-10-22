@@ -16,15 +16,15 @@ Galleon still needs dependency injection that is pleasant to use.
   constructed and passed in, and every piece of wiring can be found with
   "go to definition".
 - **Dependency injection uses reflection at boot by default.** Code
-  generation is optional, for teams that want it.
+  generation is to be an option for teams that want it.
 - **Reflection is allowed at boot, never per request** (ADR 0002's budget).
 
 ## Consequences
 
 - Two apps, or two tests, can run in one process without interfering.
 - Boot does the expensive work once; the hot path stays free of reflection.
-- Every user avoids an extra build step for DI, while teams that want
-  compile-time wiring can opt in.
+- No user needs an extra build step for DI. Teams that want compile-time
+  wiring will be able to opt in once code generation exists.
 
 ## Alternatives considered
 

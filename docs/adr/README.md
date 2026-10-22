@@ -38,8 +38,9 @@ the old one. [ADR 0001](0001-record-architecture-decisions.md) explains why.
 
 Records 0002 to 0022 were written on 2026-10-22 from the design discussion
 that preceded them. Their dates are when each decision was first committed
-to the repository, and their Sources sections link to that discussion at the
-commit where it was last revised.
+to the repository, and their Sources sections link to that discussion at
+commit 0897d74, its state when these records were written. Where a record
+describes something not built yet, it says "will" or "is to".
 
 ## Writing a record
 
@@ -47,9 +48,12 @@ commit where it was last revised.
    free number. The slug is lowercase and hyphenated.
 2. Fill it in with `Status: Proposed` and today's date, and add it to the
    index above.
-3. Open a PR. Discuss and edit the record freely while it is proposed.
+3. Open a PR. Discuss and edit the record freely while it is proposed. CI
+   marks the PR as failing while any record is still Proposed, so it can't
+   merge undecided.
 4. Before merging, set `Status: Accepted` (or `Rejected`, which is worth
-   keeping too: it records an option we chose not to take).
+   keeping too: it records an option we chose not to take), in the record
+   and in the index.
 
 Write a record when a decision is hard to reverse, affects more than one
 module, or settles a debate that would otherwise come up again. Ship it in
@@ -64,7 +68,10 @@ simply no longer applies, set it to `Status: Deprecated` instead.
 
 Nothing else in an accepted record changes, not even a typo. CI enforces
 this with [`.github/scripts/adr-check.sh`](../../.github/scripts/adr-check.sh),
-which also checks every record's format and that the index lists it.
+which also checks every record's name, header and sections, that a
+superseding record exists and is accepted, and that the index has exactly
+one up-to-date row per record. Run it locally from the repository root
+with `.github/scripts/adr-check.sh origin/dev` (it needs bash 4 or later).
 
 | Status | Meaning | Can change to |
 |---|---|---|
