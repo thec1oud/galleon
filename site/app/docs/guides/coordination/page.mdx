@@ -10,7 +10,7 @@ Locks, leader election and rate limits need a coordination backend, and Galleon 
 
 ## Pick one for how you deploy
 
-Today there is one backend, [`coord/local`](https://pkg.go.dev/github.com/thec1oud/galleon/coord/local). It is exact, but only inside one process. Use it when the app runs as a single process, and say so:
+There are two backends. [`coord/local`](https://pkg.go.dev/github.com/thec1oud/galleon/coord/local) is exact, but only inside one process. Use it when the app runs as a single process, and say so:
 
 ```go file=examples/firstapp/main.go#app title="main.go"
 func options() []galleon.Option {
@@ -35,7 +35,28 @@ func main() {
 
 Without `galleon.Deploy`, an app whose modules need coordination boots and logs a line asking you to declare it.
 
-For an app that runs as several processes, there is no backend yet. Cluster backends, on PostgreSQL first, are planned.
+For an app that runs as several processes, use [`coordpg`](https://pkg.go.dev/github.com/thec1oud/galleon/coord-pg), from the `coord-pg` module. It coordinates through a PostgreSQL database every node reaches, and needs nothing else:
+
+```go file=examples/guides/coordination/cluster.go#cluster title="cluster.go"
+// clusterOptions runs the digest on every node of a cluster. The backend
+// on PostgreSQL makes its lock hold across all of them.
+func clusterOptions(more ...galleon.Option) []galleon.Option {
+	return append([]galleon.Option{
+		galleon.Name("digest"),
+		galleon.Coordination(coordpg.New()), // reads the coord_pg config section
+		galleon.Deploy(galleon.MultiNode),
+		galleon.Modules(Module()),
+	}, more...)
+}
+```
+
+`galleon.Coordination` installs it as a module, so it reads the `coord_pg` config section, starts before the app's providers and stops after them. It needs a database, from the config file or the environment:
+
+```sh
+DIGEST_COORD_PG_DSN=postgres://app@db/digest ./digest
+```
+
+It creates its tables in the schema `coord_pg.schema` names, `galleon_coord` by default, the first time a node starts. Every node of the cluster must name the same schema, and two apps sharing a database keep apart by naming different ones. Its other keys are in the [configuration reference](/docs/reference/config#coord-pg). Redis, NATS and etcd backends are not built yet.
 
 ## Declare what each module needs
 
@@ -129,3 +150,41 @@ galleon: 1 boot problem(s):
 ```
 
 `galleon.AllowPerProcessGuarantees()` boots anyway, and logs a warning for each guarantee that now holds per process only. With it, two nodes could send the digest at the same time. Use it only where that is acceptable.
+
+## Test it across nodes
+
+Two apps on one database are two nodes of one cluster. With `coordpg`, the lock holds across them:
+
+```go file=examples/guides/coordination/cluster_test.go#nodes title="cluster_test.go"
+config := fmt.Appendf(nil, `{"coord_pg": {"dsn": %q, "schema": %q}}`, dsn, schema)
+start := func() *galleon.App {
+	app, err := galleon.New(clusterOptions(galleon.ConfigJSON(config), galleon.DrainGrace(0))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.Shutdown(context.Background()) })
+	return app
+}
+a, b := start(), start()
+ctx := context.Background()
+
+// Node b holds the lock: node a doesn't send.
+lease, _, err := b.Coordination().Locks().TryAcquire(ctx, "digest.daily", time.Minute)
+if err != nil {
+	t.Fatal(err)
+}
+if sent, err := galleon.MustResolve[*Digest](a).Send(ctx); sent || err != nil {
+	t.Fatalf("Send on node a while node b held the lock = %v, %v", sent, err)
+}
+if err := lease.Release(ctx); err != nil {
+	t.Fatal(err)
+}
+if sent, err := galleon.MustResolve[*Digest](a).Send(ctx); !sent || err != nil {
+	t.Fatalf("Send on node a = %v, %v", sent, err)
+}
+```
+
+The test needs PostgreSQL: it takes the database `testkit.PackageDSN` gives, and skips without `GALLEON_TEST_POSTGRES` (see [Test with testkit](/docs/guides/testing)).

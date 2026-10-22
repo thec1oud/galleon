@@ -11,11 +11,12 @@ The repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each modu
 | Module | Path | Contents |
 |---|---|---|
 | `github.com/thec1oud/galleon` | `/` | The kernel and every plane built so far |
+| `github.com/thec1oud/galleon/coord-pg` | `/coord-pg` | The coordination backend on PostgreSQL |
 | `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness, conformance suites and test databases |
 | `github.com/thec1oud/galleon/site` | `/site` | This site, and the Go samples its pages show |
 | `github.com/thec1oud/galleon/adapters/dpg` | `/adapters/dpg` | The migration adapter for DPG. It builds only against a local DPG checkout, so it isn't in `go.work` or CI yet. |
 
-Modules still to come: `coord-pg`, `jobs`, `web`, `realtime`, `http3`, the other `adapters/*`, and `cmd/galleon`.
+Modules still to come: `coord-redis`, `coord-nats`, `coord-etcd`, `jobs`, `web`, `realtime`, `http3`, the other `adapters/*`, and `cmd/galleon`.
 
 ## Packages of the core module
 
@@ -49,4 +50,4 @@ Tests enforce part of this today, in [`deps_test.go`](https://github.com/thec1ou
 
 ## Adding a module
 
-Create it with its own `go.mod`, then add it to the workspace with `go work use ./<dir>`. CI vets and tests every module that `go.work` lists.
+Create it with its own `go.mod`, then add it to the workspace with `go work use ./<dir>`. CI vets and tests every module that `go.work` lists, and the reference pages list each workspace module's error codes and config sections under it. A module with a config section adds its defaults to `Defaults` in `site/internal/refgen`, and a module a sample imports goes in `site/go.mod`.

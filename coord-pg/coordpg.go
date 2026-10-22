@@ -159,8 +159,9 @@ const (
 	// CodeSchemaNewer is FailedPrecondition: the schema was created by a
 	// newer version of coord-pg than this node's.
 	CodeSchemaNewer = "coord_pg.schema_newer"
-	// CodeInvalidArgument is InvalidArgument: a TTL or window that isn't
-	// positive, or a topic that isn't valid UTF-8 without NUL bytes.
+	// CodeInvalidArgument is InvalidArgument: a lease's TTL under 1ms, a
+	// key's TTL below zero, a counter's window under 1µs, or a topic that
+	// isn't valid UTF-8 without NUL bytes.
 	CodeInvalidArgument = "coord_pg.invalid_argument"
 	// CodeMessageTooLarge is InvalidArgument: a published message's topic
 	// and base64-encoded data don't fit a NOTIFY payload.

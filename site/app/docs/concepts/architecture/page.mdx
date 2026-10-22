@@ -32,7 +32,7 @@ These planes exist today:
 | Errors | `errs` | One error type with a kind and a stable code, rendered as problem+json or a gRPC status |
 | Data | `data`, `pg` | Transactions on PostgreSQL through pgx, with replica routing and read-your-writes |
 | Migrations | `migrate`, `pg/sqlmigrate` | Applies schema changes once across the cluster, under a deploy policy |
-| Coordination | `coord`, `coord/local` | Locks, leader election, pub/sub, KV, counters and membership |
+| Coordination | `coord`, `coord/local`, `coord-pg` | Locks, leader election, pub/sub, KV, counters and membership, in one process or across a cluster on PostgreSQL |
 | Processes | `process` | Runs several copies of the app on one host, sharing ports |
 
 The security, async, realtime and web planes are designed but not built. Their decisions are recorded, for example [0021](/docs/decisions/0021-generic-authorization-seams) for authorization.

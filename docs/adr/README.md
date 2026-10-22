@@ -35,6 +35,9 @@ the old one. [ADR 0001](0001-record-architecture-decisions.md) explains why.
 | 0020 | [Integrate every external service through one kit, with CloudEvents on the wire](0020-one-integration-kit.md) | Accepted |
 | 0021 | [Keep authorization generic: resolve context first, then decide locally](0021-generic-authorization-seams.md) | Accepted |
 | 0022 | [Ship the frontend as a battery: templ, fragment responses, and Vite as a seam](0022-frontend-battery.md) | Accepted |
+| 0101 | [Keep coord-pg's leases as rows judged on the database's clock, fenced by one durable epoch](0101-leases-fenced-by-one-durable-epoch.md) | Proposed |
+| 0102 | [Keep coord-pg's pub/sub at-most-once over LISTEN/NOTIFY, with a channel per topic](0102-pg-pubsub-is-at-most-once.md) | Proposed |
+| 0103 | [Let a coordination backend own its config and lifecycle through the app](0103-a-backend-owns-its-lifecycle-through-the-app.md) | Proposed |
 
 Records 0002 to 0022 were written on 2026-10-22 from the design discussion
 that preceded them. Their dates are when each decision was first committed

@@ -27,13 +27,35 @@ A module declares what it relies on with `r.Needs(...)`. Boot fails if the backe
 
 ## Backends
 
-Only one backend exists today: [`coord/local`](https://pkg.go.dev/github.com/thec1oud/galleon/coord/local), which is in-process. Its guarantees are exact, but hold inside one process only. Use it for a single node, development and tests. Cluster backends, on PostgreSQL first, are not built yet.
+| Backend | Module | Scope | Use it for |
+|---|---|---|---|
+| [`coord/local`](https://pkg.go.dev/github.com/thec1oud/galleon/coord/local) | core | Process | A single node, development and tests. Its guarantees are exact, but hold inside one process only. |
+| [`coordpg`](https://pkg.go.dev/github.com/thec1oud/galleon/coord-pg) | `coord-pg` | Cluster | Several nodes, when the app already runs PostgreSQL. It needs no other infrastructure. |
 
-Every backend must pass the conformance suite in `testkit/conformance/coordtest`.
+Redis, NATS and etcd backends are not built yet. Every backend must pass the conformance suite in `testkit/conformance/coordtest`, and a cluster backend passes it with two nodes on one store.
+
+### What `coordpg` guarantees
+
+`coordpg` keeps everything in tables of one schema (`coord_pg.schema`, `galleon_coord` by default), which it creates at start. Every node of a cluster names the same schema.
+
+| Capability | How | Guarantee |
+|---|---|---|
+| Locks | A row per key: holder, fencing token, expiry on the database's clock | One holder at a time, as judged by token. A frozen or partitioned holder keeps the key only until its TTL runs out. |
+| Leader election | A lease per election name, renewed every third of `leader_ttl` | A dead leader is replaced within `leader_ttl`. |
+| Pub/sub | `LISTEN/NOTIFY`, one channel per topic | At-most-once. A message is lost by a node whose connection is down, and must fit NOTIFY's 8000 bytes (about 5.9KB of data). |
+| KV | A table, and a history of every change | Compare-and-swap on revisions, which follow commit order. A watcher misses no change while its connection is down, unless it falls behind `history`; then it is closed. |
+| Counters | A row per key and window, on the database's clock | Every node agrees on when a window starts. |
+| Membership | A heartbeat row per node | A node that stops is dropped within `failure_detection`, which `Capabilities()` reports. |
+
+A lease's holder measures its deadline from just before the call that granted or renewed it. A lease that isn't renewed is released shortly before that deadline, and `Lost()` closes once the key is free, never after the deadline. A holder whose process is paused past its deadline can't see `Lost()` close in time, which is what fencing tokens are for ([0101](/docs/decisions/0101-leases-fenced-by-one-durable-epoch)).
+
+Pub/sub stays at-most-once on purpose ([0102](/docs/decisions/0102-pg-pubsub-is-at-most-once)). Anything that must not be lost goes through an outbox.
+
+The backend is a module, so `galleon.Coordination` installs it: it reads its config section, starts before every provider and stops after them all ([0103](/docs/decisions/0103-a-backend-owns-its-lifecycle-through-the-app)). Its keys are in the [configuration reference](/docs/reference/config#coord-pg), and its errors in the [errors reference](/docs/reference/errors#coord-pg).
 
 ## Leases and fencing
 
-A lock is a lease with a time to live. Each lease carries a fencing token that only increases for its key, within an epoch. Anything a lease protects should reject a token lower than one it has already seen from the same epoch. That way, a holder that paused past its lease can't overwrite the work of the next holder.
+A lock is a lease with a time to live. Each lease carries a fencing token that only increases for its key, within an epoch. A cluster backend keeps one epoch for as long as its store lives, so the tokens of every node and every restart compare; the in-process backend gets a new epoch each time it starts. Anything a lease protects should reject a token lower than one it has already seen from the same epoch. That way, a holder that paused past its lease can't overwrite the work of the next holder.
 
 The migration runner uses this: it applies under a coordination lock. `pg/sqlmigrate` refuses a lower token of the same epoch, and any lease of a superseded epoch.
 

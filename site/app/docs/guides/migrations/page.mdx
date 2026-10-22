@@ -126,7 +126,7 @@ NOTES_MIGRATE_MODE=apply
 NOTES_MIGRATE_APPROVE=notes=aeba9062426a4f9383ab70aa950f722a0d21932b7d985e74de8bb7b938536772
 ```
 
-With today's only coordination backend, `coord/local`, the app runs as one process (`galleon.Deploy(galleon.SingleNode)`), and that process applies. With a cluster backend, which isn't built yet, every node can boot this way: one applies under the coordination lock, and the others wait for it, then find nothing pending. A migrator with nothing pending has no plan to check.
+With `coord/local`, the app runs as one process (`galleon.Deploy(galleon.SingleNode)`), and that process applies. With a cluster backend, such as `coordpg`, every node can boot this way: one applies under the coordination lock, and the others wait for it, then find nothing pending. Its leases carry one epoch for the life of its store, so `pg/sqlmigrate`'s fence compares the tokens of every node and every restart. A migrator with nothing pending has no plan to check.
 
 If the database changed since the plan was made, or the build has a file the plan didn't, the plan differs from the approved one, and boot fails before anything is applied:
 
