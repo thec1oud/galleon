@@ -6,5 +6,6 @@ use (
 	// its library engine (see adapters/dpg/README.md). Add new modules
 	// (pg, jobs, web, adapters/...) with `go work use ./<dir>`.
 	.
+	./site
 	./testkit
 )
