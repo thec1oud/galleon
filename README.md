@@ -12,6 +12,7 @@ This repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each mod
 |---|---|---|
 | `github.com/thec1oud/galleon` | `/` | Kernel (app, modules, DI, config, lifecycle, readiness, node identity, OpenTelemetry and slog), the clock seam, roles and the process supervisor, the error model, coordination interfaces and the in-process `local` backend, the operation model and HTTP/RPC transport, the outbound client, the data plane (`data` interfaces, `pg` on pgx), and the migration seam (`migrate`, with the built-in `pg/sqlmigrate`) |
 | `github.com/thec1oud/galleon/testkit` | `/testkit` | The test harness (`testkit.New` boots the real app on a fake clock and in-process coordination) and conformance suites (`conformance/coordtest`, `conformance/datatest`, `conformance/migratetest`, `conformance/ormtest`), a fake migrator (`testkit.MigrationStore`), `testkit.DB`, a Postgres database per package with a transaction per test (`testkit.PackageDSN` for the database alone), `testkit.Replica`, its view on a streaming replica, and `testkit.Proxy` |
+| `github.com/thec1oud/galleon/site` | `/site` | The documentation site (Farming Labs docs on Next.js, built with Bun), and as a Go module, the code samples its pages show, compiled and tested in CI. Being a separate module keeps it out of what `go get` downloads; see [Writing the docs](site/app/docs/contributing/docs/page.mdx) |
 | `github.com/thec1oud/galleon/adapters/dpg` | `/adapters/dpg` | The migration seam's adapter for DPG, on DPG's provisional library engine. Not in `go.work` and not built by CI yet: it builds only against a local dpg checkout; see [its README](adapters/dpg/README.md) |
 
 Planned modules (see [the architecture](docs/design/05-architecture.md#2-module-layout-and-dependency-rules)): `coord-pg`, `jobs`, `web`, `realtime`, `http3`, the other `adapters/*`, `cmd/galleon`.
@@ -46,6 +47,10 @@ func (Module) Register(r *galleon.Registry) error {
     return nil
 }
 ```
+
+## Documentation
+
+The docs site lives in [site](site). To preview it, with [Bun](https://bun.sh/) installed: `cd site && bun install && bun dev`, then open http://localhost:3000/docs. Go-only changes don't need it.
 
 ## Decisions
 
