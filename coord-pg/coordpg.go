@@ -188,6 +188,10 @@ type Backend struct {
 	events string // the NOTIFY channel of lock and key-value changes
 	lis    *listener
 
+	// life serializes Start and Stop. They hold it, not mu, while they
+	// talk to the database, since fail reads the state under mu.
+	life sync.Mutex
+
 	mu      sync.Mutex
 	state   state
 	leases  map[*lease]struct{}
@@ -319,9 +323,12 @@ func (b *Backend) Counters() coord.Counters          { return counters{b} }
 // starts listening. It fails, and leaves nothing running, if any of that
 // fails.
 func (b *Backend) Start(ctx context.Context) (err error) {
+	b.life.Lock()
+	defer b.life.Unlock()
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	switch b.state {
+	st := b.state
+	b.mu.Unlock()
+	switch st {
 	case stateStarted:
 		return errors.New("coordpg: Start called twice")
 	case stateClosed:
@@ -366,7 +373,9 @@ func (b *Backend) Start(ctx context.Context) (err error) {
 	b.loops.Add(2)
 	go b.heartbeats(loops)
 	go b.sweeper(loops)
+	b.mu.Lock()
 	b.state = stateStarted
+	b.mu.Unlock()
 	b.log.InfoContext(ctx, "coordination started", "node", b.node, "schema", b.cfg.Schema, "epoch", b.epoch)
 	return nil
 }
@@ -375,6 +384,8 @@ func (b *Backend) Start(ctx context.Context) (err error) {
 // subscription and watch, and closes the connections the backend opened.
 // Every call after it returns coord.ErrClosed.
 func (b *Backend) Stop(ctx context.Context) error {
+	b.life.Lock()
+	defer b.life.Unlock()
 	b.mu.Lock()
 	if b.state != stateStarted {
 		b.state = stateClosed

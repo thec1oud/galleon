@@ -349,3 +349,17 @@ func TestAnExpiredKeyIsAbsentBeforeItIsSwept(t *testing.T) {
 		t.Fatalf("IfAbsent on an expired key = %v", err)
 	}
 }
+
+// A database that can't be reached fails Start, and doesn't hang it.
+func TestStartFailsOnAnUnreachableDatabase(t *testing.T) {
+	b := coordpg.New(coordpg.WithConfig(coordpg.Config{DSN: "postgres://nobody@127.0.0.1:1/x?connect_timeout=1"}))
+	c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := b.Start(c)
+	if !errors.Is(err, errs.New(errs.Unavailable, coordpg.CodeUnavailable, "")) {
+		t.Fatalf("Start on an unreachable database = %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close after a failed Start = %v", err)
+	}
+}
