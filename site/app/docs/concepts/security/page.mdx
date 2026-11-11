@@ -1,0 +1,132 @@
+---
+title: "Security"
+description: "Who is calling, in which context, and what they may do: three seams in the pipeline, denying by default."
+order: 9
+---
+
+# Security
+
+Galleon answers three questions about every call, in this order: who is calling (identity), in which context they act (context resolution), and whether they may do what they ask (decision). Each is a seam that any identity or authorization system can fill ([0021](/docs/decisions/0021-generic-authorization-seams)). Access is denied unless a decision allows it.
+
+The security module, from package [`security`](https://pkg.go.dev/github.com/thec1oud/galleon/security), runs all three as stages of the [operation pipeline](/docs/concepts/operations#the-pipeline):
+
+```go file=examples/concepts/security.go#module title="security.go"
+// Security answers who is calling, in which context, and what they may do.
+func Security() galleon.Module {
+	return security.Module(
+		// Who: bearer tokens from the issuer the "jwt" config section names.
+		jwt.Bearer(),
+		// Where: the organization the token's org_id claim names.
+		security.ResolveContext(security.ClaimResolver{Domain: "org", Claim: "org_id"}),
+		// What: each role grants actions; everything else is denied.
+		security.Decide(&security.RoleTable{Grants: map[string][]string{
+			"admin": {"*"},
+			"clerk": {"orders:create", "orders:read"},
+		}}),
+	)
+}
+```
+
+## The stages
+
+| # | Stage | Seam | Does | Fails with |
+|---|---|---|---|---|
+| 3 | authenticate | `Authenticator` | Turns the request's credentials into a `Principal`, or the anonymous one | `401` for invalid credentials |
+| 4 | resolve context | `ContextResolver` | Works out the `OperatingContext`, such as an organization | `401` if it has expired |
+| 5 | gate | none | Checks that the operation accepts the context's domain | `403`, or `401` if anonymous |
+| 5b | pre-authorize | `Decider` | Decides the action alone, before the body is read | `403`, or `401` if anonymous |
+| 8 | authorize | `Decider` | Decides the action on the resource the decoded input names | `403`, or `401` if anonymous |
+
+Each stage is prepared for each operation at boot, so an operation that doesn't need one skips it: a public operation never reaches the decider ([0203](/docs/decisions/0203-prepare-stages-per-operation)). A failing authenticator, resolver or decider fails the call with `503` (`security.unavailable`), never as an allow. The [error reference](/docs/reference/errors) lists every code.
+
+## Declaring what an operation needs
+
+An operation declares its security, and boot fails if it doesn't ([0017](/docs/decisions/0017-one-operation-model)). It is either `Public()`, or names an action:
+
+```go file=examples/concepts/security.go#declare title="security.go"
+var CancelOrder = op.Unary[CancelOrderIn, Order]("orders.cancel").
+	HTTP("POST", "/orders/{id}/cancel").
+	Contexts("org").                                               // only in an organization
+	AuthorizeResource("orders:cancel", op.Resource("order", "id")) // the action, then this order
+```
+
+`Authorize(action)` checks the action before decode, so a caller who may not call the operation gets `403` without learning anything from validation errors. `AuthorizeResource` checks it again after decode, on the resource whose ID is in the input field named, by its JSON, path, query or header name. `Schemes(...)` limits how the caller may authenticate, `Contexts(...)` which contexts it accepts, and `Inputs(...)` which context providers its resolution may use.
+
+Boot fails on a declaration no caller could satisfy: a scheme no authenticator has, contexts without a resolver, an input no provider supplies, an action without a decider, or a resource field the input doesn't have.
+
+## Identity
+
+An `Authenticator` handles one scheme, such as `bearer` or `apikey`. An operation's authenticators run in order ([0201](/docs/decisions/0201-choose-authenticators-by-scheme)):
+
+- one that finds no credentials of its scheme returns `ErrNoCredentials`, and the next one runs;
+- credentials that are present but don't verify stop the chain with `401`, even on a public operation;
+- with no credentials at all, the call runs as the anonymous principal.
+
+A `Principal` has a subject, a kind (user, service, API key or anonymous), an issuer, verified claims and an assurance: when, how and how strongly the caller authenticated. Two authenticators are built in:
+
+| Package | Scheme | Verifies |
+|---|---|---|
+| [`security/jwt`](https://pkg.go.dev/github.com/thec1oud/galleon/security/jwt) | `bearer` | JWTs from an OpenID Connect issuer or any published JWK set: an asymmetric signature, `iss`, `aud`, `exp` and `nbf` ([0205](/docs/decisions/0205-asymmetric-bearer-tokens)) |
+| [`security/apikey`](https://pkg.go.dev/github.com/thec1oud/galleon/security/apikey) | `apikey` | A key in the `X-API-Key` header, stored only as its digest and looked up through a seam |
+
+The bearer authenticator fetches the issuer's keys at start and refreshes them in the background. A token signed with a key it hasn't seen triggers at most one fetch a minute, so a key rotation doesn't fail a burst of requests. The node isn't ready until the keys are loaded.
+
+## Operating context
+
+An operating context is where the caller acts: an organization, a team, a locality. It has a domain, such as `org`, an ID, attributes for decisions, and optionally a proof and an expiry. This is the slot for context-based access control, which resolves the context before roles or attributes are checked.
+
+The `ContextResolver` produces it after authentication. Without one, the module uses `IdentityResolver`: a caller's context is their own, with the domain `user`, `service` or `api_key`. `ClaimResolver` reads the context from a verified claim, such as a token's `org_id`, so it needs no I/O. A resolver that must look something up per call marks itself `Slow`, and the module logs it at start.
+
+The gate compares the context's domain with the operation's `Contexts`. It is a plain comparison, with no I/O.
+
+Context providers supply attributes resolution may use: the built-in `request` provider has the caller's address, user agent, transport and binding, and `time` has the clock's time. Others, such as billing entitlements, plug in with `security.Input`. A resolver sees only the providers its operation names, each evaluated at most once per call.
+
+## Decisions
+
+A `Decider` answers one question: may this subject do this action, on this resource, in this context? The query follows the [OpenID AuthZEN](https://openid.net/wg/authzen/) Authorization API, so an AuthZEN engine plugs in through a thin adapter. `CheckMany` answers a batch, in order.
+
+`RoleTable` is the built-in decider. It grants actions to roles, read from the principal's `roles` claim, and denies everything else. A grant is an action, `*`, or a prefix such as `orders:*`. Every principal but the anonymous one also has the role `authenticated`. The table decides by action alone; a rule that depends on the resource, such as "only the owner", needs a decider that looks at it, and a `DeciderFunc` can wrap the table for the rest.
+
+A decision can carry obligations, such as `audit`. The module fulfils each with the handler registered with `security.HandleObligation`, and denies if there is none, or if the handler fails.
+
+## In the handler
+
+Handlers reach the call's security through its context:
+
+```go file=examples/concepts/security.go#handler title="security.go"
+func cancelOrder(ctx context.Context, in *CancelOrderIn) (*Order, error) {
+	order := Order{ID: in.ID, Owner: "u_42"} // loaded from the database
+	// A question the pipeline can't ask, because it needs the order's owner.
+	err := security.Require(ctx, "orders:cancel", &security.Resource{
+		Type: "order", ID: order.ID,
+		Attributes: security.NewValues(map[string]any{"owner": order.Owner}),
+	})
+	if err != nil {
+		return nil, err // 401, 403 or 503, already right for the caller
+	}
+	_ = security.Caller(ctx).Subject() // who is cancelling, for the audit trail
+	return &order, nil
+}
+```
+
+`Caller` returns the principal, `Context` the operating context, and `Scheme` how the caller authenticated. `Can` reports whether an action is allowed, `Require` returns the error to send if it isn't, and `CanEach` asks about many resources in one batch. Each decision is cached for the rest of the call, unless the resource has attributes or the decision carries obligations. Nothing is cached across calls ([0202](/docs/decisions/0202-cache-decisions-per-call)).
+
+A call made in process, with `Operations.Call`, runs as the principal of the call it was made from, or the one set with `security.WithPrincipal`. A call over HTTP or RPC always authenticates its own request ([0204](/docs/decisions/0204-in-process-calls-keep-their-caller)).
+
+## Testing
+
+`testkit.Security` is a scripted authenticator, context resolver and decider in one: it allows only what a test says, and records every query. The [conformance suite](https://pkg.go.dev/github.com/thec1oud/galleon/testkit/conformance/securitytest) checks any decider or authenticator against the seams' rules. See [Protect an operation](/docs/guides/security#test-it).
+
+## Not built yet
+
+- Sessions, CSRF protection and the keyring that signs cookies and context proofs.
+- mTLS and SPIFFE authentication for services.
+- Switching context, with the old proof revoked across the cluster, and revoking tokens before they expire.
+- Turning a `Filterer`'s filter into a database query, so a list fetches only the rows the caller may see.
+- Auditing decisions through the outbox.
+
+## Why it is built this way
+
+- The seams follow no one identity system's shape, so any IAM can fill them ([0021](/docs/decisions/0021-generic-authorization-seams)), and their query is the AuthZEN standard's ([0006](/docs/decisions/0006-standards-are-the-seams)).
+- The action is checked before decode and the resource after, so a caller without permission learns nothing from validation errors ([0021](/docs/decisions/0021-generic-authorization-seams)).
+- Every declaration mistake fails boot, not the first call ([0010](/docs/decisions/0010-fail-at-boot), [0203](/docs/decisions/0203-prepare-stages-per-operation)).

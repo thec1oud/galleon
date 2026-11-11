@@ -1,0 +1,7 @@
+{
+  "http": {"addr": ":8080"},
+  "jwt": {
+    "issuer": "https://id.example.com",
+    "audience": ["notes"]
+  }
+}

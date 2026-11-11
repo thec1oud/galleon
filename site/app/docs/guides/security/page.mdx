@@ -1,0 +1,263 @@
+---
+title: "Protect an operation"
+description: "Require a signed-in caller, grant actions to roles, check what depends on the data, and test it."
+order: 5
+---
+
+# Protect an operation
+
+This guide protects a small notes service: anyone may check its health, signed-in callers may write notes, each note is read only by its owner or an admin, and one operation works only inside an organization. It ends with a test that checks each rule over HTTP.
+
+For how identity, contexts and decisions fit together, see [Security](/docs/concepts/security) in Concepts.
+
+## Declare what each operation needs
+
+Every operation is either `Public()` or names the action it performs. `AuthorizeResource` also names the input field that holds the resource's ID, here the `id` path parameter:
+
+```go file=examples/guides/protect/notes.go#operations title="notes.go"
+var (
+	// Health is for load balancers: anyone may call it.
+	Health = op.Unary[struct{}, struct{}]("notes.health").
+		HTTP("GET", "/health").
+		Public()
+
+	// Create needs permission for the action alone.
+	Create = op.Unary[CreateIn, Note]("notes.create").
+		HTTP("POST", "/notes").
+		Authorize("notes:create")
+
+	// Get needs permission for the action, then for the note the path
+	// names.
+	Get = op.Unary[NoteIn, Note]("notes.get").
+		HTTP("GET", "/notes/{id}").
+		AuthorizeResource("notes:read", op.Resource("note", "id"))
+
+	List = op.Unary[struct{}, NoteList]("notes.list").
+		HTTP("GET", "/notes").
+		Authorize("notes:list")
+
+	Delete = op.Unary[NoteIn, struct{}]("notes.delete").
+		HTTP("DELETE", "/notes/{id}").
+		Authorize("notes:delete")
+)
+```
+
+The action is checked before the body is read, so a caller without permission gets `403`, never a validation error.
+
+## Write the policy
+
+A `RoleTable` grants actions to roles, which it reads from the `roles` claim of the caller's token. Every signed-in caller has the role `authenticated`. The table decides by action alone, so the rule about owners goes in a `DeciderFunc` around it:
+
+```go file=examples/guides/protect/notes.go#policy title="notes.go"
+// roles grants actions to roles, from the "roles" claim of a caller's token.
+var roles = &security.RoleTable{Grants: map[string][]string{
+	"admin":                    {"notes:*"},
+	security.RoleAuthenticated: {"notes:create", "notes:read", "notes:list", "notes:delete"},
+	"analyst":                  {"notes:stats"},
+}}
+
+// policy is the roles, plus one rule that needs the note: only its owner,
+// or an admin, may read or delete it.
+var policy = security.DeciderFunc(func(ctx context.Context, q security.Query) (security.Decision, error) {
+	if q.Resource != nil && q.Resource.Type == "note" {
+		owner, known := q.Resource.Attributes.String("owner")
+		admin, _ := q.Subject.Claims().Strings("roles")
+		if known && owner != q.Subject.Subject() && !slices.Contains(admin, "admin") {
+			return security.Deny("not the owner"), nil
+		}
+	}
+	return roles.Check(ctx, q)
+})
+```
+
+Anything the policy doesn't allow is denied. A decision's reason is logged at debug level, and never sent to the caller.
+
+## Install the security module
+
+The module takes how callers authenticate, the context resolver and the decider. Taking the authentication as a parameter lets a test swap it:
+
+```go file=examples/guides/protect/notes.go#security title="notes.go"
+// Security is the security module. The app passes how callers
+// authenticate; a test passes testkit.Security instead.
+func Security(authenticate security.Option) galleon.Module {
+	return security.Module(
+		authenticate,
+		security.ResolveContext(security.ClaimResolver{Domain: "org", Claim: "org_id"}),
+		security.Decide(policy),
+	)
+}
+
+func options() []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("notes"),
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode),
+		galleon.ConfigFile("config.json"),
+		galleon.Modules(server.Module(), Security(jwt.Bearer()), Notes{}),
+	}
+}
+```
+
+`jwt.Bearer()` accepts tokens from the issuer the `jwt` config section names:
+
+```json file=examples/guides/protect/config.json title="config.json"
+{
+  "http": {"addr": ":8080"},
+  "jwt": {
+    "issuer": "https://id.example.com",
+    "audience": ["notes"]
+  }
+}
+```
+
+At start, it finds the issuer's keys through OpenID Connect discovery, and the node isn't ready until they are loaded. To name the key set yourself, set `jwks_url`. The [config reference](/docs/reference/config#jwt) has every key.
+
+<Callout type="warn">
+Set `audience` to this service's own audience. A token issued for another service of the same issuer must not work here, and the `aud` check is what stops it.
+</Callout>
+
+To accept API keys as well, add `security.AuthenticateWith("apikey", ...)` with an [`apikey`](https://pkg.go.dev/github.com/thec1oud/galleon/security/apikey) authenticator. An operation that should accept only one scheme says so with `Schemes("bearer")`.
+
+## Check what depends on the data
+
+The pipeline checks `Get`'s note by its ID, before the handler runs. The owner is known only once the note is loaded, so the handler asks again, with the owner as an attribute:
+
+```go file=examples/guides/protect/notes.go#get title="notes.go"
+func (s *Store) Get(ctx context.Context, in *NoteIn) (*Note, error) {
+	n, err := s.find(in.ID)
+	if err != nil {
+		return nil, err
+	}
+	// The pipeline checked "notes:read" on this note by its ID. Only now,
+	// with the note loaded, can the policy see its owner.
+	if err := security.Require(ctx, "notes:read", resource(n)); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func resource(n *Note) *security.Resource {
+	return &security.Resource{Type: "note", ID: n.ID, Attributes: security.NewValues(map[string]any{"owner": n.Owner})}
+}
+```
+
+`Require` returns the error to send as it is: `401` for an anonymous caller, `403` for anyone else, or `503` if the decider failed.
+
+`Create` records who wrote the note with `security.Caller`:
+
+```go file=examples/guides/protect/notes.go#create title="notes.go"
+func (s *Store) Create(ctx context.Context, in *CreateIn) (*Note, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	n := Note{ID: strconv.Itoa(s.next), Owner: security.Caller(ctx).Subject(), Text: in.Text}
+	s.notes[n.ID] = n
+	return &n, nil
+}
+```
+
+## Filter a list
+
+A list shows only what the caller may read. `CanEach` asks about every note in one batch, and caches each answer for the rest of the call:
+
+```go file=examples/guides/protect/notes.go#list title="notes.go"
+// List returns the notes the caller may read, asking about them in one
+// batch.
+func (s *Store) List(ctx context.Context, _ *struct{}) (*NoteList, error) {
+	s.mu.Lock()
+	all := make([]Note, 0, len(s.notes))
+	for _, n := range s.notes {
+		all = append(all, n)
+	}
+	s.mu.Unlock()
+	slices.SortFunc(all, func(a, b Note) int { return cmpID(a.ID, b.ID) })
+	rs := make([]security.Resource, len(all))
+	for i := range all {
+		rs[i] = *resource(&all[i])
+	}
+	can, err := security.CanEach(ctx, "notes:read", rs)
+	if err != nil {
+		return nil, err
+	}
+	out := &NoteList{Notes: []Note{}}
+	for i, n := range all {
+		if can[i] {
+			out.Notes = append(out.Notes, n)
+		}
+	}
+	return out, nil
+}
+```
+
+This reads every note to drop most of them. Filtering in the database query instead isn't built yet.
+
+## Limit an operation to a context
+
+`OrgStats` makes sense only inside an organization. `Contexts("org")` makes the gate refuse a caller in any other context:
+
+```go file=examples/guides/protect/notes.go#context title="notes.go"
+// Stats counts an organization's notes, so it only makes sense inside one.
+var OrgStats = op.Unary[struct{}, Stats]("notes.org_stats").
+	HTTP("GET", "/org/stats").
+	Contexts("org").
+	Authorize("notes:stats")
+```
+
+The module's `ClaimResolver` puts a caller whose token has an `org_id` claim in that organization. Everyone else is in their own `user` context, which the gate refuses with `403`. In the handler, `security.Context(ctx).ID()` is the organization.
+
+## Test it
+
+`testkit.Security` stands in for the token issuer: `User` makes a principal with roles, and its authenticator accepts `Authorization: Test <subject>`. The test runs the real policy over HTTP:
+
+```go file=examples/guides/protect/notes_test.go#test title="notes_test.go"
+func TestPeopleSeeOnlyTheirOwnNotes(t *testing.T) {
+	sec := testkit.NewSecurity() // stands in for the token issuer
+	sec.User("ann")
+	sec.User("bob")
+	sec.User("root", "admin")
+	t.Setenv("TEST_HTTP_ADDR", "127.0.0.1:0")
+	h := testkit.New(t, galleon.Modules(server.Module(), Security(security.Authenticate(sec)), Notes{}))
+	api := testkit.Get[*server.Server](h).Handler()
+
+	// Without credentials: 401, with a challenge naming the scheme.
+	if w := call(api, "GET", "/notes", "", ""); w.Code != http.StatusUnauthorized || w.Header().Get("WWW-Authenticate") != "Test" {
+		t.Fatalf("anonymous: %d %v", w.Code, w.Header())
+	}
+	w := call(api, "POST", "/notes", "ann", `{"text": "ann's"}`)
+	var note Note
+	if err := json.Unmarshal(w.Body.Bytes(), &note); err != nil || note.Owner != "ann" {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	// Bob may read notes, but not ann's.
+	if w := call(api, "GET", "/notes/"+note.ID, "bob", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("bob reads ann's note: %d", w.Code)
+	}
+	if w := call(api, "GET", "/notes", "bob", ""); !strings.Contains(w.Body.String(), `"notes":[]`) {
+		t.Fatalf("bob's list: %s", w.Body)
+	}
+	// An admin may read anyone's.
+	if w := call(api, "GET", "/notes/"+note.ID, "root", ""); w.Code != http.StatusOK {
+		t.Fatalf("admin reads ann's note: %d", w.Code)
+	}
+	// Stats need an organization, and ann's test token names none.
+	if w := call(api, "GET", "/org/stats", "ann", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("stats outside an org: %d", w.Code)
+	}
+}
+
+// call sends a request as user, or anonymously when user is empty.
+func call(api http.Handler, method, path, user, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if user != "" {
+		req.Header.Set("Authorization", "Test "+user)
+	}
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	return w
+}
+```
+
+To call an operation in process instead, as a given user, pass `security.WithPrincipal(ctx, sec.User("ann"))` to `Operations.Call`. `testkit.Security` can also be the decider, allowing only what the test names with `Allow`, when the test is about the handler rather than the policy.

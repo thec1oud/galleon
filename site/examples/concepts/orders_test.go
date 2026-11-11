@@ -9,20 +9,15 @@ import (
 	"github.com/thec1oud/galleon"
 	"github.com/thec1oud/galleon/coord/local"
 	"github.com/thec1oud/galleon/errs"
-	"github.com/thec1oud/galleon/op"
+	"github.com/thec1oud/galleon/security"
 	"github.com/thec1oud/galleon/testkit"
 )
 
-// allowAll implements the pre-authorize stage, which an operation that
-// names an action needs, by letting every call through.
-var allowAll = galleon.ModuleFunc("allow-all", func(r *galleon.Registry) error {
-	r.ImplementStage(op.StagePreAuthorize, func(next op.Invoker) op.Invoker { return next })
-	return nil
-})
-
 func TestCreateOrder(t *testing.T) {
-	h := testkit.New(t, galleon.Modules(Orders{}, allowAll))
-	out, err := testkit.Get[*galleon.Operations](h).Call(context.Background(), "orders.create", &CreateOrderIn{Item: "tea", Quantity: 1})
+	sec := testkit.NewSecurity().Allow("orders:create")
+	h := testkit.New(t, galleon.Modules(Orders{}, security.Module(security.Decide(sec))))
+	ctx := security.WithPrincipal(context.Background(), sec.User("u_1"))
+	out, err := testkit.Get[*galleon.Operations](h).Call(ctx, "orders.create", &CreateOrderIn{Item: "tea", Quantity: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

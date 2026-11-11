@@ -1,0 +1,363 @@
+---
+title: "5. Authorization"
+description: "Make callers authenticate with API keys, record who saved each bookmark, and let only its owner read it."
+order: 5
+---
+
+# Authorization
+
+In this chapter the bookmarks service stops being open to everyone. Callers authenticate with an API key, each bookmark records who saved it, and only its owner may read it. You see how Galleon denies by default, and where each check belongs.
+
+This chapter starts from the service at the end of [Migrations](/docs/learn/migrations).
+
+## Add owners and keys
+
+A third migration gives bookmarks an owner, and adds a table of API keys:
+
+```sql file=examples/learn/authorization/migrations/0003_add_owners_and_keys.sql title="migrations/0003_add_owners_and_keys.sql"
+-- galleon:risk safe
+ALTER TABLE bookmarks ADD COLUMN owner text;
+
+CREATE TABLE api_keys (
+    digest     bytea PRIMARY KEY,
+    owner      text NOT NULL,
+    roles      text[] NOT NULL DEFAULT '{}',
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+The table keeps each key's SHA-256 digest, never the key itself. A leaked copy of the table can't be used to call the service.
+
+## Look keys up
+
+`Keys` stores and finds keys. Its `Lookup` method is what the [`apikey`](https://pkg.go.dev/github.com/thec1oud/galleon/security/apikey) authenticator calls with a request's key digest. It returns the key's owner as a principal, with the key's roles as a claim:
+
+```go file=examples/learn/authorization/keys.go#keys title="keys.go"
+// Keys stores API keys by their digest, never the keys themselves.
+type Keys struct{ db data.Manager }
+
+// Add makes a key for owner, with roles, and returns it. It is shown once:
+// only its digest is kept.
+func (k *Keys) Add(ctx context.Context, owner string, roles ...string) (string, error) {
+	key, digest, err := apikey.Generate("bk")
+	if err != nil {
+		return "", err
+	}
+	if roles == nil {
+		roles = []string{}
+	}
+	err = k.db.Write(ctx, func(ctx context.Context, tx data.WriteTx) error {
+		_, err := tx.Exec(ctx, "INSERT INTO api_keys (digest, owner, roles) VALUES ($1, $2, $3)", digest[:], owner, roles)
+		return err
+	})
+	return key, err
+}
+
+// Lookup finds the owner of a key, for apikey's authenticator.
+func (k *Keys) Lookup(ctx context.Context, digest apikey.Digest) (security.Principal, error) {
+	var owner string
+	var roles []string
+	err := k.db.Read(ctx, func(ctx context.Context, tx data.ReadTx) error {
+		return tx.QueryRow(ctx, "SELECT owner, roles FROM api_keys WHERE digest = $1", digest[:]).Scan(&owner, &roles)
+	})
+	if errors.Is(err, data.ErrNoRows) {
+		return nil, apikey.ErrUnknownKey
+	}
+	if err != nil {
+		return nil, err
+	}
+	return security.Identity{
+		Subject: owner,
+		Kind:    security.KindAPIKey,
+		Claims:  security.NewValues(map[string]any{"roles": roles}),
+	}.Principal(), nil
+}
+```
+
+`ErrUnknownKey` tells the authenticator the key is wrong, and the caller gets `401`. Any other error means the database couldn't answer, and the caller gets `503`: an outage never lets a call through.
+
+## Declare the actions
+
+Until now both operations were `Public()`. Replace that with the action each performs:
+
+```go file=examples/learn/authorization/bookmarks.go#operations title="bookmarks.go"
+// The error codes of the bookmarks operations.
+const (
+	CodeNotFound = "bookmarks.not_found"
+	CodeFull     = "bookmarks.full"
+)
+
+var (
+	Create = op.Unary[CreateIn, Bookmark]("bookmarks.create").
+		HTTP("POST", "/bookmarks").
+		Authorize("bookmarks:create").
+		Errors(CodeFull)
+
+	Get = op.Unary[GetIn, Bookmark]("bookmarks.get").
+		HTTP("GET", "/bookmarks/{id}").
+		Authorize("bookmarks:read").
+		Errors(CodeNotFound)
+)
+```
+
+Galleon checks the action before it reads the body. A caller who may not save bookmarks gets `403` without seeing a validation error.
+
+## Write the policy
+
+The policy says who may do what. A `RoleTable` grants actions to roles; every caller with a key has the role `authenticated`. One rule, that a bookmark is read only by its owner, needs the bookmark, so `policy` adds it:
+
+```go file=examples/learn/authorization/policy.go#policy title="policy.go"
+// roles grants actions to roles. Every caller with a key has the
+// "authenticated" role.
+var roles = &security.RoleTable{Grants: map[string][]string{
+	security.RoleAuthenticated: {"bookmarks:create", "bookmarks:read"},
+	"admin":                    {"bookmarks:*"},
+}}
+
+// policy adds one rule the roles can't express: a bookmark is read only by
+// its owner, or an admin.
+func policy(ctx context.Context, q security.Query) (security.Decision, error) {
+	if q.Resource != nil && q.Resource.Type == "bookmark" {
+		owner, _ := q.Resource.Attributes.String("owner")
+		callerRoles, _ := q.Subject.Claims().Strings("roles")
+		if owner != q.Subject.Subject() && !slices.Contains(callerRoles, "admin") {
+			return security.Deny("not the owner"), nil
+		}
+	}
+	return roles.Check(ctx, q)
+}
+```
+
+Anything the policy doesn't allow is denied, including every call without a key.
+
+## Add the security module
+
+The security module ties the two together. `AuthenticateWith` builds the authenticator at start, with the `*Keys` the bookmarks module provides:
+
+```go file=examples/learn/authorization/policy.go#security title="policy.go"
+// Security is the security module: callers authenticate with an API key,
+// which Keys looks up, and policy decides.
+func Security() galleon.Module {
+	return security.Module(
+		security.AuthenticateWith("apikey", func(keys *Keys) security.Authenticator {
+			return apikey.New(keys)
+		}),
+		security.Decide(security.DeciderFunc(policy)),
+	)
+}
+```
+
+Provide `*Keys` in the module's `Register`, beside the store:
+
+```go file=examples/learn/authorization/bookmarks.go#module title="bookmarks.go"
+func (Bookmarks) Register(r *galleon.Registry) error {
+	galleon.Migrator(r, "bookmarks", func(m *pg.Manager) (migrate.Migrator, error) {
+		pool := m.Pool("")
+		if pool == nil { // a Manager made with pg.Within, as testkit.DB's, has no pool
+			return nil, errors.New("bookmarks: migrations need a database connection pool")
+		}
+		files, err := fs.Sub(migrations, "migrations")
+		if err != nil {
+			return nil, err
+		}
+		return sqlmigrate.New("bookmarks", files, pool)
+	})
+	galleon.Config[Limits](r, "limits")
+	galleon.Provide[*Keys](r, func(db data.Manager) *Keys { return &Keys{db: db} })
+	var s *Store
+	galleon.Provide[*Store](r, func(db data.Manager, limits *Limits) *Store {
+		s = &Store{db: db, max: limits.MaxBookmarks}
+		return s
+	})
+	r.Operation(Create, func(ctx context.Context, in *CreateIn) (*Bookmark, error) { return s.Create(ctx, in) })
+	r.Operation(Get, func(ctx context.Context, in *GetIn) (*Bookmark, error) { return s.Get(ctx, in.ID) })
+	return nil
+}
+```
+
+Then install the security module in `main.go`:
+
+```go file=examples/learn/authorization/main.go#main title="main.go"
+func options(env galleon.Env) []galleon.Option {
+	return []galleon.Option{
+		galleon.Name("bookmarks"),
+		galleon.Environment(env),
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode),
+		galleon.ConfigFile("config.json"),
+		galleon.Modules(server.Module(), pg.Module(), Security(), Bookmarks{}),
+	}
+}
+```
+
+Without it, boot fails: an operation that names an action needs a module to decide it.
+
+## Record and check the owner
+
+`Create` records who saved the bookmark. `security.Caller` returns the call's principal:
+
+```go file=examples/learn/authorization/bookmarks.go#create title="bookmarks.go"
+func (s *Store) Create(ctx context.Context, in *CreateIn) (*Bookmark, error) {
+	owner := security.Caller(ctx).Subject() // the pipeline let only a signed-in caller through
+	var b Bookmark
+	err := s.db.Write(ctx, func(ctx context.Context, tx data.WriteTx) error {
+		var n int
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM bookmarks").Scan(&n); err != nil {
+			return err
+		}
+		if n >= s.max {
+			return errs.New(errs.FailedPrecondition, CodeFull, "the store is full")
+		}
+		return tx.QueryRow(ctx,
+			"INSERT INTO bookmarks (url, title, owner) VALUES ($1, $2, $3) RETURNING id::text, url, title, owner",
+			in.URL, in.Title, owner).Scan(&b.ID, &b.URL, &b.Title, &b.Owner)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+```
+
+`Get` can check the owner only once it has loaded the bookmark, so it asks the policy itself with `security.Require`, passing the owner as an attribute:
+
+```go file=examples/learn/authorization/bookmarks.go#get title="bookmarks.go"
+func (s *Store) Get(ctx context.Context, id string) (*Bookmark, error) {
+	notFound := errs.New(errs.NotFound, CodeNotFound, "no such bookmark")
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || strconv.FormatInt(n, 10) != id {
+		return nil, notFound
+	}
+	var b Bookmark
+	var owner *string // bookmarks saved before this chapter have none
+	err = s.db.Read(ctx, func(ctx context.Context, tx data.ReadTx) error {
+		return tx.QueryRow(ctx,
+			"SELECT id::text, url, title, owner FROM bookmarks WHERE id = $1", n).Scan(&b.ID, &b.URL, &b.Title, &owner)
+	})
+	if errors.Is(err, data.ErrNoRows) {
+		return nil, notFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if owner != nil {
+		b.Owner = *owner
+	}
+	// Only now, with the bookmark loaded, is its owner known.
+	err = security.Require(ctx, "bookmarks:read", &security.Resource{
+		Type: "bookmark", ID: b.ID,
+		Attributes: security.NewValues(map[string]any{"owner": b.Owner}),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+```
+
+A bookmark saved before this chapter has no owner, so only an admin may read it.
+
+## Run it
+
+Start the service in development, which applies the new migration:
+
+```sh
+go run . -dev
+```
+
+Make a key for `ann`, and store its digest. PostgreSQL's `sha256` computes the same digest the authenticator does:
+
+```sh
+KEY="bk_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+psql bookmarks -c "INSERT INTO api_keys (digest, owner) VALUES (sha256(convert_to('$KEY', 'UTF8')), 'ann')"
+```
+
+A call without the key is refused:
+
+```sh
+curl -i localhost:8080/bookmarks -H 'Content-Type: application/json' -d '{"url": "https://go.dev", "title": "Go"}'
+```
+
+```txt
+HTTP/1.1 401 Unauthorized
+Content-Type: application/problem+json
+
+{"type":"urn:galleon:problem:unauthenticated","title":"authentication is required","status":401,"code":"security.unauthenticated"}
+```
+
+With it, the bookmark is saved as ann's:
+
+```sh
+curl localhost:8080/bookmarks -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"url": "https://go.dev", "title": "Go"}'
+```
+
+```json
+{"id":"1","url":"https://go.dev","title":"Go","owner":"ann"}
+```
+
+## Test it
+
+The test makes a key for ann and one for bob, then checks each rule over HTTP:
+
+```go file=examples/learn/authorization/bookmarks_test.go#test title="bookmarks_test.go"
+func TestEachCallerSeesOnlyTheirOwnBookmarks(t *testing.T) {
+	dsn := testkit.PackageDSN(t)          // an empty database; skips unless GALLEON_TEST_POSTGRES is set
+	t.Cleanup(func() { dropAll(t, dsn) }) // registered first, so it runs after the app stops
+	t.Setenv("TEST_HTTP_ADDR", "127.0.0.1:0")
+	h := testkit.New(t,
+		galleon.Modules(server.Module(), pg.Module(), Security(), Bookmarks{}),
+		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}}`)),
+	)
+	ctx := context.Background()
+	keys := testkit.Get[*Keys](h)
+	ann, err := keys.Add(ctx, "ann")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := keys.Add(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := testkit.Get[*server.Server](h).Handler()
+
+	if w := call(api, "POST", "/bookmarks", "", `{"url": "https://go.dev", "title": "Go"}`); w.Code != http.StatusUnauthorized {
+		t.Fatalf("without a key: %d", w.Code)
+	}
+	if w := call(api, "POST", "/bookmarks", "bk_made_up", `{"url": "https://go.dev", "title": "Go"}`); w.Code != http.StatusUnauthorized {
+		t.Fatalf("with a made-up key: %d", w.Code)
+	}
+	w := call(api, "POST", "/bookmarks", ann, `{"url": "https://go.dev", "title": "Go"}`)
+	var saved Bookmark
+	if err := json.Unmarshal(w.Body.Bytes(), &saved); err != nil || saved.Owner != "ann" {
+		t.Fatalf("ann saves: %d %s", w.Code, w.Body)
+	}
+	if w := call(api, "GET", "/bookmarks/"+saved.ID, ann, ""); w.Code != http.StatusOK {
+		t.Fatalf("ann reads hers: %d", w.Code)
+	}
+	if w := call(api, "GET", "/bookmarks/"+saved.ID, bob, ""); w.Code != http.StatusForbidden {
+		t.Fatalf("bob reads ann's: %d", w.Code)
+	}
+}
+
+// call sends a request with an API key, or none when key is empty.
+func call(api http.Handler, method, path, key, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	w := httptest.NewRecorder()
+	api.ServeHTTP(w, req)
+	return w
+}
+```
+
+Its `dropAll` drops the `api_keys` table too, beside the others.
+
+## Checkpoint
+
+Every call to the service needs a key, and each caller reads only their own bookmarks. The pipeline checks the action before it reads a body, and the handler checks what depends on the data once it has loaded it. Nothing is allowed unless the policy says so.
+
+That is the end of Learn for now. Later chapters will cover running several nodes, and replicas. Meanwhile, see [Security](/docs/concepts/security) for how identity, contexts and decisions fit together, and [Protect an operation](/docs/guides/security) for bearer tokens and operating contexts.

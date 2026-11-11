@@ -93,6 +93,10 @@ func (s *Security) Queries() []security.Query {
 // Scheme is "test".
 func (s *Security) Scheme() string { return "test" }
 
+// Challenge is "Test", sent as WWW-Authenticate when a call needs a
+// principal and has none.
+func (s *Security) Challenge() string { return "Test" }
+
 // Authenticate accepts "Authorization: Test <subject>" for a subject made
 // with User.
 func (s *Security) Authenticate(_ context.Context, r *op.Request) (security.Principal, error) {

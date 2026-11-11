@@ -1,0 +1,5 @@
+{
+  "http": {"addr": ":8080"},
+  "pg": {"primary": {"dsn": "postgres://postgres:postgres@localhost:5432/bookmarks?sslmode=disable"}},
+  "limits": {"max_bookmarks": 500}
+}
