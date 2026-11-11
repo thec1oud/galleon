@@ -200,8 +200,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, opts ...g
 	if len(args) == 0 {
 		args = []string{"serve"}
 	}
-	switch args[0] {
-	case "help", "-h", "-help", "--help":
+	if args[0] == "help" || isHelp(args[0]) {
 		if len(args) == 1 {
 			usage(stdout, "")
 			return ExitOK
@@ -225,7 +224,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, opts ...g
 				usage(stdout, args[0])
 				return ExitOK
 			}
-			fmt.Fprintf(stderr, "%s needs a subcommand\n\n", args[0])
+			switch {
+			case len(args) == 1:
+				fmt.Fprintf(stderr, "%s needs a subcommand\n\n", args[0])
+			case strings.HasPrefix(args[1], "-"):
+				fmt.Fprintf(stderr, "%s: put flags after the subcommand, as in %s plan -offline\n\n", args[0], args[0])
+			default:
+				fmt.Fprintf(stderr, "unknown command %q\n\n", args[0]+" "+args[1])
+			}
 			usage(stderr, args[0])
 			return ExitUsage
 		}

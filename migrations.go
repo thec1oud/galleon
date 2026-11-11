@@ -508,7 +508,7 @@ func (a *App) buildMigrators() (*migrate.Runner, []migrate.Migrator, error) {
 // Only providers the migrators' constructors reach through parameters
 // start. One that matters for its side effect alone, such as pg's
 // telemetry for a Manager supplied with pg.Use, doesn't.
-func (a *App) WithMigrations(ctx context.Context, fn func(ctx context.Context, m *Migrations) error) error {
+func (a *App) WithMigrations(ctx context.Context, fn func(ctx context.Context, m *Migrations) error) (err error) {
 	a.mu.Lock()
 	if a.state != stateBuilt {
 		st := a.state
@@ -524,21 +524,22 @@ func (a *App) WithMigrations(ctx context.Context, fn func(ctx context.Context, m
 	a.state = stateMigrating
 	a.mu.Unlock()
 
-	err := a.withMigrations(ctx, fn)
-	// What it started is about to stop: the handle refuses from now on.
-	a.migrationsHandle.set(nil, nil)
-	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.settings.stopTimeout)
-	defer cancel()
-	if serr := a.stopAll(stopCtx); serr != nil {
-		err = errors.Join(err, serr)
-	}
-	if terr := shutdownTelemetry(stopCtx, &a.settings); terr != nil {
-		err = errors.Join(err, terr)
-	}
-	a.mu.Lock()
-	a.state = stateStopped
-	a.mu.Unlock()
-	return err
+	// Deferred, so a panic in fn, a provider or a constructor still stops
+	// what was started.
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.settings.stopTimeout)
+		defer cancel()
+		if serr := a.stopAll(stopCtx); serr != nil {
+			err = errors.Join(err, serr)
+		}
+		if terr := shutdownTelemetry(stopCtx, &a.settings); terr != nil {
+			err = errors.Join(err, terr)
+		}
+		a.mu.Lock()
+		a.state, a.migratorsUp = stateStopped, false
+		a.mu.Unlock()
+	}()
+	return a.withMigrations(ctx, fn)
 }
 
 func (a *App) withMigrations(ctx context.Context, fn func(ctx context.Context, m *Migrations) error) error {
@@ -569,6 +570,9 @@ func (a *App) withMigrations(ctx context.Context, fn func(ctx context.Context, m
 	}
 	// No gate is polled here, so an apply has none to refresh.
 	a.migrations.handle.set(runner, func(context.Context) {})
+	a.mu.Lock()
+	a.migratorsUp = true // Resolve may now read what started
+	a.mu.Unlock()
 	return fn(ctx, a.migrations.handle)
 }
 
@@ -681,7 +685,7 @@ func (m *Migrations) Runner() (*migrate.Runner, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.runner == nil {
-		return nil, errs.New(errs.FailedPrecondition, migrate.CodeNotSupported, "the app has no migrators, or hasn't started")
+		return nil, errs.New(errs.FailedPrecondition, migrate.CodeNotSupported, "the app has no migrators, or isn't running")
 	}
 	return m.runner, nil
 }

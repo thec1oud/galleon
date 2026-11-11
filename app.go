@@ -188,6 +188,7 @@ type App struct {
 	state        state
 	started      []*provider // providers whose Start succeeded, in order
 	fullyStarted bool        // every provider and start hook succeeded
+	migratorsUp  bool        // WithMigrations has started what the migrators need
 	sealed       bool        // New has returned; registrations are closed
 	readyCancel  context.CancelFunc
 	readyDone    chan struct{}
@@ -404,7 +405,7 @@ func (a *App) Start(ctx context.Context) error {
 		a.mu.Unlock()
 		switch st {
 		case stateStopped:
-			return errors.New("galleon: Start called after Shutdown or WithMigrations; an app runs once")
+			return errors.New("galleon: Start called after the app stopped (after Shutdown, a failed Start or WithMigrations); an app runs once")
 		case stateMigrating:
 			return errors.New("galleon: Start called while WithMigrations runs; an app runs once")
 		}
@@ -579,6 +580,8 @@ func (a *App) stopAll(ctx context.Context) error {
 		}
 	}
 	a.started = nil
+	// What the migrators run on has stopped: the handle refuses from now on.
+	a.migrationsHandle.set(nil, nil)
 	return errors.Join(errs...)
 }
 

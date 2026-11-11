@@ -612,3 +612,26 @@ func TestWithMigrationsRefusesARunningApp(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestWithMigrationsStopsWhatItStartedWhenFnPanics(t *testing.T) {
+	var mu sync.Mutex
+	var applied, life []string
+	s := newStub("schema", &applied, &mu)
+	app, err := galleon.New(base(migratorModule("m", func(r *galleon.Registry) {
+		galleon.Provide[*dbHandle](r, func() *dbHandle { return &dbHandle{&lifecycle{"db", &life}} })
+		galleon.Migrator(r, "schema", func(*dbHandle) migrate.Migrator { return s })
+	}))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() { _ = recover() }()
+		_ = app.WithMigrations(context.Background(), func(context.Context, *galleon.Migrations) error { panic("boom") })
+	}()
+	if got := strings.Join(life, ","); got != "start db,stop db" {
+		t.Errorf("lifecycle %q", got)
+	}
+	if err := app.Shutdown(context.Background()); err != nil {
+		t.Errorf("the app is still migrating after the panic: %v", err)
+	}
+}
