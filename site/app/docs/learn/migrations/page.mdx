@@ -231,4 +231,4 @@ func dropAll(t *testing.T, dsn string) {
 
 The service owns its schema. Development applies migrations at boot. Production checks them, keeps the node out of traffic until they are applied, and applies them only when you set the mode.
 
-That is the end of Learn for now. Later chapters will cover authorization, several nodes, and replicas. Meanwhile, see [Migrations](/docs/concepts/migrations) for how migrations run across a cluster, and the [Guides](/docs/guides) for specific tasks.
+Next, in [Authorization](/docs/learn/authorization), callers authenticate with API keys and see only their own bookmarks. See [Migrations](/docs/concepts/migrations) for how migrations run across a cluster.

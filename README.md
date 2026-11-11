@@ -2,7 +2,7 @@
 
 A complete, efficient web framework for Go, for internal services and large full-stack applications.
 
-Galleon gives you modules, dependency injection and configuration, typed operations over HTTP and RPC, and a PostgreSQL data plane with replicas, read-your-writes and migrations. Every app's wiring, config and coordination are checked at boot, before it takes traffic.
+Galleon gives you modules, dependency injection and configuration, typed operations over HTTP and RPC, authentication and authorization that deny by default, and a PostgreSQL data plane with replicas, read-your-writes and migrations. Every app's wiring, config and coordination are checked at boot, before it takes traffic.
 
 > **Status: early.** APIs will change and there is no release yet. Coordination has only the in-process backend, for a single node. The [Concepts](site/app/docs/concepts/page.mdx) pages say what isn't built yet.
 

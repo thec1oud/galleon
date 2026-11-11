@@ -53,6 +53,20 @@ Read by package `server`.
 | `trusted_proxies` | `[]string` |  | TrustedProxies are the CIDRs whose X-Forwarded-For header is believed when working out the caller's address. "unix" trusts connections on a Unix socket, from a proxy on the same host. Without it, callers on a Unix socket have no address, so rate limits keyed by address skip them. |
 | `access_log` **env** | `bool` |  | AccessLog logs one line per request. |
 
+## jwt
+
+Read by package `security/jwt`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `issuer` **env** | `string` |  | Issuer is the token issuer: a token's iss claim must equal it. Unless JWKSURL or JWKS is set, the issuer's keys are found through OpenID Connect discovery, at Issuer + "/.well-known/openid-configuration". |
+| `audience` | `[]string` |  | Audience lists the audiences this service answers to: a token's aud claim must name one of them. |
+| `jwks_url` **env** | `string` |  | JWKSURL is where the issuer publishes its JWK set, if not found through discovery. It must be https, except on a loopback host. |
+| `jwks` **env** | `string` |  | JWKS is a JWK set, as JSON, used instead of fetching one, for tests and issuers whose keys never change. |
+| `algorithms` | `[]string` |  | Algorithms lists the signature algorithms accepted. The default is every one supported: RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512 and EdDSA. |
+| `leeway` **env** | `time.Duration` | `1m` | Leeway is the allowance for clock skew when checking exp and nbf. It may be at most 5 minutes. |
+| `refresh_interval` **env** | `time.Duration` | `1h` | RefreshInterval is how often the issuer's keys are fetched again. It must be at least a minute. |
+
 ## migrate
 
 Read by package `galleon`. Its keys, other than `recheck` and `apply_timeout`, override the app's migration policy. A key left unset keeps the policy's value, which is the environment profile's unless the app changes it (see [Migrations](/docs/concepts/migrations#the-deploy-policy)).

@@ -62,7 +62,7 @@ Every call runs the same fixed stages, in this order:
 
 The kernel compiles each operation's chain once, at boot, so a call walks a prepared list.
 
-A module can add an interceptor before or after any stage with `r.Intercept`, for every operation. The kernel implements admit, decode and both validation stages. Authenticate, resolve context, gate, pre-authorize, authorize, commit hooks and encode are slots a module fills with `r.ImplementStage`. The transport matches the route before the pipeline starts.
+A module can add an interceptor before or after any stage with `r.Intercept`, for every operation. The kernel implements admit, decode and both validation stages. Authenticate, resolve context, gate, pre-authorize, authorize, commit hooks and encode are slots a module fills with `r.ImplementStage`, or with `r.PrepareStage`, which prepares the stage once per operation at boot and can leave it out of operations that don't need it ([0203](/docs/decisions/0203-prepare-stages-per-operation)). The transport matches the route before the pipeline starts.
 
 ## Security is declared
 
@@ -73,9 +73,7 @@ Every operation must either be `Public()` or name an action with `Authorize` or 
 - `Schemes` needs authenticate;
 - `Contexts` needs resolve context and gate.
 
-<Callout type="warn">
-The security plane isn't built yet, so no module of Galleon's implements those stages. Until it is, an app either marks its operations `Public()` or implements the stages itself.
-</Callout>
+The [security module](/docs/concepts/security) fills all of them but commit hooks and encode, and checks each operation's declaration against what it has at boot.
 
 ## Input
 

@@ -16,6 +16,7 @@ import (
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/migrate"
 	"github.com/thec1oud/galleon/pg"
+	"github.com/thec1oud/galleon/security/jwt"
 	"github.com/thec1oud/galleon/server"
 )
 
@@ -28,6 +29,7 @@ var Defaults = map[string]func() any{
 	"http":   func() any { c := new(server.Config); c.Default(); return c },
 	"pg":     func() any { c := new(pg.Config); c.Default(); return c },
 	"client": func() any { c := new(client.Config); c.Default(); return c },
+	"jwt":    func() any { c := new(jwt.Config); c.Default(); return c },
 }
 
 // migrateDefaults returns the defaults of the migrate section, which has

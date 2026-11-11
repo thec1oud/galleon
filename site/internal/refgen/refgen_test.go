@@ -71,7 +71,7 @@ func TestEverySectionIsFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{"client": true, "http": true, "migrate": true, "pg": true}
+	want := map[string]bool{"client": true, "http": true, "jwt": true, "migrate": true, "pg": true}
 	for _, s := range sections {
 		if !want[s.Name] {
 			t.Errorf("unexpected section %q: add it to Defaults, or to this test if it has no defaults", s.Name)

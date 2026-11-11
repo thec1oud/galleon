@@ -29,13 +29,14 @@ These planes exist today:
 |---|---|---|
 | Operations | `op`, `bind`, `validate`, `codec` | Describes every API operation once, and runs each call through one fixed pipeline |
 | Transport | `server`, `client` | Serves operations over HTTP and RPC on one `net/http` server, and makes outbound HTTP calls |
+| Security | `security`, `security/jwt`, `security/apikey` | Authenticates callers, resolves their operating context, and decides what they may do, denying by default |
 | Errors | `errs` | One error type with a kind and a stable code, rendered as problem+json or a gRPC status |
 | Data | `data`, `pg` | Transactions on PostgreSQL through pgx, with replica routing and read-your-writes |
 | Migrations | `migrate`, `pg/sqlmigrate` | Applies schema changes once across the cluster, under a deploy policy |
 | Coordination | `coord`, `coord/local` | Locks, leader election, pub/sub, KV, counters and membership |
 | Processes | `process` | Runs several copies of the app on one host, sharing ports |
 
-The security, async, realtime and web planes are designed but not built. Their decisions are recorded, for example [0021](/docs/decisions/0021-generic-authorization-seams) for authorization.
+The async, realtime and web planes are designed but not built, as are the security plane's sessions and keyring. Their decisions are recorded, for example [0022](/docs/decisions/0022-frontend-battery) for the web battery.
 
 ## Seams
 
