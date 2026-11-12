@@ -1,6 +1,7 @@
 // Package refgen generates the docs' reference pages for error codes and
-// config sections from the source of Galleon's core module, so they can't
-// drift from it. It reads the code with full type information, and fails
+// config sections from the source of Galleon's core module, and the
+// command line's from its definitions in package cli, so they can't drift
+// from it. It reads the code with full type information, and fails
 // rather than guess when it meets a code or a section it can't resolve.
 package refgen
 

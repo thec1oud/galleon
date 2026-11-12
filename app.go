@@ -137,6 +137,9 @@ const (
 	stateStarted
 	stateDraining
 	stateStopped
+	// stateMigrating: WithMigrations is running; only the migrators'
+	// providers are started.
+	stateMigrating
 )
 
 // App is a built, validated application. Create it with New.
@@ -185,6 +188,7 @@ type App struct {
 	state        state
 	started      []*provider // providers whose Start succeeded, in order
 	fullyStarted bool        // every provider and start hook succeeded
+	migratorsUp  bool        // WithMigrations has started what the migrators need
 	sealed       bool        // New has returned; registrations are closed
 	readyCancel  context.CancelFunc
 	readyDone    chan struct{}
@@ -399,8 +403,11 @@ func (a *App) Start(ctx context.Context) error {
 	if a.state != stateBuilt {
 		st := a.state
 		a.mu.Unlock()
-		if st == stateStopped {
-			return errors.New("galleon: Start called after Shutdown; an app runs once")
+		switch st {
+		case stateStopped:
+			return errors.New("galleon: Start called after the app stopped (after Shutdown, a failed Start or WithMigrations); an app runs once")
+		case stateMigrating:
+			return errors.New("galleon: Start called while WithMigrations runs; an app runs once")
 		}
 		return errors.New("galleon: Start called twice")
 	}
@@ -477,6 +484,8 @@ func (a *App) Ready(ctx context.Context) error {
 		}
 	case stateDraining:
 		return errors.New("draining")
+	case stateMigrating:
+		return errors.New("running migrate commands, not serving")
 	default:
 		return errors.New("not started")
 	}
@@ -505,6 +514,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 		a.state = stateStopped
 		a.mu.Unlock()
 		return shutdownTelemetry(ctx, &a.settings)
+	case stateMigrating:
+		a.mu.Unlock()
+		return errors.New("galleon: Shutdown called while WithMigrations runs; it stops what it started when its function returns")
 	default:
 		a.mu.Unlock()
 		return nil
@@ -568,6 +580,8 @@ func (a *App) stopAll(ctx context.Context) error {
 		}
 	}
 	a.started = nil
+	// What the migrators run on has stopped: the handle refuses from now on.
+	a.migrationsHandle.set(nil, nil)
 	return errors.Join(errs...)
 }
 

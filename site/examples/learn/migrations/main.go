@@ -5,9 +5,10 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
+	"os"
 
 	"github.com/thec1oud/galleon"
+	"github.com/thec1oud/galleon/cli"
 	"github.com/thec1oud/galleon/coord/local"
 	"github.com/thec1oud/galleon/pg"
 	"github.com/thec1oud/galleon/server"
@@ -25,6 +26,7 @@ func options(env galleon.Env) []galleon.Option {
 	}
 }
 
+// main serves, or runs the command after the flags, such as migrate plan.
 func main() {
 	dev := flag.Bool("dev", false, "apply migrations at boot, as in development")
 	flag.Parse()
@@ -32,13 +34,7 @@ func main() {
 	if *dev {
 		env = galleon.Development
 	}
-	app, err := galleon.New(options(env)...)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := app.Run(context.Background()); err != nil {
-		log.Fatal(err)
-	}
+	os.Exit(cli.Main(context.Background(), flag.Args(), options(env)...))
 }
 
 // docs:end main

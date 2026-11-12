@@ -11,9 +11,9 @@ In production, Galleon never applies a migration nobody looked at. This guide se
 1. Each migration file declares its risk.
 2. CI prints the plan for the production database, with the fingerprint that identifies it.
 3. Someone approves that fingerprint.
-4. The deploy applies the plan only if it is still the one approved, and only up to the risk the policy allows.
+4. The deploy's release step applies the plan only if it is still the one approved, and only up to the risk the policy allows.
 
-It assumes a service that migrates its own schema with `pg/sqlmigrate`, as in [Migrations](/docs/learn/migrations) in Learn. For how the parts fit together, see [Migrations](/docs/concepts/migrations) in Concepts.
+Steps 2 and 4 are commands of the service's own binary: `notes migrate plan` and `notes migrate apply`. It assumes a service that migrates its own schema with `pg/sqlmigrate`, as in [Migrations](/docs/learn/migrations) in Learn. For how the parts fit together, see [Migrations](/docs/concepts/migrations) in Concepts.
 
 ## Declare each file's risk
 
@@ -36,17 +36,17 @@ Building an index on a large table blocks writes unless it is built concurrently
 CREATE INDEX CONCURRENTLY IF NOT EXISTS notes_title ON notes (title);
 ```
 
-If the statement fails part way, or runs past `apply_timeout` (ten minutes by default) and is cancelled, the file is pending again. A concurrent build that fails leaves an invalid index behind, and on the next attempt `IF NOT EXISTS` skips it: the file is recorded as applied, and nothing was built. A restarted node can make that attempt on its own when the failed file was the first step of the approved plan, since the pending plan, and so its fingerprint, still matches. Without a pinned fingerprint, any restart in apply mode retries it.
+If the statement fails part way, or the apply is cancelled, the file is pending again. A concurrent build that fails leaves an invalid index behind, and on the next attempt `IF NOT EXISTS` skips it: the file is recorded as applied, and nothing was built. Rerunning the release step with the same approval makes that attempt when the failed file was the first step of the approved plan, since the pending plan, and so its fingerprint, still matches. So does a node that applies at boot, on every restart.
 
-So after a failed apply, switch the deploy back to verify mode (unset `NOTES_MIGRATE_MODE`) or stop restarts, and check the index:
+So after a failed apply, don't rerun it, and check the index:
 
 ```sql
 SELECT indisvalid FROM pg_index WHERE indexrelid = 'notes_title'::regclass;
 ```
 
-If it is invalid, drop it with `DROP INDEX CONCURRENTLY IF EXISTS notes_title`, then deploy again, approving the new plan if its fingerprint changed. If an attempt has already recorded the file, ship two new `no-transaction` files: one that drops the index, and one that builds it again. For a large table, raise `apply_timeout` for the deploy.
+If it is invalid, drop it with `DROP INDEX CONCURRENTLY IF EXISTS notes_title`, then deploy again, approving the new plan if its fingerprint changed. If an attempt has already recorded the file, ship two new `no-transaction` files: one that drops the index, and one that builds it again. `migrate apply` has no time limit of its own, so give the release step enough time for a large table.
 
-The migrator is registered as in Learn:
+The migrator is registered as in Learn, and `main` hands the binary's arguments to [`cli.Main`](/docs/reference/cli), which serves without a command and runs `migrate status`, `plan` and `apply` with one:
 
 ```go file=examples/guides/migrations/notes.go#module title="notes.go"
 // Notes registers the "notes" migrator over Files.
@@ -62,52 +62,50 @@ func (n Notes) Register(r *galleon.Registry) error {
 }
 ```
 
+```go file=examples/guides/migrations/notes.go#main title="main.go"
+// options is the service, as every command runs it, over the migrations
+// in files; more adds to it, such as its config.
+func options(files fs.FS, more ...galleon.Option) []galleon.Option {
+	return append([]galleon.Option{
+		galleon.Name("notes"),
+		galleon.Coordination(local.New()),
+		galleon.Deploy(galleon.SingleNode),
+		galleon.Modules(pg.Module(), Notes{files}),
+	}, more...)
+}
+
+// main serves without a command, and runs `notes migrate status|plan|apply`
+// with one.
+func main() {
+	os.Exit(cli.Main(context.Background(), os.Args[1:], options(Migrations, galleon.ConfigFile("config.json"))...))
+}
+```
+
+Each command builds the service as `main` does, with the same config and environment, and starts only what its migrators need. It doesn't serve, and it never applies unless it is `migrate apply`, whatever the config's mode says.
+
 ## Know what production does by default
 
-The `Production` profile verifies at boot and never applies. Each migrator's readiness gate, `migrate.<name>`, stays failing while changes are pending, so a node with an old schema takes no traffic. When it applies, it allows steps up to `caution`.
+The `Production` profile verifies at boot and never applies. Each migrator's readiness gate, `migrate.<name>`, stays failing while changes are pending, so a node with an old schema takes no traffic. The policy allows steps up to `caution`, whether they are applied by `migrate apply` or at boot.
 
 Deploys change that with the `migrate` config section, or its environment variables, `<APP>_MIGRATE_<KEY>`:
 
 | Key | What it does |
 |---|---|
-| `mode` | `apply` applies at boot, under the cluster lock |
 | `approve` | pins each migrator's approved fingerprint, as `name=fingerprint` pairs |
 | `max_risk` | raises or lowers the highest risk a deploy may apply |
 | `allow_unknown` | lets steps of unknown risk run |
 | `tolerate_ahead` | keeps a node ready when the database is newer than its build |
-| `apply_timeout` | bounds applying at boot, waiting for the lock included; ten minutes by default |
+| `mode` | `apply` applies at boot, under the cluster lock, instead of in a release step |
 
 [Configuration](/docs/reference/config#migrate) in Reference lists every key.
 
 ## Plan in CI
 
-A plan says what applying would do to one database: the pending steps, their risks, and a fingerprint of exactly those steps. Make it against the production database, or a copy at the same version, right before you deploy.
+A plan says what applying would do to one database: the pending steps, their risks, and a fingerprint of exactly those steps. Make it against the production database, or a copy at the same version, right before you deploy, with the build you are about to deploy and the production config:
 
-There is no `migrate plan` command yet. Until there is, `App.Migrations().Plan` is the Go API. This function prints the plan and fails if the policy would refuse it:
-
-```go file=examples/guides/migrations/notes.go#plan title="notes.go"
-// PrintPlan writes what applying would do to the database app is connected
-// to: each migrator's pending steps, their risks, and the fingerprint to
-// approve. It fails when a plan couldn't be made, the database's status
-// couldn't be read, or the policy would refuse the plan, so CI stops there.
-func PrintPlan(ctx context.Context, app *galleon.App, w io.Writer) error {
-	reports, err := app.Migrations().Plan(ctx, false)
-	if err != nil {
-		return err
-	}
-	if err := migrate.WritePlans(w, reports); err != nil {
-		return err
-	}
-	for _, r := range reports {
-		if r.Err != nil || r.StatusErr != nil || r.Refused != nil {
-			return fmt.Errorf("migrator %s can't be deployed as planned", r.Name)
-		}
-	}
-	return nil
-}
+```sh
+notes migrate plan
 ```
-
-Call it from a command your CI runs, on an app built with the production config, `pg.Module()` and the modules that own migrators. Run it in verify mode, never with the deploy's `NOTES_MIGRATE_MODE=apply`: `Start` would apply everything before the plan is made. It prints:
 
 ```txt
 notes: 2 step(s), max risk caution, fingerprint aeba9062426a4f9383ab70aa950f722a0d21932b7d985e74de8bb7b938536772
@@ -115,90 +113,83 @@ notes: 2 step(s), max risk caution, fingerprint aeba9062426a4f9383ab70aa950f722a
   0002_index_notes_title [caution] 0002_index_notes_title.sql (outside a transaction)
 ```
 
-Review the steps, then record the approval where your deploy reads it, such as a protected variable in your pipeline.
+It exits 1 if a plan couldn't be made, the database's status couldn't be read, or the policy would refuse the plan, so CI stops there. Review the steps, then record the approval where your deploy reads it, such as a protected variable in your pipeline.
 
 ## Deploy the approved plan
 
-Deploy with migrations applied at boot, and the fingerprint pinned:
+Run `migrate apply` once, as the release step, before the new build takes traffic, with the fingerprint pinned:
 
 ```sh
-NOTES_MIGRATE_MODE=apply
-NOTES_MIGRATE_APPROVE=notes=aeba9062426a4f9383ab70aa950f722a0d21932b7d985e74de8bb7b938536772
+NOTES_MIGRATE_APPROVE=notes=aeba9062426a4f9383ab70aa950f722a0d21932b7d985e74de8bb7b938536772 notes migrate apply
 ```
-
-With today's only coordination backend, `coord/local`, the app runs as one process (`galleon.Deploy(galleon.SingleNode)`), and that process applies. With a cluster backend, which isn't built yet, every node can boot this way: one applies under the coordination lock, and the others wait for it, then find nothing pending. A migrator with nothing pending has no plan to check.
-
-If the database changed since the plan was made, or the build has a file the plan didn't, the plan differs from the approved one, and boot fails before anything is applied:
 
 ```txt
-applying migrations at boot (mode apply): migrate.fingerprint_mismatch: migrator "notes": the plan's fingerprint is aeba9062…, but 0123abcd was approved; review the new plan and approve it
+notes: applied, 2 step(s)
+  0001_create_notes [safe]
+  0002_index_notes_title [caution]
 ```
 
-This test runs the whole flow against a real database:
+Then roll out the new build in the default verify mode. Its nodes' gates pass at once, since the schema is already up to date; `notes migrate status` says the same, and exits 1 while any migrator isn't ready.
+
+If the database changed since the plan was made, or the build has a file the plan didn't, the plan differs from the approved one, and nothing is applied:
+
+```txt
+notes: refused
+  error: migrate.fingerprint_mismatch: migrator "notes": the plan's fingerprint is aeba9062…, but 0123abcd was approved; review the new plan and approve it
+```
+
+This test runs the whole flow against a real database, through the same command line:
 
 ```go file=examples/guides/migrations/notes_test.go#approve title="notes_test.go"
 func TestADeployAppliesOnlyTheApprovedPlan(t *testing.T) {
 	dsn := testkit.PackageDSN(t) // an empty database, standing in for production
 	t.Cleanup(func() { dropAll(t, dsn) })
-	ctx := context.Background()
 
-	// CI: boot as production does, in verify mode, and print the plan.
-	ci := testkit.New(t,
-		galleon.Name("notes"),
-		galleon.Environment(galleon.Production),
-		galleon.Modules(pg.Module(), Notes{Migrations}),
-		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}}`)),
-	)
-	var out bytes.Buffer
-	if err := PrintPlan(ctx, ci.App, &out); err != nil {
-		t.Fatal(err)
+	// CI: notes migrate plan
+	plan, code := notes(dsn, Migrations, "migrate", "plan")
+	if code != cli.ExitOK {
+		t.Fatalf("plan exited %d:\n%s", code, plan)
 	}
-	t.Log(out.String())
-	approve := approval(t, out.String())
+	t.Log(plan)
+	approve := approval(t, plan)
 
-	// The deploy: a plan other than the approved one is refused.
+	// The release step: notes migrate apply. A plan other than the
+	// approved one is refused.
 	t.Setenv("NOTES_MIGRATE_APPROVE", "notes=0123abcd")
-	err := deploy(dsn, Migrations)
-	if err == nil || !strings.Contains(err.Error(), "migrate.fingerprint_mismatch") {
-		t.Fatalf("an unapproved plan: %v", err)
+	if out, code := notes(dsn, Migrations, "migrate", "apply"); code != cli.ExitFailed || !strings.Contains(out, "migrate.fingerprint_mismatch") {
+		t.Fatalf("an unapproved plan: exited %d:\n%s", code, out)
 	}
 
 	// The approved plan applies.
 	t.Setenv("NOTES_MIGRATE_APPROVE", approve)
-	if err := deploy(dsn, Migrations); err != nil {
-		t.Fatalf("the approved plan: %v", err)
+	if out, code := notes(dsn, Migrations, "migrate", "apply"); code != cli.ExitOK {
+		t.Fatalf("the approved plan: exited %d:\n%s", code, out)
 	}
-	reports, err := ci.Migrations().Status(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reports) != 1 || reports[0].Status.State != migrate.UpToDate {
-		t.Fatalf("after the deploy: %+v", reports)
+
+	// The new release's nodes, verifying at boot, find the schema ready.
+	if out, code := notes(dsn, Migrations, "migrate", "status"); code != cli.ExitOK || !strings.Contains(out, "notes: up_to_date") {
+		t.Fatalf("after the deploy: exited %d:\n%s", code, out)
 	}
 }
 
-// deploy boots the service as production does, with migrations applied at
-// boot, and stops it again.
-func deploy(dsn string, files fs.FS) error {
-	app, err := galleon.New(
-		galleon.Name("notes"),
-		galleon.Environment(galleon.Production),
-		galleon.Coordination(local.New()),
-		galleon.Deploy(galleon.SingleNode),
-		galleon.DrainGrace(0), // nothing to drain: the test stops it at once
+// notes runs the service's command line, as production configures it, on
+// database dsn and the migrations in files. It returns what the command
+// printed, stdout and stderr together, and its exit code.
+func notes(dsn string, files fs.FS, args ...string) (string, int) {
+	var out bytes.Buffer
+	code := cli.Run(context.Background(), args, &out, &out, options(files,
 		galleon.Logger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		galleon.Modules(pg.Module(), Notes{files}),
-		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}, "migrate": {"mode": "apply"}}`)),
-	)
-	if err != nil {
-		return err
-	}
-	if err := app.Start(context.Background()); err != nil {
-		return err
-	}
-	return app.Shutdown(context.Background())
+		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}}`)),
+	)...)
+	return out.String(), code
 }
 ```
+
+`migrate apply` holds the coordination lock, as an apply at boot does. With today's only backend, `coord/local`, that lock holds within one process, so don't run the release step while a node applies at boot. With a cluster backend, which isn't built yet, they exclude each other.
+
+### Or apply at boot
+
+A deploy without a release step can set `NOTES_MIGRATE_MODE=apply` instead, with the approval pinned the same way: the app applies at boot, under the lock, and fails to start if the plan isn't the approved one. With `coord/local` the app runs as one process (`galleon.Deploy(galleon.SingleNode)`), and that process applies; with a cluster backend every node can boot this way, and one applies while the others wait for it. A migrator with nothing pending has no plan to check.
 
 ## Ship a destructive change
 
@@ -214,34 +205,26 @@ notes: 1 step(s), max risk destructive, fingerprint d1cf2bc2…
 func TestProductionRefusesADestructiveStep(t *testing.T) {
 	dsn := testkit.PackageDSN(t)
 	t.Cleanup(func() { dropAll(t, dsn) })
-	if err := deploy(dsn, Migrations); err != nil { // no approval pinned: any plan up to caution
-		t.Fatal(err)
+	if out, code := notes(dsn, Migrations, "migrate", "apply"); code != cli.ExitOK { // no approval pinned: any plan up to caution
+		t.Fatalf("exited %d:\n%s", code, out)
 	}
 
 	drop := fstest.MapFS{"0003_drop_body.sql": {Data: []byte("-- galleon:risk destructive\nALTER TABLE notes DROP COLUMN body;\n")}}
 	files := merge(Migrations, drop)
 
 	// CI's plan already says the deploy would be refused.
-	ci := testkit.New(t,
-		galleon.Name("notes"),
-		galleon.Environment(galleon.Production),
-		galleon.Modules(pg.Module(), Notes{files}),
-		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}}`)),
-	)
-	var out bytes.Buffer
-	if err := PrintPlan(context.Background(), ci.App, &out); err == nil || !strings.Contains(out.String(), "refused") {
-		t.Fatalf("PrintPlan = %v:\n%s", err, out.String())
+	if out, code := notes(dsn, files, "migrate", "plan"); code != cli.ExitFailed || !strings.Contains(out, "refused") {
+		t.Fatalf("plan exited %d:\n%s", code, out)
 	}
 
-	// And so is the deploy, if it gets that far.
-	err := deploy(dsn, files)
-	if err == nil || !strings.Contains(err.Error(), "3_drop_body (destructive)") {
-		t.Fatalf("a destructive step in production: %v", err)
+	// And so is the apply, if it gets that far.
+	if out, code := notes(dsn, files, "migrate", "apply"); code != cli.ExitFailed || !strings.Contains(out, "3_drop_body (destructive)") {
+		t.Fatalf("a destructive step in production: exited %d:\n%s", code, out)
 	}
 }
 ```
 
-Drop a column only once no running build reads it: stop using it in one release, and drop it in a later one. Then raise the limit for that one change, both for the plan in CI and for the deploy beside its approval, and set it back afterwards:
+Drop a column only once no running build reads it: stop using it in one release, and drop it in a later one. Then raise the limit for that one change, both for the plan in CI and for the release step beside its approval, and set it back afterwards:
 
 ```sh
 NOTES_MIGRATE_MAX_RISK=destructive

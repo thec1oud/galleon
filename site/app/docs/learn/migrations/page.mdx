@@ -80,7 +80,7 @@ Galleon builds the migrator once the database is connected. It applies the files
 
 ## Choose the environment
 
-What Galleon does with pending migrations at boot depends on the environment. Production, the default, only checks them. Development applies them. Add a flag to choose:
+What Galleon does with pending migrations at boot depends on the environment. Production, the default, only checks them. Development applies them. Add a flag to choose, and hand the arguments after the flags to [`cli.Main`](/docs/reference/cli): without any it serves, and with `migrate status`, `migrate plan` or `migrate apply` it runs that command instead:
 
 ```go file=examples/learn/migrations/main.go#main title="main.go"
 func options(env galleon.Env) []galleon.Option {
@@ -94,6 +94,7 @@ func options(env galleon.Env) []galleon.Option {
 	}
 }
 
+// main serves, or runs the command after the flags, such as migrate plan.
 func main() {
 	dev := flag.Bool("dev", false, "apply migrations at boot, as in development")
 	flag.Parse()
@@ -101,13 +102,7 @@ func main() {
 	if *dev {
 		env = galleon.Development
 	}
-	app, err := galleon.New(options(env)...)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := app.Run(context.Background()); err != nil {
-		log.Fatal(err)
-	}
+	os.Exit(cli.Main(context.Background(), flag.Args(), options(env)...))
 }
 ```
 
@@ -146,11 +141,45 @@ Run it without `-dev`. It starts, but it doesn't open its port. The log says why
 level=WARN msg="migration gate fails: the app takes no traffic until it passes" migrator=bookmarks reason="migrate.not_ready: migrator \"bookmarks\": changes are pending (database none, build 2): 2 pending: 0001_create_bookmarks.sql, 0002_add_created_at.sql; apply them with mode apply or migrate apply"
 ```
 
-Production never changes a schema on its own. To apply the pending files, set the mode for that deploy:
+Production never changes a schema on its own. Stop it, and ask the service what is pending:
 
 ```sh
-BOOKMARKS_MIGRATE_MODE=apply go run .
+go run . migrate status
 ```
+
+```txt
+bookmarks: pending (database none, build 2), not ready
+  2 pending: 0001_create_bookmarks.sql, 0002_add_created_at.sql
+  capabilities: plan, plan_offline, verify
+  verify: no drift
+```
+
+See what applying would do:
+
+```sh
+go run . migrate plan
+```
+
+```txt
+bookmarks: 2 step(s), max risk safe, fingerprint 91a736151db70a03b20d3eaefc0daa2ef9fa718230380284f5a9212bf70209ae
+  0001_create_bookmarks [safe] 0001_create_bookmarks.sql
+  0002_add_created_at [safe] 0002_add_created_at.sql
+```
+
+Then apply it, and start the service again:
+
+```sh
+go run . migrate apply
+go run .
+```
+
+```txt
+bookmarks: applied, 2 step(s)
+  0001_create_bookmarks [safe]
+  0002_add_created_at [safe]
+```
+
+This time the gate passes, and the service opens its port. Neither `migrate status` nor `migrate plan` changed anything, and none of the three commands served: each starts only the database the migrator needs. A production deploy runs the same commands, and pins the plan it approved; [Deploy migrations safely](/docs/guides/migrations) shows how.
 
 The production policy applies files up to `caution` risk. It refuses a riskier file, or one of unknown risk, unless the `migrate` section allows it with `max_risk` or `allow_unknown`; see the [configuration reference](/docs/reference/config#migrate).
 
@@ -229,6 +258,6 @@ func dropAll(t *testing.T, dsn string) {
 
 ## Checkpoint
 
-The service owns its schema. Development applies migrations at boot. Production checks them, keeps the node out of traffic until they are applied, and applies them only when you set the mode.
+The service owns its schema. Development applies migrations at boot. Production checks them, keeps the node out of traffic until they are applied, and applies them only when you run `migrate apply`, or set the mode.
 
 That is the end of Learn for now. Later chapters will cover authorization, several nodes, and replicas. Meanwhile, see [Migrations](/docs/concepts/migrations) for how migrations run across a cluster, and the [Guides](/docs/guides) for specific tasks.

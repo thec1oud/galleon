@@ -15,7 +15,7 @@ The repository is a [Go workspace](https://go.dev/ref/mod#workspaces). Each modu
 | `github.com/thec1oud/galleon/site` | `/site` | This site, and the Go samples its pages show |
 | `github.com/thec1oud/galleon/adapters/dpg` | `/adapters/dpg` | The migration adapter for DPG. It builds only against a local DPG checkout, so it isn't in `go.work` or CI yet. |
 
-Modules still to come: `coord-pg`, `jobs`, `web`, `realtime`, `http3`, the other `adapters/*`, and `cmd/galleon`.
+Modules still to come: `coord-pg`, `jobs`, `web`, `realtime`, `http3`, the other `adapters/*`, and `cmd/galleon`, a CLI for development tooling that forwards `galleon migrate` to the app's own binary ([0500](/docs/decisions/0500-commands-are-subcommands-of-the-apps-binary)).
 
 ## Packages of the core module
 
@@ -31,6 +31,7 @@ Modules still to come: `coord-pg`, `jobs`, `web`, `realtime`, `http3`, the other
 | `migrate`, `pg/sqlmigrate` | The migration seam and the built-in SQL migrator |
 | `clock` | The time seam |
 | `process` | The multi-process supervisor |
+| `cli` | The app's command line: `serve` and `migrate status\|plan\|apply` |
 | `internal/dsn` | Telling the forms of a PostgreSQL connection string apart |
 
 ## Dependency rules
@@ -44,7 +45,7 @@ Dependencies point one way ([0008](/docs/decisions/0008-dependency-direction)):
 
 Tests enforce part of this today, in [`deps_test.go`](https://github.com/thec1oud/galleon/blob/dev/deps_test.go):
 
-- The kernel, `op`, `server` and `client` don't link a PostgreSQL driver.
+- The kernel, `op`, `server`, `client` and `cli` don't link a PostgreSQL driver.
 - `data` links pgx's types and `errs`, and nothing else of Galleon. An ORM adapter that imports it gets neither the kernel nor a pool.
 
 ## Adding a module

@@ -136,11 +136,18 @@ func (a *App) build(p *provider) error {
 	return nil
 }
 
-// Resolve returns the instance of T. It only works after Start.
+// Resolve returns the instance of T. It only works after Start, or inside
+// WithMigrations for what the migrators need, which is all it starts.
 func Resolve[T any](a *App) (T, error) {
 	var zero T
 	a.mu.Lock()
-	started := a.state >= stateStarted
+	var started bool
+	switch a.state {
+	case stateStarted, stateDraining, stateStopped:
+		started = true
+	case stateMigrating:
+		started = a.migratorsUp
+	}
 	a.mu.Unlock()
 	if !started {
 		return zero, errors.New("galleon: Resolve called before Start")
@@ -148,6 +155,9 @@ func Resolve[T any](a *App) (T, error) {
 	p, ok := a.providers[reflect.TypeFor[T]()]
 	if !ok {
 		return zero, fmt.Errorf("galleon: nothing provides %s", reflect.TypeFor[T]())
+	}
+	if !p.value.IsValid() {
+		return zero, fmt.Errorf("galleon: %s wasn't built: the app didn't start it (WithMigrations starts only what the migrators need)", reflect.TypeFor[T]())
 	}
 	return p.value.Interface().(T), nil
 }

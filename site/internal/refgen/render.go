@@ -12,6 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/thec1oud/galleon/cli"
 	"github.com/thec1oud/galleon/client"
 	"github.com/thec1oud/galleon/errs"
 	"github.com/thec1oud/galleon/migrate"
@@ -19,8 +20,9 @@ import (
 	"github.com/thec1oud/galleon/server"
 )
 
-// Pages are the generated reference pages, relative to the site.
-var Pages = []string{"app/docs/reference/errors/page.mdx", "app/docs/reference/config/page.mdx"}
+// Pages are the generated reference pages, relative to the site: errors
+// and config from the source, and the command line from its definitions.
+var Pages = []string{"app/docs/reference/errors/page.mdx", "app/docs/reference/config/page.mdx", "app/docs/reference/cli/page.mdx"}
 
 // Defaults are the config sections whose struct has a Default method,
 // built so their default values can be read.
@@ -109,7 +111,11 @@ func (s *source) generate() (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]string{Pages[0]: errPage, Pages[1]: cfgPage}, nil
+	cliPage, err := renderCLI(cli.Commands(), cli.ExitCodes())
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{Pages[0]: errPage, Pages[1]: cfgPage, Pages[2]: cliPage}, nil
 }
 
 // Write regenerates the pages under site.

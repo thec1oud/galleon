@@ -1,4 +1,4 @@
-package notes
+package main
 
 import (
 	"bytes"
@@ -13,9 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/thec1oud/galleon"
-	"github.com/thec1oud/galleon/coord/local"
-	"github.com/thec1oud/galleon/migrate"
-	"github.com/thec1oud/galleon/pg"
+	"github.com/thec1oud/galleon/cli"
 	"github.com/thec1oud/galleon/testkit"
 )
 
@@ -23,63 +21,44 @@ import (
 func TestADeployAppliesOnlyTheApprovedPlan(t *testing.T) {
 	dsn := testkit.PackageDSN(t) // an empty database, standing in for production
 	t.Cleanup(func() { dropAll(t, dsn) })
-	ctx := context.Background()
 
-	// CI: boot as production does, in verify mode, and print the plan.
-	ci := testkit.New(t,
-		galleon.Name("notes"),
-		galleon.Environment(galleon.Production),
-		galleon.Modules(pg.Module(), Notes{Migrations}),
-		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}}`)),
-	)
-	var out bytes.Buffer
-	if err := PrintPlan(ctx, ci.App, &out); err != nil {
-		t.Fatal(err)
+	// CI: notes migrate plan
+	plan, code := notes(dsn, Migrations, "migrate", "plan")
+	if code != cli.ExitOK {
+		t.Fatalf("plan exited %d:\n%s", code, plan)
 	}
-	t.Log(out.String())
-	approve := approval(t, out.String())
+	t.Log(plan)
+	approve := approval(t, plan)
 
-	// The deploy: a plan other than the approved one is refused.
+	// The release step: notes migrate apply. A plan other than the
+	// approved one is refused.
 	t.Setenv("NOTES_MIGRATE_APPROVE", "notes=0123abcd")
-	err := deploy(dsn, Migrations)
-	if err == nil || !strings.Contains(err.Error(), "migrate.fingerprint_mismatch") {
-		t.Fatalf("an unapproved plan: %v", err)
+	if out, code := notes(dsn, Migrations, "migrate", "apply"); code != cli.ExitFailed || !strings.Contains(out, "migrate.fingerprint_mismatch") {
+		t.Fatalf("an unapproved plan: exited %d:\n%s", code, out)
 	}
 
 	// The approved plan applies.
 	t.Setenv("NOTES_MIGRATE_APPROVE", approve)
-	if err := deploy(dsn, Migrations); err != nil {
-		t.Fatalf("the approved plan: %v", err)
+	if out, code := notes(dsn, Migrations, "migrate", "apply"); code != cli.ExitOK {
+		t.Fatalf("the approved plan: exited %d:\n%s", code, out)
 	}
-	reports, err := ci.Migrations().Status(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reports) != 1 || reports[0].Status.State != migrate.UpToDate {
-		t.Fatalf("after the deploy: %+v", reports)
+
+	// The new release's nodes, verifying at boot, find the schema ready.
+	if out, code := notes(dsn, Migrations, "migrate", "status"); code != cli.ExitOK || !strings.Contains(out, "notes: up_to_date") {
+		t.Fatalf("after the deploy: exited %d:\n%s", code, out)
 	}
 }
 
-// deploy boots the service as production does, with migrations applied at
-// boot, and stops it again.
-func deploy(dsn string, files fs.FS) error {
-	app, err := galleon.New(
-		galleon.Name("notes"),
-		galleon.Environment(galleon.Production),
-		galleon.Coordination(local.New()),
-		galleon.Deploy(galleon.SingleNode),
-		galleon.DrainGrace(0), // nothing to drain: the test stops it at once
+// notes runs the service's command line, as production configures it, on
+// database dsn and the migrations in files. It returns what the command
+// printed, stdout and stderr together, and its exit code.
+func notes(dsn string, files fs.FS, args ...string) (string, int) {
+	var out bytes.Buffer
+	code := cli.Run(context.Background(), args, &out, &out, options(files,
 		galleon.Logger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		galleon.Modules(pg.Module(), Notes{files}),
-		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}, "migrate": {"mode": "apply"}}`)),
-	)
-	if err != nil {
-		return err
-	}
-	if err := app.Start(context.Background()); err != nil {
-		return err
-	}
-	return app.Shutdown(context.Background())
+		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}}`)),
+	)...)
+	return out.String(), code
 }
 
 // docs:end approve
@@ -88,35 +67,27 @@ func deploy(dsn string, files fs.FS) error {
 func TestProductionRefusesADestructiveStep(t *testing.T) {
 	dsn := testkit.PackageDSN(t)
 	t.Cleanup(func() { dropAll(t, dsn) })
-	if err := deploy(dsn, Migrations); err != nil { // no approval pinned: any plan up to caution
-		t.Fatal(err)
+	if out, code := notes(dsn, Migrations, "migrate", "apply"); code != cli.ExitOK { // no approval pinned: any plan up to caution
+		t.Fatalf("exited %d:\n%s", code, out)
 	}
 
 	drop := fstest.MapFS{"0003_drop_body.sql": {Data: []byte("-- galleon:risk destructive\nALTER TABLE notes DROP COLUMN body;\n")}}
 	files := merge(Migrations, drop)
 
 	// CI's plan already says the deploy would be refused.
-	ci := testkit.New(t,
-		galleon.Name("notes"),
-		galleon.Environment(galleon.Production),
-		galleon.Modules(pg.Module(), Notes{files}),
-		galleon.ConfigJSON([]byte(`{"pg": {"primary": {"dsn": "`+dsn+`"}}}`)),
-	)
-	var out bytes.Buffer
-	if err := PrintPlan(context.Background(), ci.App, &out); err == nil || !strings.Contains(out.String(), "refused") {
-		t.Fatalf("PrintPlan = %v:\n%s", err, out.String())
+	if out, code := notes(dsn, files, "migrate", "plan"); code != cli.ExitFailed || !strings.Contains(out, "refused") {
+		t.Fatalf("plan exited %d:\n%s", code, out)
 	}
 
-	// And so is the deploy, if it gets that far.
-	err := deploy(dsn, files)
-	if err == nil || !strings.Contains(err.Error(), "3_drop_body (destructive)") {
-		t.Fatalf("a destructive step in production: %v", err)
+	// And so is the apply, if it gets that far.
+	if out, code := notes(dsn, files, "migrate", "apply"); code != cli.ExitFailed || !strings.Contains(out, "3_drop_body (destructive)") {
+		t.Fatalf("a destructive step in production: exited %d:\n%s", code, out)
 	}
 }
 
 // docs:end risk
 
-// approval turns the plan PrintPlan wrote into the value of
+// approval turns the plan migrate plan printed into the value of
 // NOTES_MIGRATE_APPROVE: "notes=" and the fingerprint.
 func approval(t *testing.T, plan string) string {
 	_, fp, ok := strings.Cut(plan, "fingerprint ")
