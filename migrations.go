@@ -679,8 +679,8 @@ func (m *Migrations) set(r *migrate.Runner, refresh func(ctx context.Context)) {
 	m.runner, m.refresh = r, refresh
 }
 
-// Runner returns the app's migration runner, or an error before Start or
-// when the app has no migrators.
+// Runner returns the app's migration runner, or an error when the app has
+// no migrators or isn't running: before Start, or once it has stopped.
 func (m *Migrations) Runner() (*migrate.Runner, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
